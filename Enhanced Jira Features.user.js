@@ -2,8 +2,8 @@
 // @name        Enhanced Jira Features
 // @version     1.1
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira and also parses Log Files submitted from the EVE client
-// @updateURL   https://raw.githubusercontent.com/Schogol/JiraButtons/master/Extra%20Jira%20buttons.user.js
-// @downloadURL https://raw.githubusercontent.com/Schogol/JiraButtons/master/Extra%20Jira%20buttons.user.js
+// @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
+// @downloadURL https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
 // @match       https://ccpgames.atlassian.net/*
 // @require     https://gist.github.com/raw/2625891/waitForKeyElements.js
 // @require     https://ajax.googleapis.com/ajax/libs/jquery/3.3.1/jquery.min.js
