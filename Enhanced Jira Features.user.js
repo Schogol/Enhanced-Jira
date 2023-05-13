@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     1.2
+// @version     1.4
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira and also parses Log Files submitted from the EVE client
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
 // @downloadURL https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -15,97 +15,173 @@
 
 
 
-// Variable which holds the Google Translate API key
-var key = GM_getValue ("key", "");
-
-// Variable which holds the value which either enables or disables the Log Parser. yes = enabled - no = disabled
-var parser = GM_getValue ("parser", "");
-
-// Variable which holds the value which either enables or disables the custom scrollbar. yes = enabled - no = disabled
-var scrollbar = GM_getValue ("scrollbar", "");
-
 // Variable which contains the logs later on in the script
 var rows;
 
+// Variable which contains the locally saved values or a couple of variables
+var savedVariables = [["key",""], ["parser", ""], ["scrollbar", ""], ["dropdowns", ""], ["buttons", ""]];
 
-// Check if the Translation API key is set. If it isn't then prompt for the user to input the key
-if (!key) {
-    key  = prompt (
+
+// Iterate through all variables in savedVariables and load their values or set them to "yes" if they are not set yet
+for (let i = 0; i < savedVariables.length; i++) {
+    savedVariables[i][1] = GM_getValue (savedVariables[i][0], "");
+    if (savedVariables[i][1] == "") {
+        GM_setValue (savedVariables[i][0], "yes");
+        savedVariables[i][1] = GM_getValue (savedVariables[i], "");
+    }
+}
+
+
+// Check if the Translation API key is set. If it isn't then prompt for the user to input the key.
+if (!savedVariables[0][1] | savedVariables[0][1] == "yes") {
+    savedVariables[0][1] = prompt (
         'Translation API key not set. Please enter the key:',
         ''
     );
-    GM_setValue ("key", key);
+    GM_setValue (savedVariables[0][0], savedVariables[0][1]);
 }
 
-// Check if the parser variable is set. If it isn't then enable the log parser by setting the variable to yes
-if (parser == "") {
-    GM_setValue ("parser", "yes");
-    parser = GM_getValue ("parser", "");
-}
 
-// Check if the scrollbar variable is set. If it isn't then enable the custom scrollbar by setting the variable to yes
-if (scrollbar == "") {
-    GM_setValue ("scrollbar", "yes");
-    scrollbar = GM_getValue ("scrollbar", "");
-}
-
+// Activate a custom scrollbar if the scrollbar value is set to yes
+if (savedVariables[2][1] == "yes") {
+    GM_addStyle(
+        '*::-webkit-scrollbar { width: 11px !important; height: 11px !important;}\
+        *::-webkit-scrollbar-thumb { border-radius: 10px !important; background: linear-gradient(left, #96A6BF, #63738C) !important;box-shadow: inset 0 0 1px 1px #828f9e !important;}\
+        .notion-scroller.horizontal { margin-bottom: 30px !important;}\
+        .notion-scroller.vertical { margin-bottom: 0px !important;}'
+    );
+};
 
 
 // Add menu command that allows the Translation API key to be changed.
-GM_registerMenuCommand ("Change Translation API Key", changeAPIKey);
-
-function changeAPIKey () {
-    promptAndChangeStoredValue (key, "Key", "key");
-}
-
-// Function which prompts the user to input a value for a Variable and saves it locally
-function promptAndChangeStoredValue (targVar, userPrompt, setValVarName) {
-    targVar     = prompt (
-        'Change ' + userPrompt + ' for ' + location.hostname + ':',
-        targVar
-    );
-    GM_setValue (setValVarName, targVar);
-    key  = GM_getValue ("key", "");
-};
+GM_registerMenuCommand ("Change Translation API Key", promptAndChangeStoredValue);
 
 // Add menu command that will allow to toggle On/Off the Log Parser.
-GM_registerMenuCommand ("Toggle LogParser On / Off", toggleParser);
-
-function toggleParser () {
-    switch (parser) {
-        case "yes":
-            GM_setValue ("parser", "no");
-            parser = GM_getValue ("parser", "");
-            break;
-        default:
-            GM_setValue ("parser", "yes");
-            parser = GM_getValue ("parser", "");
-            break;
-    }
-};
+GM_registerMenuCommand ("Toggle Log Parser On / Off", toggleParser);
 
 // Add menu command that will allow to toggle On/Off the custom scrollbar.
-GM_registerMenuCommand ("Toggle custom scrollbar On / Off", toggleScrollbar);
+GM_registerMenuCommand ("Toggle Custom Scrollbar On / Off", toggleScrollbar);
 
-function toggleScrollbar () {
-    switch (scrollbar) {
-        case "yes":
-            GM_setValue ("scrollbar", "no");
-            scrollbar = GM_getValue ("scrollbar", "");
-            break;
-        default:
-            GM_setValue ("scrollbar", "yes");
-            scrollbar = GM_getValue ("scrollbar", "");
-            break;
-    }
+// Add menu command that will allow to toggle On/Off the dropdown lists on Linked Issues.
+GM_registerMenuCommand ("Toggle Linked Issue Dropdowns On / Off", toggleDropdown);
+
+// Add menu command that will allow to toggle On/Off the dropdown lists on Linked Issues.
+GM_registerMenuCommand ("Toggle Extra Buttons On / Off", toggleButtons);
+
+
+// Function which prompts the user to input a value for a Variable and saves it locally
+function promptAndChangeStoredValue () {
+    savedVariables[0][1] = prompt (
+        'Change Translation API Key:',
+        ''
+    );
+    GM_setValue (savedVariables[0][0], savedVariables[0][1]);
 };
 
+
+/*
+// This function could replace the following 3 functions if Tampermonkey accepted arguments in the GM_registerMenuCommand function
+
+function toggleFeature(i) {
+    savedVariables[i][1] = (savedVariables[i][1] == "yes") ? "no" : "yes";
+    GM_setValue (savedVariables[i][0], savedVariables[i][1]);
+};
+*/
+
+
+function toggleParser() {
+    savedVariables[1][1] = (savedVariables[1][1] == "yes") ? "no" : "yes";
+    GM_setValue (savedVariables[1][0], savedVariables[1][1]);
+};
+
+
+
+function toggleScrollbar() {
+    savedVariables[2][1] = (savedVariables[2][1] == "yes") ? "no" : "yes";
+    GM_setValue (savedVariables[2][0], savedVariables[2][1]);
+};
+
+
+
+function toggleDropdown() {
+    savedVariables[3][1] = (savedVariables[3][1] == "yes") ? "no" : "yes";
+    GM_setValue (savedVariables[3][0], savedVariables[3][1]);
+};
+
+
+function toggleButtons() {
+    savedVariables[4][1] = (savedVariables[4][1] == "yes") ? "no" : "yes";
+    GM_setValue (savedVariables[4][0], savedVariables[4][1]);
+};
+
+
+// Listener which triggers when the locally scaved scrollbar value is changed. If the new value is "no" we remove the custom scrollbar. If the new value is "yes" we add the custom scrollbar.
+GM_addValueChangeListener("scrollbar", function(key, oldValue, newValue, remote) {
+    if (newValue == "no") {
+        $('style:contains("*::-webkit-scrollbar { width: 11px !important; height: 11px !important;}")').remove();
+    } else {
+        GM_addStyle(
+            '*::-webkit-scrollbar { width: 11px !important; height: 11px !important;}\
+            *::-webkit-scrollbar-thumb { border-radius: 10px !important; background: linear-gradient(left, #96A6BF, #63738C) !important;box-shadow: inset 0 0 1px 1px #828f9e !important;}\
+            .notion-scroller.horizontal { margin-bottom: 30px !important;}\
+            .notion-scroller.vertical { margin-bottom: 0px !important;}'
+        );
+    }
+});
+
+
+// Listener which triggers when the locally scaved scrollbar value is changed. If the new value is "no" we remove the custom scrollbar. If the new value is "yes" we add the custom scrollbar.
+GM_addValueChangeListener("buttons", function(key, oldValue, newValue, remote) {
+    if (newValue == "no") {
+        $('#translateButton').remove();
+        $('#GMButton').remove();
+        $('#ConvertToDefectButton').remove();
+        $('#closeButton').remove();
+    } else {
+        addButtons()
+    }
+});
+
+
+// Listener which triggers when the locally scaved dropdowns value is changed. If the new value is "no" we remove functionality of the LinkedIssue dropdowns. If the new value is "yes" we add the dropdowns to LinkedIssues.
+GM_addValueChangeListener("dropdowns", function(key, oldValue, newValue, remote) {
+    if (newValue == "no") {
+        let reasons = ['duplicates', 'added to idea', 'blocks', 'is blocked by', 'clones', 'is cloned by', 'is duplicated by', 'has to be finished together with', 'has to be done before', 'has to be done after', 'earliest end is start of', 'start is earliest end of', 'has to be started together with', 'split to', 'split from', 'is parent of', 'is child of', 'is idea for', 'implements', 'is implemented by', 'merged from', 'merged into', 'reviews', 'is reviewed by', 'causes', 'is caused by', 'relates to']
+
+        for (let i = 0; i < reasons.length; i++) {
+            if ($('h3 > span:contains(' + reasons[i] + ')')) {
+                $('h3 > span:contains(' + reasons[i] + ')').text(reasons[i]);
+                $('h3 > span:contains(' + reasons[i] + ')').css('cursor', '');
+                $('h3 > span:contains(' + reasons[i] + ')').parent().next().show();
+                $('h3 > span:contains(' + reasons[i] + ')').off('click');
+            }
+        }
+    } else {
+        let reasons = ['duplicates', 'added to idea', 'blocks', 'is blocked by', 'clones', 'is cloned by', 'is duplicated by', 'has to be finished together with', 'has to be done before', 'has to be done after', 'earliest end is start of', 'start is earliest end of', 'has to be started together with', 'split to', 'split from', 'is parent of', 'is child of', 'is idea for', 'implements', 'is implemented by', 'merged from', 'merged into', 'reviews', 'is reviewed by', 'causes', 'is caused by', 'relates to']
+
+        for (let i = 0; i < reasons.length; i++) {
+            if ($('h3 > span:contains(' + reasons[i] + ')')) {
+                let children = $('h3 > span:contains(' + reasons[i] + ')').parent().next().children().length;
+
+                $('h3 > span:contains(' + reasons[i] + ')').text('> ' + reasons[i] + ' - '+ children +' elements');
+                $('h3 > span:contains(' + reasons[i] + ')').css('cursor', 'pointer');
+                $('h3 > span:contains(' + reasons[i] + ')').parent().next().toggle();
+                $('h3 > span:contains(' + reasons[i] + ')').click(function() {
+                    $(this).parent().next().toggle();
+                    $(this).toggleText('> ' + reasons[i] + ' - '+ children +' elements', '⌄ ' + reasons[i] + ' - '+ children +' elements')
+                });
+            }
+        }
+    }
+});
 
 
 // waitForKeyElements waits until the it finds the "Give Feedback" element of the page and then removes it because we dont want that to take up space.
 var feedbackItem = 'button[data-testid="issue-navigator.common.ui.feedback.feedback-button"]';
 waitForKeyElements (feedbackItem, removeFeedbackButton);
 
+
+// Remove the Feedback element
 function removeFeedbackButton() {
     $('button[data-testid="issue-navigator.common.ui.feedback.feedback-button"]').parent().remove()
 };
@@ -118,10 +194,11 @@ waitForKeyElements (issueItem, checkIssueType);
 
 // Check if the issue is a Bug report. If it is then we add the extra buttons
 function checkIssueType() {
-    if ($('a[data-testid="issue.views.issue-base.foundation.breadcrumbs.current-issue.item"]:contains("EBR")').length > 0) {
+    if ($('a[data-testid="issue.views.issue-base.foundation.breadcrumbs.current-issue.item"]:contains("EBR")').length > 0 & savedVariables[4][1] == "yes") {
         addButtons();
     }
 };
+
 
 // Adds the different buttons to the "command-bar" and defines what they do
 function addButtons() {
@@ -129,8 +206,8 @@ function addButtons() {
     var issueID = $('a[data-testid="issue.views.issue-base.foundation.breadcrumbs.current-issue.item"]').text();
 
     // Grabbing the button and span class for the buttons (which constantly changes because react + atlassian ~_~)
-    let buttonClass = jQuery('span[data-testid="issue.issue-view.views.issue-base.foundation.quick-add.quick-add-item.add-attachment"]').children(1).attr('class');
-    let spanClass = jQuery('span[data-testid="issue.issue-view.views.issue-base.foundation.quick-add.quick-add-item.add-attachment"]').attr('class');
+    let buttonClass = $('span[data-testid="issue.issue-view.views.issue-base.foundation.quick-add.quick-add-item.add-attachment"]').children(1).attr('class');
+    let spanClass = $('span[data-testid="issue.issue-view.views.issue-base.foundation.quick-add.quick-add-item.add-attachment"]').attr('class');
 
     // Jira cloud ID which we need for some of the POST requests we send
     let ajscloudid = $('meta[name="ajs-cloud-id"]').attr('content');
@@ -141,128 +218,150 @@ function addButtons() {
 
     // When the translate button is clicked we send the Issue title, description and reproduction steps to the Google translate API and change the original content to what we receive back from the API
     $("#translateButton").click(function () {
-	$.ajax({
-       	url: 'https://translation.googleapis.com/language/translate/v2?key=' + key,
-   			type: 'POST',
-   			contentType: 'application/json',
-			charset: 'utf-8',
+        $.ajax({
+            url: 'https://translation.googleapis.com/language/translate/v2?key=' + savedVariables[0][1],
+            type: 'POST',
+            contentType: 'application/json',
+            charset: 'utf-8',
 
-			// The regex might be a bit janky but it removes some unneccessary spaces in the text which we send to the API.
-			// By changing the "target:" attribute we could chose a different language than english if needed
-    		data: '{"q":"'+ $("h1[data-test-id='issue.views.issue-base.foundation.summary.heading']").text().replace(/"/g,'').replace(/ {2,}/g,' ')+'", "q":"'+ $("div[data-component-selector='jira-issue-view-rich-text-inline-edit-view-container']").children().eq(0).text().replace(/"/g,'').replace(/ {2,}/g,' ')+'", "q":"'+ $("div[data-component-selector='jira-issue-view-rich-text-inline-edit-view-container']").children().eq(1).text().replace(/"/g,'').replace(/ {2,}/g,' ')+'", "target":"en", "format":"text"}',
+            // The regex might be a bit janky but it removes some unneccessary spaces in the text which we send to the API.
+            // By changing the "target:" attribute we could chose a different language than english if needed
+            data: '{"q":"'+ $("h1[data-test-id='issue.views.issue-base.foundation.summary.heading']").text().replace(/"/g,'').replace(/ {2,}/g,' ')+'", "q":"'+ $("div[data-component-selector='jira-issue-view-rich-text-inline-edit-view-container']").children().eq(0).text().replace(/"/g,'').replace(/ {2,}/g,' ')+'", "q":"'+ $("div[data-component-selector='jira-issue-view-rich-text-inline-edit-view-container']").children().eq(1).text().replace(/"/g,'').replace(/ {2,}/g,' ')+'", "target":"en", "format":"text"}',
 
-			// When we receive a translation back from the API we replace the original Title, Description and Repro-Steps with the translation we get from Google.
+            // When we receive a translation back from the API we replace the original Title, Description and Repro-Steps with the translation we get from Google.
             success: function (data) {
-        		$("h1[data-test-id='issue.views.issue-base.foundation.summary.heading']").text(data.data.translations[0].translatedText);
+                $("h1[data-test-id='issue.views.issue-base.foundation.summary.heading']").text(data.data.translations[0].translatedText);
                 $("div[data-component-selector='jira-issue-view-rich-text-inline-edit-view-container']").children().eq(1).replaceWith(data.data.translations[2].translatedText.replace(/\n\n/g, '<br><br>'));
                 $("div[data-component-selector='jira-issue-view-rich-text-inline-edit-view-container']").children().eq(0).replaceWith(data.data.translations[1].translatedText.replace(/\n/g, '<br><br>'));
-			},
+            },
 
-    		// If we get an Error from the Google API then we annoy the user by telling them that it failed and to check their Dev Console for errors
-    		error: function(data){
-           		console.log(JSON.stringify(data));
-    			alert("Cannot get translation. Check Console for errors and report issues to Schogol :). \r\nMake sure you have entered the correct key.");
-    		}
-    	})
-	});
+            // If we get an Error from the Google API then we annoy the user by telling them that it failed and to check their Dev Console for errors
+            error: function(data){
+                console.log(JSON.stringify(data));
+                alert("Cannot get translation. Check Console for errors and report issues to Schogol :). \r\nMake sure you have entered the correct key.");
+            }
+        })
+    });
 
 
-    var GMButton= $('<span id="GMButton" class="' + spanClass + '"><button aria-label="Translate" class="' + buttonClass + '" type="button" tabindex="1"><span>Assign to GM</span></button></span>');
+    var GMButton= $('<span id="GMButton" class="' + spanClass + '"><button class="' + buttonClass + '" type="button" tabindex="1"><span>Assign to GM</span></button></span>');
     $('span[data-testid="issue.issue-view.views.issue-base.foundation.quick-add.quick-add-item.add-attachment"]').parent().parent().append(GMButton);
 
     // When the Assign to GM button is clicked we change the Team to "EO - Game Masters" and also visually change the field so the user sees that it worked.
     $("#GMButton").click(function () {
-	$.ajax({
-       	url: 'https://ccpgames.atlassian.net/rest/api/2/issue/'+ $('a[data-testid="issue.views.issue-base.foundation.breadcrumbs.current-issue.item"]').text(),
-   			type: 'PUT',
-   			contentType: 'application/json',
-			charset: 'utf-8',
-    		data: '{"fields":{"customfield_10001":"38"}}',
+        $.ajax({
+            url: 'https://ccpgames.atlassian.net/rest/api/2/issue/'+ $('a[data-testid="issue.views.issue-base.foundation.breadcrumbs.current-issue.item"]').text(),
+            type: 'PUT',
+            contentType: 'application/json',
+            charset: 'utf-8',
+            data: '{"fields":{"customfield_10001":"38"}}',
 
-			// When the change of the team via API is successful we change the Team visually for the user to also see that as the Issue doesnt update automatically
+            // When the change of the team via API is successful we change the Team visually for the user to also see that as the Issue doesnt update automatically
             success: function (data) {
-        		$('div[data-testid="issue-field-heading-styled-field-heading.field"]:contains(Team)').parent().children('div').eq(1).text('EO - GameMasters');
+                $('div[data-testid="issue-field-heading-styled-field-heading.field"]:contains(Team)').parent().children('div').eq(1).text('EO - GameMasters');
                 // After changing the Team field to "EO - Game Masters" we change the Assignee field to "Unassigned" because GMs wont be able to see the BRs in their filters if they are assigned to someone.
                 $.ajax({
                     url: 'https://ccpgames.atlassian.net/rest/api/3/issue/'+ $('a[data-testid="issue.views.issue-base.foundation.breadcrumbs.current-issue.item"]').text() + '/assignee',
                     type: 'PUT',
-   			        contentType: 'application/json',
-			        charset: 'utf-8',
-    		        data: '{"accountId":null}',
+                    contentType: 'application/json',
+                    charset: 'utf-8',
+                    data: '{"accountId":null}',
 
                     success: function (data) {
-        		        $('div[data-testid="issue-field-heading-styled-field-heading.assignee"]:contains(Assignee)').parent().children('div').eq(1).text('Unassigned');
-			        },
+                        $('div[data-testid="issue-field-heading-styled-field-heading.assignee"]:contains(Assignee)').parent().children('div').eq(1).text('Unassigned');
+                    },
 
-    		        // If we get an Error we annoy the user by telling them that it failed and to check their Dev Console for errors
-    		        error: function(data){
-           		        console.log(JSON.stringify(data));
-    			        alert("Wasn't able to change Assignee field to 'Unassigned'. Check Console for errors and report issues to Schogol :).");
-    		        }
-    	        });
+                    // If we get an Error we annoy the user by telling them that it failed and to check their Dev Console for errors
+                    error: function(data){
+                        console.log(JSON.stringify(data));
+                        alert("Wasn't able to change Assignee field to 'Unassigned'. Check Console for errors and report issues to Schogol :).");
+                    }
+                });
 
-	        },
+            },
 
-    		// If we get an Error then we annoy the user by telling them that it failed and to check their Dev Console for errors
-    		error: function(data){
-           		console.log(JSON.stringify(data));
-    			alert("This failed for some reason. Check Console for errors and report issues to Schogol :).");
-    		}
-    })
-	});
+            // If we get an Error then we annoy the user by telling them that it failed and to check their Dev Console for errors
+            error: function(data){
+                console.log(JSON.stringify(data));
+                alert("This failed for some reason. Check Console for errors and report issues to Schogol :).");
+            }
+        })
+    });
 
 
 
-    var convertToDefectButton= $('<span id="ConvertToDefectButton" class="' + spanClass + '"><button aria-label="Translate" class="' + buttonClass + '" type="button" tabindex="1"><span>Convert to Defect</span></button></span>');
+    var convertToDefectButton= $('<span id="ConvertToDefectButton" class="' + spanClass + '"><button class="' + buttonClass + '" type="button" tabindex="1"><span>Convert to Defect</span></button></span>');
     $('span[data-testid="issue.issue-view.views.issue-base.foundation.quick-add.quick-add-item.add-attachment"]').parent().parent().append(convertToDefectButton);
 
     // When the Convert to Defect button is clicked we trigger the Automation which converts the EBR into an EDR issue
     $("#ConvertToDefectButton").click(function () {
+        $(".icon-close").click();
 
         $.ajax({
-       	url: 'https://ccpgames.atlassian.net/gateway/api/automation/internal-api/jira/' + ajscloudid + '/pro/rest/rules/invocation/10609113',
-   			type: 'POST',
-   			contentType: 'application/json',
-			charset: 'utf-8',
-    		data: '{"targetIssueKeys":["' + issueID + '"]}',
+            url: 'https://ccpgames.atlassian.net/gateway/api/automation/internal-api/jira/' + ajscloudid + '/pro/rest/rules/invocation/10609113',
+            type: 'POST',
+            contentType: 'application/json',
+            charset: 'utf-8',
+            data: '{"targetIssueKeys":["' + issueID + '"]}',
 
-			// After 5 seconds (which should be enough for Jira to execute and complete the Automation we reload the page so that the user can see that the EDR issue was created.
+            // Once the conversion succeeds we check for the "Issue Updated" message on screen and once it appears we refresh the page
             success: function (data) {
-        		setTimeout(function(){window.location.reload(false)}, 5000);
-			},
+                var t=setInterval(function () {if ($('strong:contains(Issue Updated)')[0]) {clearInterval(t);window.location.reload(false);}},500);
+            },
 
-    		// If we get an Error then we annoy the user by telling them that it failed and to check their Dev Console for errors
-    		error: function(data){
-           		console.log(JSON.stringify(data));
-    			alert("This failed for some reason. Check Console for errors and report issues to Schogol :).");
-    		}
-    	})
-	});
+            // If we get an Error then we annoy the user by telling them that it failed and to check their Dev Console for errors
+            error: function(data){
+                console.log(JSON.stringify(data));
+                alert("This failed for some reason. Check Console for errors and report issues to Schogol :).");
+            }
+        })
+    });
 
 
-    var closeButton= $('<span id="closeButton" class="' + spanClass + '"><button aria-label="Translate" class="' + buttonClass + '" type="button" tabindex="1"><span>Close</span></button></span>');
+    var closeButton= $('<span id="closeButton" class="' + spanClass + '"><button class="' + buttonClass + '" type="button" tabindex="1"><span>Close</span></button></span>');
     $('span[data-testid="issue.issue-view.views.issue-base.foundation.quick-add.quick-add-item.add-attachment"]').parent().parent().append(closeButton);
 
     // When the Close button is clicked we change the status to Closed by simulating clicks on the relevant buttons. This is extremely janky right now because I cant figure out a better way to do this.
     $("#closeButton").click(function () {
         $("div[data-testid='issue.views.issue-base.foundation.status.status-field-wrapper']").find("button").click()
         setTimeout(function(){$("div[data-testid='issue.fields.status.common.ui.status-lozenge.3']").children().find("span:contains(Closed)").click();}, 100);
-	});
+    });
 };
 
 
 
-// Switch to a custom scrollbar if the scrollbar value is set to yes
-switch (scrollbar) {
-    case "yes":
-        GM_addStyle('*::-webkit-scrollbar { width: 11px !important; height: 11px !important; background-color: #F5F5F5 !important; }');
-        GM_addStyle('*::-webkit-scrollbar-thumb { border-radius: 10px !important; background: linear-gradient(left, #96A6BF, #63738C) !important;box-shadow: inset 0 0 1px 1px #cad1d9 !important;}');
-        GM_addStyle('.notion-scroller.horizontal { margin-bottom: 30px !important; }');
-        GM_addStyle('.notion-scroller.vertical { margin-bottom: 0px !important; }');
-        break;
-    case "no":
-        break;
-};
+// Adds the "toggleText()" function to jQuery which lets you easily toggle between two given texts
+$.fn.extend({
+    toggleText: function(a, b){
+        return this.text(this.text() == b ? a : b);
+    }
+});
+
+
+// When we detect the "title row" of a log parser file then we swap out the content of the log file with a parsed, more readable version of it with some extra features likke buttons which allow you to toggle the visibility of certain types of events
+var linkedIssues = 'h2:contains(Linked issue)';
+waitForKeyElements (linkedIssues, createDropdowns);
+
+
+// Function which creates dropdown lists for all different types of linked issues instead of listing them all by default
+function createDropdowns() {
+    let reasons = ['duplicates', 'added to idea', 'blocks', 'is blocked by', 'clones', 'is cloned by', 'is duplicated by', 'has to be finished together with', 'has to be done before', 'has to be done after', 'earliest end is start of', 'start is earliest end of', 'has to be started together with', 'split to', 'split from', 'is parent of', 'is child of', 'is idea for', 'implements', 'is implemented by', 'merged from', 'merged into', 'reviews', 'is reviewed by', 'causes', 'is caused by', 'relates to']
+
+    if (savedVariables[3][1] == "yes") {
+        for (let i = 0; i < reasons.length; i++) {
+            if ($('h3 > span:contains(' + reasons[i] + ')')) {
+                let children = $('h3 > span:contains(' + reasons[i] + ')').parent().next().children().length;
+                $('h3 > span:contains(' + reasons[i] + ')').text('> ' + reasons[i] + ' - '+ children +' elements');
+                $('h3 > span:contains(' + reasons[i] + ')').css('cursor', 'pointer');
+                $('h3 > span:contains(' + reasons[i] + ')').parent().next().toggle();
+                $('h3 > span:contains(' + reasons[i] + ')').click(function() {
+                    $(this).parent().next().toggle();
+                    $(this).toggleText('> ' + reasons[i] + ' - '+ children +' elements', '⌄ ' + reasons[i] + ' - '+ children +' elements')
+                });
+            }
+        }
+    };
+}
 
 
 
@@ -270,18 +369,15 @@ switch (scrollbar) {
 var selector = "span[data-testid='code-block']:contains(Time	Facility	Type	Message)";
 waitForKeyElements (selector, ArtificialSlowdown);
 
-// If the parser value is set we Swap out the Log file with the parsed version after 500ms (This slowdown seems to help with weird issues where atlassian seems to time how long content takes to load files but if we have swapped out the file before atlassian realizes that it completed loading then errors might occur)
+// If the parser value is set we Swap out the Log file with the parsed version after 500ms (This slowdown seems to help with weird issues where atlassian seems to time how long content takes to load files but if we have swapped out the content before atlassian realizes that it completed loading then errors might occur)
 function ArtificialSlowdown() {
-    switch (parser) {
-        case "yes":
-            setTimeout(SwapUI, 500);
-            break;
-        case "no":
-            break;
+    if (savedVariables[1][1] == "yes") {
+        setTimeout(SwapUI, 500);
     };
 };
 
 
+// Swap out the UI when looking at a log file and add the buttons to toggle message types at the top of the page
 function SwapUI() {
     $('span[data-testid="code-block"]').find('span > span.comment').remove()
     rows = $("span[data-testid='code-block']").text();
@@ -289,45 +385,47 @@ function SwapUI() {
     setTimeout(ParseLogs, 250);
 
     $("#gpanel a").click(function() {
-            switch ($(this).hasClass('toggle')) {
-                case false:
-                    $('.'+$(this).attr('id')).css({'display':'none'});
-                    $(this).not($('#onlyexception, #showAll')).addClass('toggle');
-                    break;
-                default:
-                    $('.'+$(this).attr('id')).css({'display':'table-row'});
-                    $(this).removeClass('toggle');
-                    break;
-            };
-            switch ($(this).attr('id')) {
-                case "onlyexception":
-                    $('tr:not(.exception)').css({'display':'none'});
-                    $('tr.exception').css({'display':'table-row'});
-                    $('#gnav a#notice, #gnav a#error, #gnav a#warning').addClass('toggle');
-                    $('#gnav a#exception').removeClass('toggle');
-                    break;
-                case "showAll":
-                    $('tr').css({'display':'table-row'});
-                    $('#gnav a#notice, #gnav a#warning, #gnav a#error, #gnav a#exception').removeClass('toggle');
-                    break;
-                default:
-                    break;
-            }
-        });
-    };
+        switch ($(this).hasClass('toggle')) {
+            case false:
+                $('.'+$(this).attr('id')).css({'display':'none'});
+                $(this).not($('#onlyexception, #showAll')).addClass('toggle');
+                break;
+            default:
+                $('.'+$(this).attr('id')).css({'display':'table-row'});
+                $(this).removeClass('toggle');
+                break;
+        };
+        switch ($(this).attr('id')) {
+            case "onlyexception":
+                $('tr:not(.exception)').css({'display':'none'});
+                $('tr.exception').css({'display':'table-row'});
+                $('#gnav a#notice, #gnav a#error, #gnav a#warning').addClass('toggle');
+                $('#gnav a#exception').removeClass('toggle');
+                break;
+            case "showAll":
+                $('tr').css({'display':'table-row'});
+                $('#gnav a#notice, #gnav a#warning, #gnav a#error, #gnav a#exception').removeClass('toggle');
+                break;
+            default:
+                break;
+        }
+    });
+};
 
 
+
+// Process the logs and display them in a more readable state than the default
 function ParseLogs() {
     rows = rows.replace(/(\t{2,})+/g, "\t").replace(/([\r\n]){2,}/g, "\r\n").replace(/([\r\n])[*]{3}(.*)(?=[*]{3})[*]{3}/g, "\r\n\t\t\tLogging error occurred").replace(/[\<]/g, function(c) {return "&lt;";}).split("\n");
 
-/**
+    /**
  * Object to which we save the table
  */
     var logs = {};
     logs.tableInfo = [];
 
 
-/**
+    /**
  * Adds each row from 'rows' to the 'tableContent' table.
  * rowQuantity: Quantity of rows which will be loaded
  */
@@ -348,7 +446,7 @@ function ParseLogs() {
             typeCell = row.insertCell(++cellIndex);
 
 
-/**
+            /**
  * Switch for checking if the current row is a notice, warning, error or info message
  * and add the according class to the row
  */
@@ -368,7 +466,7 @@ function ParseLogs() {
             }
 
 
-/**
+            /**
  * Check if the message contains the beginning of an exception and set excTime (Exception time) to the time of the current message
  * Also adds a border to the top of the row
  */
@@ -378,7 +476,7 @@ function ParseLogs() {
             }
 
 
-/**
+            /**
  * Check if the message contains the beginning of a stacktrace,
  * then set sttTime (Stacktrace time) to the time of the current message and add a border to the top of the row
  */
@@ -388,7 +486,7 @@ function ParseLogs() {
             }
 
 
-/**
+            /**
  * If the time of the current message is the same time as it was when the exception started
  * then add the 'exception' class to the row
  */
@@ -397,7 +495,7 @@ function ParseLogs() {
             }
 
 
-/**
+            /**
  * If there is an "Exception End" message in the current log row,
  * then add the 'borderbot' class to the row and set excTime to its default value
  */
@@ -407,7 +505,7 @@ function ParseLogs() {
             }
 
 
-/**
+            /**
  * If excTime is not empty but it doesnt match the time of the current row,
  * then add the 'borderbot' class to the row and set excTime to its default value
  */
@@ -417,7 +515,7 @@ function ParseLogs() {
             }
 
 
-/**
+            /**
  * If there is an "Stacktrace End" message in the current log row,
  * then add the 'borderbot' class to the row and set sttTime to its default value
  */
@@ -427,7 +525,7 @@ function ParseLogs() {
             }
 
 
-/**
+            /**
  * If sttTime is not empty but it doesnt match the time of the current row,
  * then add the 'borderbot' class to the row and set sttTime to its default value
  */
@@ -442,7 +540,7 @@ function ParseLogs() {
             messageCell.innerHTML = table[i][3];
 
 
-/**
+            /**
  * Currently unused clickHandler
  */
             clickHandler = function(row) {
@@ -456,7 +554,7 @@ function ParseLogs() {
     };
 
 
-/**
+    /**
  * Fill the table with the log data
  */
     for (var i = 1; i < rows.length; ++i) {
@@ -466,7 +564,7 @@ function ParseLogs() {
     logs.showRow((rows.length - 2));
 
 
-/**
+    /**
  * Remove the loader and show the content
  */
     document.getElementById("loader").style.display = "none";
@@ -477,7 +575,7 @@ function ParseLogs() {
 
 
 
-
+// Variable which contains the UI of the Log Parser
 var html = `
 <style>
     body {
@@ -679,6 +777,7 @@ var html = `
     #tableContent {
       word-wrap: break-word;
       table-layout: fixed;
+      color: #333;
     }
     .timeCol {
       width: 139.766px;
