@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     1.5
+// @version     1.6
 // @author      ISD BH Schogol
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira and also parses Log Files submitted from the EVE client
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
 // @downloadURL https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
-// @match       https://ccpgames.atlassian.net/*
+// @match       https://ccpgames.atlassian.net/jira/*
+// @match       https://ccpgames.atlassian.net/browse/*
 // @require     https://gist.github.com/raw/2625891/waitForKeyElements.js
 // @require     https://ajax.googleapis.com/ajax/libs/jquery/3.3.1/jquery.min.js
 // @grant       GM_addStyle
@@ -19,7 +20,7 @@
 // Variable which contains the logs later on in the script
 var rows;
 
-// Variable which contains the locally saved values or a couple of variables
+// Variable which contains the locally saved values for a couple of variables
 var savedVariables = [["key",""], ["parser", ""], ["scrollbar", ""], ["dropdowns", ""], ["buttons", ""]];
 
 
@@ -34,7 +35,7 @@ for (let i = 0; i < savedVariables.length; i++) {
 
 
 // Check if the Translation API key is set. If it isn't then prompt for the user to input the key.
-if (!savedVariables[0][1] | savedVariables[0][1] == "yes") {
+if (!savedVariables[0][1] || savedVariables[0][1] == "yes") {
     savedVariables[0][1] = prompt (
         'Translation API key not set. Please enter the key:',
         ''
@@ -68,6 +69,9 @@ GM_registerMenuCommand ("Toggle Linked Issue Dropdowns On / Off", toggleDropdown
 
 // Add menu command that will allow to toggle On/Off the dropdown lists on Linked Issues.
 GM_registerMenuCommand ("Toggle Extra Buttons On / Off", toggleButtons);
+
+// Add menu command that will allow to toggle On/Off darkmode.
+GM_registerMenuCommand ("Toggle Dark Mode On / Off", toggleDarkmode);
 
 
 // Function which prompts the user to input a value for a Variable and saves it locally
@@ -116,10 +120,37 @@ function toggleButtons() {
 };
 
 
+function toggleDarkmode() {
+    if ($('html[data-color-mode="dark"]')[0]) {
+        $('input[type=checkbox]').prop('checked', false);
+        $.ajax({
+            url: 'https://ccpgames.atlassian.net/rest/api/3/mypreferences?key=jira.user.theme.preference',
+            type: 'PUT',
+            contentType: 'application/json',
+            charset: 'utf-8',
+			Accept: 'application/json,text/javascript,*/*',
+            data: '{"value":"light"}',
+        })
+    } else {
+        $('input[type=checkbox]').prop('checked', true);
+        $.ajax({
+            url: 'https://ccpgames.atlassian.net/rest/api/3/mypreferences?key=jira.user.theme.preference',
+            type: 'PUT',
+            contentType: 'application/json',
+            charset: 'utf-8',
+			Accept: 'application/json,text/javascript,*/*',
+            data: '{"value":"dark"}',
+        })
+    }
+    window.location.reload(false)
+};
+
+
 // Listener which triggers when the locally scaved scrollbar value is changed. If the new value is "no" we remove the custom scrollbar. If the new value is "yes" we add the custom scrollbar.
 GM_addValueChangeListener("scrollbar", function(key, oldValue, newValue, remote) {
     if (newValue == "no") {
         $('style:contains("*::-webkit-scrollbar { width: 11px !important; height: 11px !important;}")').remove();
+        $('style:contains("color-scheme: dark")')[0].remove();
     } else {
         GM_addStyle(
             '*::-webkit-scrollbar { width: 11px !important; height: 11px !important;}\
@@ -127,6 +158,7 @@ GM_addValueChangeListener("scrollbar", function(key, oldValue, newValue, remote)
             .notion-scroller.horizontal { margin-bottom: 30px !important;}\
             .notion-scroller.vertical { margin-bottom: 0px !important;}'
         );
+        GM_addStyle(cssDark);
     }
 });
 
@@ -913,3 +945,78 @@ var html = `
       </div>
    </div>
 `;
+
+
+var darkModeSwitch = `
+    <span>
+      <input type="checkbox" class="checkbox" id="checkbox">
+      <label for="checkbox" class="checkbox-label">
+        <svg viewBox="0 -150 1000 800">
+  <path d="M223.5 32C100 32 0 132.3 0 256S100 480 223.5 480c60.6 0 115.5-24.2 155.8-63.4c5-4.9 6.3-12.5 3.1-18.7s-10.1-9.7-17-8.5c-9.8 1.7-19.8 2.6-30.1 2.6c-96.9 0-175.5-78.8-175.5-176c0-65.8 36-123.1 89.3-153.3c6.1-3.5 9.2-10.5 7.7-17.3s-7.3-11.9-14.3-12.5c-6.3-.5-12.6-.8-19-.8z" style="fill: rgb(241, 196, 15);"></path>
+</svg>
+<svg viewBox="-350 -150 1000 800">
+  <path d="M361.5 1.2c5 2.1 8.6 6.6 9.6 11.9L391 121l107.9 19.8c5.3 1 9.8 4.6 11.9 9.6s1.5 10.7-1.6 15.2L446.9 256l62.3 90.3c3.1 4.5 3.7 10.2 1.6 15.2s-6.6 8.6-11.9 9.6L391 391 371.1 498.9c-1 5.3-4.6 9.8-9.6 11.9s-10.7 1.5-15.2-1.6L256 446.9l-90.3 62.3c-4.5 3.1-10.2 3.7-15.2 1.6s-8.6-6.6-9.6-11.9L121 391 13.1 371.1c-5.3-1-9.8-4.6-11.9-9.6s-1.5-10.7 1.6-15.2L65.1 256 2.8 165.7c-3.1-4.5-3.7-10.2-1.6-15.2s6.6-8.6 11.9-9.6L121 121 140.9 13.1c1-5.3 4.6-9.8 9.6-11.9s10.7-1.5 15.2 1.6L256 65.1 346.3 2.8c4.5-3.1 10.2-3.7 15.2-1.6zM160 256a96 96 0 1 1 192 0 96 96 0 1 1 -192 0zm224 0a128 128 0 1 0 -256 0 128 128 0 1 0 256 0z" style="fill: rgb(243, 156, 18);"></path>
+</svg>
+        <span class="ball"></span>
+      </label>
+    </span>
+    `
+
+var darkModeSwitchCss = `
+
+.checkbox {
+  opacity: 0;
+  position: absolute;
+}
+
+.checkbox-label {
+  box-sizing: border-box;
+  background-color: #323232;
+  width: 50px;
+  height: 26px;
+  border-radius: 50px;
+  position: relative;
+  padding: 5px;
+  cursor: pointer;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.fa-moon {color: #f1c40f;}
+
+.fa-sun {color: #f39c12;}
+
+.checkbox-label .ball {
+  background-color: #fff;
+  width: 22px;
+  height: 22px;
+  position: absolute;
+  left: 2px;
+  top: 2px;
+  border-radius: 50%;
+  transition: transform 0.2s linear;
+}
+
+.checkbox:checked + .checkbox-label .ball {
+  transform: translateX(24px);
+}
+`
+
+// We wait until the searchbar is loaded before running the function addDarkmodeToggle
+var searchbar = 'input[data-test-id="search-dialog-input"';
+waitForKeyElements (searchbar, addDarkmodeToggle);
+
+
+// This adds the CSS and Button (An input checkbox box) to the left of the search box. If the saved variable for the darkmode is "yes" then we check the checkbox and add the dark mode CSS
+function addDarkmodeToggle() {
+    GM_addStyle(darkModeSwitchCss);
+    if ($('html[data-color-mode="dark"]')[0] || $('html[data-color-mode="light"]')[0]) {
+        $('input[data-test-id="search-dialog-input"').parent().parent().parent().parent().parent().parent().parent().parent().parent().prepend(darkModeSwitch);
+        if ($('html[data-color-mode="dark"]')[0]) {
+            $('input[type=checkbox]').prop('checked', true);
+        };
+        $('input[type=checkbox]').on( "click", toggleDarkmode);
+    }
+}
+
