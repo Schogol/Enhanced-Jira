@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     1.7
+// @version     1.8
 // @author      ISD BH Schogol
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira and also parses Log Files submitted from the EVE client
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -431,7 +431,7 @@ function SwapUI() {
         };
         switch ($(this).attr('id')) {
             case "onlyexception":
-                $('tr:not(.exception)').css({'display':'none'});
+                $('tr:not(.exception):not(#fixedHead)').css({'display':'none'});
                 $('tr.exception').css({'display':'table-row'});
                 $('#gnav a#notice, #gnav a#error, #gnav a#warning').addClass('toggle');
                 $('#gnav a#exception').removeClass('toggle');
