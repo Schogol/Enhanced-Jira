@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     1.8
+// @version     1.9
 // @author      ISD BH Schogol
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira and also parses Log Files submitted from the EVE client
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -18,14 +18,19 @@
 
 
 
-// Variable which contains the logs later on in the script
-var rows;
+// Creating various variables which we use later on
+var rows, oc, lc, pdm, pdmdata, driverAge = "unknown";
 
-// Variable which contains the locally saved values for a couple of variables
+
+// Current Date
+var today = new Date();
+
+
+// Array which contains the locally saved values for a couple of variables
 var savedVariables = [["key",""], ["parser", ""], ["scrollbar", ""], ["dropdowns", ""], ["buttons", ""]];
 
 
-// Iterate through all variables in savedVariables and load their values or set them to "yes" if they are not set yet
+// Iterate through all variables in savedVariables and load their locally saved values or set them to "yes" if they are not set yet
 for (let i = 0; i < savedVariables.length; i++) {
     savedVariables[i][1] = GM_getValue (savedVariables[i][0], "");
     if (savedVariables[i][1] == "") {
@@ -48,10 +53,10 @@ if (!savedVariables[0][1] || savedVariables[0][1] == "yes") {
 // Activate a custom scrollbar if the scrollbar value is set to yes
 if (savedVariables[2][1] == "yes") {
     GM_addStyle(
-        '*::-webkit-scrollbar { width: 11px !important; height: 11px !important;}\
-        *::-webkit-scrollbar-thumb { border-radius: 10px !important; background: linear-gradient(left, #96A6BF, #63738C) !important;box-shadow: inset 0 0 1px 1px #828f9e !important;}\
-        .notion-scroller.horizontal { margin-bottom: 30px !important;}\
-        .notion-scroller.vertical { margin-bottom: 0px !important;}'
+`*::-webkit-scrollbar { width: 11px !important; height: 11px !important;}\
+*::-webkit-scrollbar-thumb { border-radius: 10px !important; background: linear-gradient(left, #96A6BF, #63738C) !important;box-shadow: inset 0 0 1px 1px #828f9e !important;}\
+.notion-scroller.horizontal { margin-bottom: 30px !important;}\
+.notion-scroller.vertical { margin-bottom: 0px !important;}`
     );
 };
 
@@ -59,23 +64,28 @@ if (savedVariables[2][1] == "yes") {
 // Add menu command that allows the Translation API key to be changed.
 GM_registerMenuCommand ("Change Translation API Key", promptAndChangeStoredValue);
 
+
 // Add menu command that will allow to toggle On/Off the Log Parser.
 GM_registerMenuCommand ("Toggle Log Parser On / Off", toggleParser);
+
 
 // Add menu command that will allow to toggle On/Off the custom scrollbar.
 GM_registerMenuCommand ("Toggle Custom Scrollbar On / Off", toggleScrollbar);
 
+
 // Add menu command that will allow to toggle On/Off the dropdown lists on Linked Issues.
 GM_registerMenuCommand ("Toggle Linked Issue Dropdowns On / Off", toggleDropdown);
 
-// Add menu command that will allow to toggle On/Off the dropdown lists on Linked Issues.
+
+// Add menu command that will allow to toggle On/Off the extra buttons on bug reports.
 GM_registerMenuCommand ("Toggle Extra Buttons On / Off", toggleButtons);
+
 
 // Add menu command that will allow to toggle On/Off darkmode.
 GM_registerMenuCommand ("Toggle Dark Mode On / Off", toggleDarkmode);
 
 
-// Function which prompts the user to input a value for a Variable and saves it locally
+// Function which prompts the user to input a value for the Translation API Key and saves it locally
 function promptAndChangeStoredValue () {
     savedVariables[0][1] = prompt (
         'Change Translation API Key:',
@@ -86,7 +96,7 @@ function promptAndChangeStoredValue () {
 
 
 /*
-// This function could replace the following 3 functions if Tampermonkey accepted arguments in the GM_registerMenuCommand function
+// This function could replace the following 4 functions if Tampermonkey accepted parameters in the GM_registerMenuCommand function
 
 function toggleFeature(i) {
     savedVariables[i][1] = (savedVariables[i][1] == "yes") ? "no" : "yes";
@@ -95,32 +105,35 @@ function toggleFeature(i) {
 */
 
 
+// Function which toggles between "yes" and "no" for the parser variable and saves it locally
 function toggleParser() {
     savedVariables[1][1] = (savedVariables[1][1] == "yes") ? "no" : "yes";
     GM_setValue (savedVariables[1][0], savedVariables[1][1]);
 };
 
 
-
+// Function which toggles between "yes" and "no" for the scrollbar variable and saves it locally
 function toggleScrollbar() {
     savedVariables[2][1] = (savedVariables[2][1] == "yes") ? "no" : "yes";
     GM_setValue (savedVariables[2][0], savedVariables[2][1]);
 };
 
 
-
+// Function which toggles between "yes" and "no" for the dropdowns variable and saves it locally
 function toggleDropdown() {
     savedVariables[3][1] = (savedVariables[3][1] == "yes") ? "no" : "yes";
     GM_setValue (savedVariables[3][0], savedVariables[3][1]);
 };
 
 
+// Function which toggles between "yes" and "no" for the buttons variable and saves it locally
 function toggleButtons() {
     savedVariables[4][1] = (savedVariables[4][1] == "yes") ? "no" : "yes";
     GM_setValue (savedVariables[4][0], savedVariables[4][1]);
 };
 
 
+// Function which toggles darkmode on / off by sending the nescessary PUT command to the atlassian server to change the dark mode setting. It then reloads the page
 function toggleDarkmode() {
     if ($('html[data-color-mode="dark"]')[0]) {
         $('input[type=checkbox]').prop('checked', false);
@@ -129,7 +142,7 @@ function toggleDarkmode() {
             type: 'PUT',
             contentType: 'application/json',
             charset: 'utf-8',
-			Accept: 'application/json,text/javascript,*/*',
+            Accept: 'application/json,text/javascript,*/*',
             data: '{"value":"light"}',
         })
     } else {
@@ -139,7 +152,7 @@ function toggleDarkmode() {
             type: 'PUT',
             contentType: 'application/json',
             charset: 'utf-8',
-			Accept: 'application/json,text/javascript,*/*',
+            Accept: 'application/json,text/javascript,*/*',
             data: '{"value":"dark"}',
         })
     }
@@ -155,16 +168,16 @@ GM_addValueChangeListener("scrollbar", function(key, oldValue, newValue, remote)
     } else {
         GM_addStyle(
             '*::-webkit-scrollbar { width: 11px !important; height: 11px !important;}\
-            *::-webkit-scrollbar-thumb { border-radius: 10px !important; background: linear-gradient(left, #96A6BF, #63738C) !important;box-shadow: inset 0 0 1px 1px #828f9e !important;}\
-            .notion-scroller.horizontal { margin-bottom: 30px !important;}\
-            .notion-scroller.vertical { margin-bottom: 0px !important;}'
+*::-webkit-scrollbar-thumb { border-radius: 10px !important; background: linear-gradient(left, #96A6BF, #63738C) !important;box-shadow: inset 0 0 1px 1px #828f9e !important;}\
+.notion-scroller.horizontal { margin-bottom: 30px !important;}\
+.notion-scroller.vertical { margin-bottom: 0px !important;}'
         );
         GM_addStyle(cssDark);
     }
 });
 
 
-// Listener which triggers when the locally scaved scrollbar value is changed. If the new value is "no" we remove the custom scrollbar. If the new value is "yes" we add the custom scrollbar.
+// Listener which triggers when the locally scaved buttons value is changed. If the new value is "no" we remove the custom buttons. If the new value is "yes" we add the custom buttons.
 GM_addValueChangeListener("buttons", function(key, oldValue, newValue, remote) {
     if (newValue == "no") {
         $('#translateButton').remove();
@@ -172,7 +185,7 @@ GM_addValueChangeListener("buttons", function(key, oldValue, newValue, remote) {
         $('#ConvertToDefectButton').remove();
         $('#closeButton').remove();
     } else {
-        addButtons()
+        addButtons();
     }
 });
 
@@ -329,8 +342,6 @@ function addButtons() {
 
     // When the Convert to Defect button is clicked we trigger the Automation which converts the EBR into an EDR issue
     $("#ConvertToDefectButton").click(function () {
-        $(".icon-close").click();
-
         $.ajax({
             url: 'https://ccpgames.atlassian.net/gateway/api/automation/internal-api/jira/' + ajscloudid + '/pro/rest/rules/invocation/10609113',
             type: 'POST',
@@ -363,7 +374,6 @@ function addButtons() {
 };
 
 
-
 // Adds the "toggleText()" function to jQuery which lets you easily toggle between two given texts
 $.fn.extend({
     toggleText: function(a, b){
@@ -372,7 +382,7 @@ $.fn.extend({
 });
 
 
-// When we detect the "title row" of a log parser file then we swap out the content of the log file with a parsed, more readable version of it with some extra features likke buttons which allow you to toggle the visibility of certain types of events
+// When we detect the "Linked Issues" header on the page then we run the createDropdowns function which creates dropdown lists for all linked issues
 var linkedIssues = 'h2:contains(Linked issue)';
 waitForKeyElements (linkedIssues, createDropdowns);
 
@@ -398,26 +408,122 @@ function createDropdowns() {
 }
 
 
-
-// When we detect the "title row" of a log parser file then we swap out the content of the log file with a parsed, more readable version of it with some extra features likke buttons which allow you to toggle the visibility of certain types of events
+// When we detect the "title row" of a log parser file then we swap out the content of the log file with a parsed, more readable version of it with some extra features like buttons which allow you to toggle the visibility of certain types of events
 var selector = "span[data-testid='code-block']:contains(Time	Facility	Type	Message)";
-waitForKeyElements (selector, ArtificialSlowdown);
+waitForKeyElements(selector, SwapUI);
 
-// If the parser value is set we Swap out the Log file with the parsed version after 500ms (This slowdown seems to help with weird issues where atlassian seems to time how long content takes to load files but if we have swapped out the content before atlassian realizes that it completed loading then errors might occur)
-function ArtificialSlowdown() {
-    if (savedVariables[1][1] == "yes") {
-        setTimeout(SwapUI, 500);
-    };
-};
+
+// When we detect the "title row" of a processHealth file then we swap out the content of the log file with a parsed, more readable version of it with some extra features
+var phSelector = "span[data-testid='code-block']:contains(dateTime	pyDateTime	procCpu	threadCpu	pyMem	virtualMem	runnable1	runnable2	watchdog time	spf	serviceCalls	callsFromClient	bytesReceived	bytesSent	packetsReceived	packetsSent	sessionCount	tidiFactor)";
+waitForKeyElements(phSelector, SwapUI);
+
+
+// When we detect the "title row" of a methodCalls file then we swap out the content of the log file with a parsed, more readable version of it with some extra features
+var McSelector = "span[data-testid='code-block']:contains(Time	Method	Duration [ms])";
+waitForKeyElements(McSelector, SwapUI);
+
+
+// When we detect the oustandingCalls.txt file link inside the igbr.zip then we run the addClickEvent function
+var ocSelector = 'span[data-item-title="true"]:contains(outstandingcalls.txt)';
+waitForKeyElements(ocSelector, addClickEvent);
+
+
+// When we detect the lastCrashes.txt file link inside the igbr.zip then we run the addClickEvent2 function
+var lcSelector = 'span[data-item-title="true"]:contains(lastcrashes.txt)';
+waitForKeyElements(lcSelector, addClickEvent2);
+
+
+// When we detect the PDMData.txt file link inside the igbr.zip then we run the addClickEvent3 function
+var pdmSelector = 'span[data-item-title="true"]:contains(PDMData.txt)';
+waitForKeyElements(pdmSelector, addClickEvent3);
+
+
+//Once we click on the outstandingcalls.txt we set the oc variable to true and run the SwapUI function after 750ms (to give it some time to load)
+function addClickEvent() {
+    $("button:contains('outstandingcalls.txt')").on('click', function() {oc = true; setTimeout(SwapUI, 750)});
+}
+
+
+//Once we click on the lastcrashes.txt we set the lc variable to true and run the SwapUI function after 750ms (to give it some time to load)
+function addClickEvent2() {
+    $("button:contains('lastcrashes.txt')").on('click', function() {lc = true; setTimeout(SwapUI, 750)});
+}
+
+
+//Once we click on the PDMData.txt we set the pdm variable to true and run the SwapUI function after 750ms (to give it some time to load)
+function addClickEvent3() {
+    $("button:contains('PDMData.txt')").on('click', function() {pdm = true; setTimeout(SwapUI, 750)});
+}
 
 
 // Swap out the UI when looking at a log file and add the buttons to toggle message types at the top of the page
 function SwapUI() {
+    $('code > span:empty').remove()
     $('span[data-testid="code-block"]').find('span > span.comment').remove()
     rows = $("span[data-testid='code-block']").text();
-    $("span[data-testid='code-block']").html(html);
-    setTimeout(ParseLogs, 250);
 
+    if ($("span[data-testid='code-block']:contains(Time	Facility	Type	Message)")[0] && savedVariables[1][1] == "yes") {
+        $("span[data-testid='code-block']").html(html);
+        setTimeout(ParseLogs, 250);
+    }
+
+    else if ($("span[data-testid='code-block']:contains(dateTime	pyDateTime	procCpu	threadCpu	pyMem	virtualMem	runnable1	runnable2	watchdog time	spf	serviceCalls	callsFromClient	bytesReceived	bytesSent	packetsReceived	packetsSent	sessionCount	tidiFactor)")[0] && savedVariables[1][1] == "yes") {
+        $("span[data-testid='code-block']").html(phHtml);
+        setTimeout(ParsePhLogs, 250);
+    }
+
+    else if ($("span[data-testid='code-block']:contains(Time	Method	Duration [ms])")[0] && savedVariables[1][1] == "yes") {
+        $("span[data-testid='code-block']").html(McHtml);
+        setTimeout(ParseMcLogs, 250);
+    }
+
+    else if (oc && savedVariables[1][1] == "yes") {
+        $("span[data-testid='code-block']").html(ocHtml);
+        oc = false;
+        setTimeout(ParseOcLogs, 250);
+    }
+
+    else if (lc && savedVariables[1][1] == "yes") {
+        $("span[data-testid='code-block']").html(lcHtml);
+        lc = false;
+        setTimeout(ParseOcLogs, 250);
+    }
+
+    else if (pdm && savedVariables[1][1] == "yes") {
+        $("span[data-testid='code-block']").append(pdmHtml);
+        pdmdata = convertTextToObject(rows);
+
+        switch (pdmdata.DATA.OS.TYPE) {
+            case "Windows":
+                switch (true) {
+                    case ((Number(pdmdata.DATA.OS.BUILD_NUMBER) >= Number(recRequirements.OS.Windows.BuildNo)) && (pdmdata.DATA.MACHINE.CPU.VENDOR == "AuthenticAMD") && (Number(pdmdata.DATA.MACHINE.CPU.LOGICAL_CORE_COUNT) >= Number(recRequirements.CPU.AMD.Cores)) && (Number(pdmdata.DATA.MACHINE.CPU.FREQUENCY_MHZ) >= Number(recRequirements.CPU.AMD.Frequency)) && (Number(pdmdata.DATA.OS.GRAPHICS_APIS.D3D_HIGHEST_SUPPORT) >= Number(recRequirements.Graphics.D3D_SUPPORT)) && (Number(pdmdata.DATA.MACHINE.GPUS.GPU.VIDEO_MEMORY) >= Number(recRequirements.Graphics.Video_Memory)) && (Number(pdmdata.DATA.MACHINE.TOTAL_MEMORY) >= Number(recRequirements.RAM))) : $('#Requirements').html('This PC <u><b>does</b></u> meet the recommended requirements for EVE.'); break;
+                    case ((Number(pdmdata.DATA.OS.BUILD_NUMBER) >= Number(minRequirements.OS.Windows.BuildNo)) && (pdmdata.DATA.MACHINE.CPU.VENDOR == "AuthenticAMD") && (Number(pdmdata.DATA.MACHINE.CPU.LOGICAL_CORE_COUNT) >= Number(minRequirements.CPU.AMD.Cores)) && (Number(pdmdata.DATA.MACHINE.CPU.FREQUENCY_MHZ) >= Number(minRequirements.CPU.AMD.Frequency)) && (Number(pdmdata.DATA.OS.GRAPHICS_APIS.D3D_HIGHEST_SUPPORT) >= Number(minRequirements.Graphics.D3D_SUPPORT)) && (Number(pdmdata.DATA.MACHINE.GPUS.GPU.VIDEO_MEMORY) >= Number(minRequirements.Graphics.Video_Memory)) && (Number(pdmdata.DATA.MACHINE.TOTAL_MEMORY) >= Number(minRequirements.RAM))) : $('#Requirements').html('This PC <u><b>does</b></u> meet the minimum requirements for EVE.'); break;
+                    case ((Number(pdmdata.DATA.OS.BUILD_NUMBER) >= Number(recRequirements.OS.Windows.BuildNo)) && (pdmdata.DATA.MACHINE.CPU.VENDOR == "GenuineIntel") && (Number(pdmdata.DATA.MACHINE.CPU.LOGICAL_CORE_COUNT) >= Number(recRequirements.CPU.Intel.Cores)) && (Number(pdmdata.DATA.MACHINE.CPU.FREQUENCY_MHZ) >= Number(recRequirements.CPU.Intel.Frequency)) && (Number(pdmdata.DATA.OS.GRAPHICS_APIS.D3D_HIGHEST_SUPPORT) >= Number(recRequirements.Graphics.D3D_SUPPORT)) && (Number(pdmdata.DATA.MACHINE.GPUS.GPU.VIDEO_MEMORY) >= Number(recRequirements.Graphics.Video_Memory)) && (Number(pdmdata.DATA.MACHINE.TOTAL_MEMORY) >= Number(recRequirements.RAM))) : $('#Requirements').html('This PC <u><b>does</b></u> meet the recommended requirements for EVE.'); break;
+                    case ((Number(pdmdata.DATA.OS.BUILD_NUMBER) >= Number(rminRequirements.OS.Windows.BuildNo)) && (pdmdata.DATA.MACHINE.CPU.VENDOR == "GenuineIntel") && (Number(pdmdata.DATA.MACHINE.CPU.LOGICAL_CORE_COUNT) >= Number(minRequirements.CPU.Intel.Cores)) && (Number(pdmdata.DATA.MACHINE.CPU.FREQUENCY_MHZ) >= Number(minRequirements.CPU.Intel.Frequency)) && (Number(pdmdata.DATA.OS.GRAPHICS_APIS.D3D_HIGHEST_SUPPORT) >= Number(minRequirements.Graphics.D3D_SUPPORT)) && (Number(pdmdata.DATA.MACHINE.GPUS.GPU.VIDEO_MEMORY) >= Number(minRequirements.Graphics.Video_Memory)) && (Number(pdmdata.DATA.MACHINE.TOTAL_MEMORY) >= Number(minRequirements.RAM))) : $('#Requirements').html('This PC <u><b>does</b></u> meet the minimum requirements for EVE.'); break;
+                    default: $('#Requirements').html('This PC <u><b>does not</u></b> meet the minimum requirements for EVE.');
+                }
+                break;
+            case "macOS":
+                switch (true) {
+                    case ((Number(pdmdata.DATA.OS.MAJOR_VERSION + "." + pdmdata.DATA.OS.MINOR_VERSION) >= Number(recRequirements.OS.Mac.MajorVersion + "." + recRequirements.OS.Mac.MinorVersion)) && (pdmdata.DATA.MACHINE.CPU.VENDOR == "GenuineIntel") && (Number(pdmdata.DATA.MACHINE.CPU.LOGICAL_CORE_COUNT) >= Number(recRequirements.CPU.Intel.Cores)) && (Number(pdmdata.DATA.MACHINE.CPU.FREQUENCY_MHZ) >= Number(recRequirements.CPU.Intel.Frequency)) && (Number(pdmdata.DATA.MACHINE.TOTAL_MEMORY) >= Number(recRequirements.RAM))) : $('#Requirements').html('This PC <u><b>does</b></u> meet the recommended requirements for EVE.'); break;
+                    case ((Number(pdmdata.DATA.OS.MAJOR_VERSION + "." + pdmdata.DATA.OS.MINOR_VERSION) >= Number(recRequirements.OS.Mac.MajorVersion + "." + recRequirements.OS.Mac.MinorVersion)) && (pdmdata.DATA.MACHINE.CPU.VENDOR == "Apple") && (Number(pdmdata.DATA.MACHINE.CPU.LOGICAL_CORE_COUNT) >= Number(recRequirements.CPU.Apple.Cores)) && (Number(pdmdata.DATA.MACHINE.TOTAL_MEMORY) >= Number(recRequirements.RAM))) : $('#Requirements').html('This PC <u><b>does</b></u> meet the recommended requirements for EVE.'); break;
+                    case ((Number(pdmdata.DATA.OS.MAJOR_VERSION + "." + pdmdata.DATA.OS.MINOR_VERSION) >= Number(minRequirements.OS.Mac.MajorVersion + "." + minRequirements.OS.Mac.MinorVersion)) && (pdmdata.DATA.MACHINE.CPU.VENDOR == "GenuineIntel") && (Number(pdmdata.DATA.MACHINE.CPU.LOGICAL_CORE_COUNT) >= Number(minRequirements.CPU.Intel.Cores)) && (Number(pdmdata.DATA.MACHINE.CPU.FREQUENCY_MHZ) >= Number(minRequirements.CPU.Intel.Frequency)) && (Number(pdmdata.DATA.MACHINE.TOTAL_MEMORY) >= Number(minRequirements.RAM))) : $('#Requirements').html('This PC <u><b>does</b></u> meet the minimum requirements for EVE.'); break;
+                    case ((Number(pdmdata.DATA.OS.MAJOR_VERSION + "." + pdmdata.DATA.OS.MINOR_VERSION) >= Number(minRequirements.OS.Mac.MajorVersion + "." + minRequirements.OS.Mac.MinorVersion)) && (pdmdata.DATA.MACHINE.CPU.VENDOR == "Apple") && (Number(pdmdata.DATA.MACHINE.CPU.LOGICAL_CORE_COUNT) >= Number(minRequirements.CPU.Apple.Cores)) && (Number(pdmdata.DATA.MACHINE.TOTAL_MEMORY) >= Number(minRequirements.RAM))) : $('#Requirements').html('This PC <u><b>does</b></u> meet the minimum requirements for EVE.'); break;
+                    default: $('#Requirements').html('This PC <u><b>does not</u></b> meet the minimum requirements for EVE.');
+                }
+                break;
+            default:
+                $('#Requirements').html('This PC <u><b>does not</b></u> meet the minimum requirements for EVE.<div>Reason: Unsupported Operating System</div>');
+        }
+        var driverDate = pdmdata.DATA.MACHINE.GPUS.GPU.DRIVER.DATE.split("-");
+        driverDate = Date.parse(driverDate[2]+"-"+driverDate[0]+"-"+driverDate[1]);
+        driverAge = Math.ceil((today - driverDate)/(1000 * 3600 *24));
+        $('#driverAge').html('The graphics driver is '+ driverAge +' days old.');
+        pdm = false;
+    };
+
+
+    // Functionality for the buttons in the gpanel to toggle show / hide specific table rows
     $("#gpanel a").click(function() {
         switch ($(this).hasClass('toggle')) {
             case false:
@@ -447,19 +553,281 @@ function SwapUI() {
 };
 
 
+// Process the methodcalls logs and display them in a more readable state than the default
+function ParseMcLogs() {
+    var averageDuration = 0;
+    var count = 0;
+    var peak = 0;
+    rows = rows.replace(/(\t{2,})+/g, "\t").replace(/([\r\n]){2,}/g, "\r\n").replace(/([\r\n])[*]{3}(.*)(?=[*]{3})[*]{3}/g, "\r\n\t\t\tLogging error occurred").replace(/[\<]/g, function(c) {return "&lt;";}).replace(/\n$/, "").split("\n");
 
-// Process the logs and display them in a more readable state than the default
-function ParseLogs() {
-    rows = rows.replace(/(\t{2,})+/g, "\t").replace(/([\r\n]){2,}/g, "\r\n").replace(/([\r\n])[*]{3}(.*)(?=[*]{3})[*]{3}/g, "\r\n\t\t\tLogging error occurred").replace(/[\<]/g, function(c) {return "&lt;";}).split("\n");
-
-    /**
+ /**
  * Object to which we save the table
  */
     var logs = {};
     logs.tableInfo = [];
 
 
-    /**
+ /**
+ * Adds each row from 'rows' to the 'tableContent' table.
+ * rowQuantity: Quantity of rows which will be loaded
+ */
+    logs.showRow = function(rowQuantity) {
+        var table = logs.tableInfo;
+        var tableContent = document.getElementById('tableContent');
+        var tableContentRowsLength = 0;
+        var toIndex = tableContentRowsLength + rowQuantity;
+        for (var i = tableContentRowsLength, row, rowNumber, cellIndex, dateTime, method, duration, macho; i < toIndex; ++i) {
+            row = document.createElement('tr');
+            row.className = 'row';
+            cellIndex = -1;
+            dateTime = row.insertCell(++cellIndex);
+            dateTime.innerHTML = table[i][0];
+            method = row.insertCell(++cellIndex);
+
+            if (table[i][1] == "machoNet::GetTime (RemoteServiceCall)") {
+                macho = true;
+            }
+            else {
+                macho = false;
+            }
+
+            method.innerHTML = table[i][1];
+            duration = row.insertCell(++cellIndex);
+
+            if (table[i][2] >= 1500) {
+                row.className = 'red';
+            }
+            else if (table[i][2] >= 500) {
+                row.className = 'yellow';
+            }
+
+            if (macho & table[i][2] >= Number(peak)) {
+                $('.peakMachoCell').each(function() {$(this).removeClass('peakMachoCell')})
+                row.className += ' peakMachoCell'
+            }
+
+            duration.innerHTML = table[i][2];
+
+            tableContent.tBodies[0].appendChild(row);
+        }
+    };
+
+ /**
+ * Fill the table with the log data
+ */
+    for (var i = 1; i < rows.length; ++i) {
+        var cols = rows[i].split("\t");
+
+        if (cols[1] == "machoNet::GetTime (RemoteServiceCall)") {
+            averageDuration = averageDuration + Number(cols[2]);
+            count++;
+            if (Number(peak) < Number(cols[2])) {
+                peak = cols[2];
+            }
+        }
+
+        logs.tableInfo.push([cols[0], cols[1], cols[2]]);
+    }
+    $('#averageMacho').html('Average machoNet::GetTime duration: ' + Math.round(averageDuration / count) + 'ms <i class="fa-regular fa-circle-question" title="machoNet::GetTime is similar to the ping between the client and the EVE proxy.\nIf GetTime is bad / spiky then there are likely internet or client computer/network issues present.\nIf GetTime is stable and low but other calls are spiking then you can assume that there was some sort of server issue."></i>');
+    $('#peakMacho').html('Peak machoNet::GetTime duration: ' + peak + 'ms <i class="fa-regular fa-circle-question" title="Clicking this row scrolls to the highest GetTime value withing this log file."></i>');
+    $('#peakMacho').on('click', function(){$(".peakMachoCell")[0].scrollIntoView({ behavior: "smooth", block: "center", inline: "nearest" })})
+    logs.showRow((rows.length - 2));
+
+
+
+ /**
+ * Remove the loader and show the content
+ */
+    document.getElementById("loader").style.display = "none";
+    document.getElementById("tableContent").style.display = "table";
+};
+
+
+// Process the outstandingcalls logs and display them in a more readable state than the default
+function ParseOcLogs() {
+    rows = rows.replace(/(\t{2,})+/g, "\t").replace(/([\r\n]){2,}/g, "\r\n").replace(/([\r\n])[*]{3}(.*)(?=[*]{3})[*]{3}/g, "\r\n\t\t\tLogging error occurred").replace(/[\<]/g, function(c) {return "&lt;";}).replace(/\n$/, "").split("\n");
+
+ /**
+ * Object to which we save the table
+ */
+    var logs = {};
+    logs.tableInfo = [];
+
+
+ /**
+ * Adds each row from 'rows' to the 'tableContent' table.
+ * rowQuantity: Quantity of rows which will be loaded
+ */
+    logs.showRow = function(rowQuantity) {
+        var table = logs.tableInfo;
+        var tableContent = document.getElementById('tableContent');
+        var tableContentRowsLength = 0;
+        var toIndex = tableContentRowsLength + rowQuantity;
+        for (var i = tableContentRowsLength, row, rowNumber, cellIndex, dateTime, method; i < toIndex; ++i) {
+            if (table[i][0] == "") {
+                break;
+            }
+            row = document.createElement('tr');
+            row.className = 'row';
+            cellIndex = -1;
+            dateTime = row.insertCell(++cellIndex);
+            dateTime.innerHTML = table[i][0];
+            method = row.insertCell(++cellIndex);
+            method.innerHTML = table[i][1];
+
+            tableContent.tBodies[0].appendChild(row);
+        }
+    };
+
+ /**
+ * Fill the table with the log data
+ */
+    for (var i = 0; i < rows.length; ++i) {
+        var cols = rows[i].split(" - ");
+        logs.tableInfo.push([cols[0], cols[1]]);
+    }
+
+    logs.showRow((rows.length));
+
+
+
+ /**
+ * Remove the loader and show the content
+ */
+    document.getElementById("loader").style.display = "none";
+    document.getElementById("tableContent").style.display = "table";
+};
+
+
+// Process the processHealth logs and display them in a more readable state than the default
+function ParsePhLogs() {
+    rows = rows.replace(/(\t{2,})+/g, "\t").replace(/([\r\n]){2,}/g, "\r\n").replace(/([\r\n])[*]{3}(.*)(?=[*]{3})[*]{3}/g, "\r\n\t\t\tLogging error occurred").replace(/[\<]/g, function(c) {return "&lt;";}).replace(/\n$/, "").split("\n");
+
+ /**
+ * Object to which we save the table
+ */
+    var logs = {};
+    logs.tableInfo = [];
+
+
+ /**
+ * Adds each row from 'rows' to the 'tableContent' table.
+ * rowQuantity: Quantity of rows which will be loaded
+ */
+    logs.showRow = function(rowQuantity) {
+        var table = logs.tableInfo;
+        var tableContent = document.getElementById('tableContent');
+        var tableContentRowsLength = 0;
+        var toIndex = tableContentRowsLength + rowQuantity;
+        for (var i = tableContentRowsLength, row, rowNumber, cellIndex, dateTime, pyDateTime, procCpu, threadCpu, pyMem, virtualMem, runnable1, runnable2, watchdogTime, spf, serviceCalls, callsFromClient, bytesReceived, bytesSent, packetsReceived, packetsSent, sessionCount, tidiFactor; i < toIndex; ++i) {
+            row = document.createElement('tr');
+            row.className = 'row';
+            cellIndex = -1;
+            dateTime = row.insertCell(++cellIndex);
+            dateTime.innerHTML = table[i][0];
+            pyDateTime = row.insertCell(++cellIndex);
+            pyDateTime.innerHTML = table[i][1];
+            procCpu = row.insertCell(++cellIndex);
+            procCpu.innerHTML = table[i][2];
+            threadCpu = row.insertCell(++cellIndex);
+            threadCpu.innerHTML = table[i][3];
+            pyMem = row.insertCell(++cellIndex);
+            pyMem.innerHTML = table[i][4];
+            virtualMem = row.insertCell(++cellIndex);
+            virtualMem.innerHTML = table[i][5];
+            runnable1 = row.insertCell(++cellIndex);
+            runnable1.innerHTML = table[i][6];
+            runnable2 = row.insertCell(++cellIndex);
+            runnable2.innerHTML = table[i][7];
+            watchdogTime = row.insertCell(++cellIndex);
+            watchdogTime.innerHTML = Number(table[i][8]);
+            spf = row.insertCell(++cellIndex);
+
+            if (Number(table[i][9]) >= "0.0666666666666667") {
+                spf.className += 'red';
+            }
+            else if (Number(table[i][9]) >= "0.0333333333333333") {
+                spf.className += 'yellow';
+            }
+
+            spf.innerHTML = Math.round(1 / Number(table[i][9]) *10000) /10000;
+            serviceCalls = row.insertCell(++cellIndex);
+            serviceCalls.innerHTML = table[i][10];
+            callsFromClient = row.insertCell(++cellIndex);
+            callsFromClient.innerHTML = table[i][11];
+            bytesReceived = row.insertCell(++cellIndex);
+            bytesReceived.innerHTML = table[i][12];
+            bytesSent = row.insertCell(++cellIndex);
+            bytesSent.innerHTML = table[i][13];
+            packetsReceived = row.insertCell(++cellIndex);
+            packetsReceived.innerHTML = table[i][14];
+            packetsSent = row.insertCell(++cellIndex);
+            packetsSent.innerHTML = table[i][15];
+            sessionCount = row.insertCell(++cellIndex);
+            sessionCount.innerHTML = table[i][16];
+            tidiFactor = row.insertCell(++cellIndex);
+
+            if (table[i][17] <= "0.2") {
+                tidiFactor.className += 'red';
+            }
+            else if (table[i][17] <= "0.8") {
+                tidiFactor.className += 'yellow';
+            }
+            else if (table[i][17] >= "1.05") {
+                tidiFactor.className += 'red';
+            }
+
+
+            tidiFactor.innerHTML = table[i][17];
+            tableContent.tBodies[0].appendChild(row);
+        }
+    };
+
+ /**
+ * Fill the table with the log data
+ */
+    for (var i = 1; i < rows.length; ++i) {
+        var cols = rows[i].split("\t");
+        logs.tableInfo.push([cols[0], cols[1], cols[2], cols[3], cols[4], cols[5], cols[6], cols[7], cols[8], cols[9], cols[10], cols[11], cols[12], cols[13], cols[14], cols[15], cols[16], cols[17]]);
+    }
+    logs.showRow((rows.length - 2));
+
+ /**
+ * Clickhandler for when the user clicks on the FPS /spf row. We toggle between spf and FPS on click
+ */
+    var clickHandler = function() {
+        return function() {
+            let FPS = 'FPS <i class="fa-regular fa-circle-question" title="Frames per second"></i>'
+            let spf = 'spf <i class="fa-regular fa-circle-question" title="Seconds per frame"></i>'
+            $('#tableContent > thead > tr > th:nth-child(10)').html($(this).html() == FPS ? spf : FPS);
+            $('#tableContent > tbody > tr > td:nth-child(10)').each(function() {
+                $(this).text(Math.round(1 / $(this).text() *10000) /10000);
+            });
+        };
+    };
+    $('#tableContent > thead > tr > th:nth-child(10)').on('click', clickHandler());
+
+
+ /**
+ * Remove the loader and show the content
+ */
+    document.getElementById("loader").style.display = "none";
+    document.getElementById("tableContent").style.display = "table";
+};
+
+
+
+// Process the logs and display them in a more readable state than the default
+function ParseLogs() {
+    rows = rows.replace(/(\t{2,})+/g, "\t").replace(/([\r\n]){2,}/g, "\r\n").replace(/([\r\n])[*]{3}(.*)(?=[*]{3})[*]{3}/g, "\r\n\t\t\tLogging error occurred").replace(/[\<]/g, function(c) {return "&lt;";}).replace(/\n$/, "").split("\n");
+
+ /**
+ * Object to which we save the table
+ */
+    var logs = {};
+    logs.tableInfo = [];
+
+ /**
  * Adds each row from 'rows' to the 'tableContent' table.
  * rowQuantity: Quantity of rows which will be loaded
  */
@@ -467,7 +835,7 @@ function ParseLogs() {
         var excTime, sttTime = "";
         var table = logs.tableInfo;
         var tableContent = document.getElementById('tableContent');
-        var tableContentRowsLength = tableContent.rows.length;
+        var tableContentRowsLength = 0;
         var toIndex = tableContentRowsLength + rowQuantity;
         for (var i = tableContentRowsLength, row, rowNumber, cellIndex, timeCell, facilityCell, typeCell, messageCell, clickHandler; i < toIndex; ++i) {
             row = document.createElement('tr');
@@ -480,7 +848,7 @@ function ParseLogs() {
             typeCell = row.insertCell(++cellIndex);
 
 
-            /**
+ /**
  * Switch for checking if the current row is a notice, warning, error or info message
  * and add the according class to the row
  */
@@ -499,8 +867,7 @@ function ParseLogs() {
                     break;
             }
 
-
-            /**
+ /**
  * Check if the message contains the beginning of an exception and set excTime (Exception time) to the time of the current message
  * Also adds a border to the top of the row
  */
@@ -510,7 +877,7 @@ function ParseLogs() {
             }
 
 
-            /**
+ /**
  * Check if the message contains the beginning of a stacktrace,
  * then set sttTime (Stacktrace time) to the time of the current message and add a border to the top of the row
  */
@@ -520,7 +887,7 @@ function ParseLogs() {
             }
 
 
-            /**
+ /**
  * If the time of the current message is the same time as it was when the exception started
  * then add the 'exception' class to the row
  */
@@ -529,7 +896,7 @@ function ParseLogs() {
             }
 
 
-            /**
+ /**
  * If there is an "Exception End" message in the current log row,
  * then add the 'borderbot' class to the row and set excTime to its default value
  */
@@ -539,7 +906,7 @@ function ParseLogs() {
             }
 
 
-            /**
+ /**
  * If excTime is not empty but it doesnt match the time of the current row,
  * then add the 'borderbot' class to the row and set excTime to its default value
  */
@@ -549,7 +916,7 @@ function ParseLogs() {
             }
 
 
-            /**
+ /**
  * If there is an "Stacktrace End" message in the current log row,
  * then add the 'borderbot' class to the row and set sttTime to its default value
  */
@@ -559,7 +926,7 @@ function ParseLogs() {
             }
 
 
-            /**
+ /**
  * If sttTime is not empty but it doesnt match the time of the current row,
  * then add the 'borderbot' class to the row and set sttTime to its default value
  */
@@ -574,7 +941,7 @@ function ParseLogs() {
             messageCell.innerHTML = table[i][3];
 
 
-            /**
+ /**
  * Currently unused clickHandler
  */
             clickHandler = function(row) {
@@ -588,17 +955,17 @@ function ParseLogs() {
     };
 
 
-    /**
+ /**
  * Fill the table with the log data
  */
     for (var i = 1; i < rows.length; ++i) {
         var cols = rows[i].split("\t");
         logs.tableInfo.push([cols[0], cols[1], cols[2], cols[3]]);
     }
-    logs.showRow((rows.length - 2));
+    logs.showRow((rows.length - 1));
 
 
-    /**
+ /**
  * Remove the loader and show the content
  */
     document.getElementById("loader").style.display = "none";
@@ -606,48 +973,79 @@ function ParseLogs() {
 };
 
 
-
-
-
-// Variable which contains the UI of the Log Parser
-var html = `
-<style>
-    body {
-      color: #333;
-      font: 13px/1.2 Arial,Helvetica,sans-serif;
+// CSS for all parsed Logs
+var css = `
+	.pointer {
+      cursor: pointer;
     }
+
+    .peakMachoCell {
+      border: solid thin;
+      border-color: red;
+    }
+
+    #peakMacho {
+      cursor: pointer;
+      text-align: right;
+    }
+
+    #averageMacho {
+      text-align: right;
+    }
+
+    #gpanel {
+      position: fixed;
+      top: 75px;
+      left: 520px;
+      box-sizing: border-box;
+      width: auto;
+      height: 43px;
+      padding: 0 5px;
+      overflow: visible;
+    }
+
+    #gheader {
+      white-space: normal;
+      z-index: 522;
+    }
+
+    #gpanel ul {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+    }
+
+    #gpanel li {
+      float: left;
+      overflow: hidden;
+      margin-top: 0px;
+    }
+
+    #gnav {
+      float: left;
+      overflow: hidden;
+    }
+
+    .red {
+      background: #f99;
+    }
+
+    .yellow {
+      background: #ff9;
+    }
+
     td:first-child, th:first-child {
        padding: 4px 8px;
     }
+
     th {
       vertical-align: top;
       text-align: left;
       font-weight: bold;
+      color: aliceblue;
+      background-color: #282d33;
     }
-    #header-fixed {
-      border-bottom: 0px;
-      text-align: center;
-    }
-    #header-fixed tr th {
-      vertical-align: top;
-      font-weight: bold;
-      width: 68px;
-    }
-    #header-fixed tr th+th {
-      vertical-align: top;
-      font-weight: bold;
-      width: 257px;
-    }
-    #header-fixed tr th+th+th {
-      vertical-align: top;
-      font-weight: bold;
-      width: 69px;
-    }
-    #header-fixed tr th+th+th+th {
-      vertical-align: top;
-      font-weight: bold;
-      width: auto;
-    }
+
     td {
       vertical-align: top;
       text-align: left;
@@ -656,48 +1054,164 @@ var html = `
       font-weight: normal;
       border-right: 1.5px solid #aaaaaa;
     }
+
     .row {
       background: #FFF;
-      cursor: default;
     }
+
+    #body {
+      margin-top: -12px;
+      overflow: auto;
+      white-space: normal;
+    }
+
+    #body h1 {
+      margin: 0;
+      padding: 10px 20px 5px;
+      border-bottom: 1px solid #CCC;
+      color: #848589;
+      font: 400 30px 'Segoe UI',Arial,Helvetica,sans-serif;
+      height: 41px;
+    }
+
+    #table {
+      position: absolute;
+      top: 85px;
+      bottom: 0;
+      width: 100%;
+      -webkit-transition: .3s linear;
+      -moz-transition: .3s linear;
+      transition: .3s linear;
+      overflow-y: scroll;
+      margin-top: 28px;
+    }
+
+    #table table {
+      width: max-content;
+      border-collapse: collapse;
+      border-spacing: 0;
+      table-layout: fixed;
+      -webkit-box-sizing: content-box;
+      -moz-box-sizing: content-box;
+      box-sizing: content-box;
+      word-wrap: break-word;
+      table-layout: fixed;
+      color: #333;
+    }
+
+    #loader {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      z-index: 1;
+      width: 150px;
+      height: 150px;
+      margin: -75px 0 0 -75px;
+      border: 16px solid #f3f3f3;
+      border-radius: 50%;
+      border-top: 16px solid #3498db;
+      width: 120px;
+      height: 120px;
+      -webkit-animation: spin 2s linear infinite;
+      animation: spin 2s linear infinite;
+    }
+
+    @-webkit-keyframes spin {
+      0% { -webkit-transform: rotate(0deg); }
+      100% { -webkit-transform: rotate(360deg); }
+    }
+
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+
+    .animate-bottom {
+      position: relative;
+      -webkit-animation-name: animatebottom;
+      -webkit-animation-duration: 1s;
+      animation-name: animatebottom;
+      animation-duration: 1s
+    }
+
+    @-webkit-keyframes animatebottom {
+      from { bottom:-100px; opacity:0 }
+      to { bottom:0px; opacity:1 }
+    }
+
+    @keyframes animatebottom {
+      from{ bottom:-100px; opacity:0 }
+      to{ bottom:0; opacity:1 }
+    }
+
+    .fixedHead {
+      overflow: auto;
+      height: 100px;
+    }
+
+    .fixedHead thead th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }
+
+    .floating-div {
+      background-color: #333;
+      padding: 10px 50px;
+      color: #EEE;
+      margin-top: 10px;
+      position: fixed;
+      top: 75px;
+      right: 18px;
+      width: calc(33.33% - 25px);
+      white-space: normal;
+    }
+`
+
+
+// Additional CSS only for the LogParser
+var cssLogParser = `
+    td:first-child, th:first-child {
+       padding: 4px 8px;
+    }
+
+    th {
+      vertical-align: top;
+      text-align: left;
+      font-weight: bold;
+      background-color: #282d33;
+      color: aliceblue;
+    }
+
+    td {
+      vertical-align: top;
+      text-align: left;
+      font-family: Courier New;
+      font-size: 11px;
+      font-weight: normal;
+      border-right: 1.5px solid #aaaaaa;
+    }
+
+    .row {
+      background: #FFF;
+    }
+
     .notice {
       background: #99ff99;
     }
+
     .warning {
       background: #ff9;
     }
+
     .error {
       background: #f99;
     }
+
     .info {
       background: #7dcbff;
     }
-    html {
-      height: 100%;
-      background-color: #FFF;
-      background: -webkit-gradient(linear,left top,left bottom,from(#EEE),to(#FFF));
-      background: -webkit-radial-gradient(#FFF,#FFF 35%,#EEE);
-      background: -moz-radial-gradient(#FFF,#FFF 35%,#EEE);
-      background: radial-gradient(#FFF,#FFF 35%,#EEE);
-      -webkit-user-select: none;
-      -khtml-user-select: none;
-      -moz-user-select: -moz-none;
-      -o-user-select: none;
-      user-select: text;
-      -webkit-touch-callout: none;
-      -webkit-tap-highlight-color: transparent;
-      -webkit-text-size-adjust: none;
-      -webkit-font-smoothing: antialiased;
-      cursor: default;
-    }
-    body {
-      margin: 0;
-      background-color: transparent;
-      overflow: hidden;
-    }
-    a {
-      outline: none;
-    }
+
     #gpanel {
       position: fixed;
       top: 15px;
@@ -709,21 +1223,8 @@ var html = `
       line-height: 46px;
       overflow: visible;
     }
-    #gheader {
-      white-space: normal;
-      z-index: 522;
-    }
-    #gpanel ul {
-      list-style: none;
-      margin: 0;
-      padding: 0;
-    }
-    #gpanel li {
-      float: left;
-      overflow: hidden;
-      margin-top: 0px;
-    }
-    #gpanel a {
+
+	#gpanel a {
       display: block;
       padding: 0 10px;
       color: #FFF;
@@ -736,164 +1237,64 @@ var html = `
       -o-transition: 0.1s ease-in-out;
       transition: .1s ease-in-out;
     }
+
     #gpanel li a  {
       color: #FFF;
       background-color: #7B4;
       border: 1px solid black;
     }
-    #gnav {
-      float: left;
-      overflow: hidden;
-    }
-    #body {
-      margin-top: -20px;
-      overflow: auto;
-    }
-    #body h1 {
-      margin: 0;
-      padding: 10px 20px 5px;
-      border-bottom: 1px solid #CCC;
-      color: #848589;
-      font: 400 30px 'Segoe UI',Arial,Helvetica,sans-serif;
-      height: 41px;
-    }
-    .toggle {
+
+	.toggle {
       color: #FFF;
       background-color: #8b8e89 !important;
       border: 1px solid black;
     }
+
     #button a  {
       color: #FFF;
       background-color: #7B4;
       border: 1px solid black;
     }
+
     #button a:hover {
       background-color: rgba(204,204,204,.4);
       color: #FFF;
     }
-    #table {
-      position: absolute;
-      top: 85px;
-      bottom: 0;
-      width: 100%;
-      -webkit-transition: .3s linear;
-      -moz-transition: .3s linear;
-      transition: .3s linear;
-      overflow-y: scroll;
-      margin-top: 20px;
-    }
-    #table.hidden {
-      opacity: 0;
-      -webkit-transform: scale(0);
-      -moz-transform: scale(0);
-      -o-transform: scale(0);
-      -ms-transform: scale(0);
-      transform: scale(0);
-    }
-    #table:focus {
-      outline: none;
-    }
-    ::-moz-focus-inner {
-      border: none;
-    }
-    #table table {
-      width: 100%;
-      border-collapse: collapse;
-      border-spacing: 0;
-      table-layout: fixed;
-      -webkit-box-sizing: content-box;
-      -moz-box-sizing: content-box;
-      box-sizing: content-box;
-    }
-    #tableHeader {
-      top: 101px;
-    }
-    #tableContent {
-      word-wrap: break-word;
-      table-layout: fixed;
-      color: #333;
-    }
+
     .timeCol {
       width: 139.766px;
       text-align: center;
     }
+
     .facilityCol {
       width: 265px;
     }
+
     .typeCol {
       width: 70px;
     }
+
     .messageCol {
       width: auto;
     }
+
     .bordertop {
         border-top: 2px solid #aaaaaa;
     }
+
     .borderbot {
         border-bottom: 2px solid #aaaaaa;
     }
-    #header-fixed {
-      position: fixed;
-      top: 85px;
-      display:table;
-      width: -webkit-fill-available;
-    }
+`
 
 
-/* Center the loader */
-#loader {
-  position: absolute;
-  left: 50%;
-  top: 50%;
-  z-index: 1;
-  width: 150px;
-  height: 150px;
-  margin: -75px 0 0 -75px;
-  border: 16px solid #f3f3f3;
-  border-radius: 50%;
-  border-top: 16px solid #3498db;
-  width: 120px;
-  height: 120px;
-  -webkit-animation: spin 2s linear infinite;
-  animation: spin 2s linear infinite;
-}
-
-@-webkit-keyframes spin {
-  0% { -webkit-transform: rotate(0deg); }
-  100% { -webkit-transform: rotate(360deg); }
-}
-
-@keyframes spin {
-  0% { transform: rotate(0deg); }
-  100% { transform: rotate(360deg); }
-}
-
-/* Add animation to "page content" */
-.animate-bottom {
-  position: relative;
-  -webkit-animation-name: animatebottom;
-  -webkit-animation-duration: 1s;
-  animation-name: animatebottom;
-  animation-duration: 1s
-}
-
-@-webkit-keyframes animatebottom {
-  from { bottom:-100px; opacity:0 }
-  to { bottom:0px; opacity:1 }
-}
-
-@keyframes animatebottom {
-  from{ bottom:-100px; opacity:0 }
-  to{ bottom:0; opacity:1 }
-}
-
-#myDiv {
-  display: none;
-  text-align: center;
-}
+// Variable which contains the UI of the Log Parser
+var html = `
+<style>
+`+ css + cssLogParser +`
 </style>
 
-<title>Log Parser | Jira</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 <body>
    <header id="gheader">
       <nav id="gpanel">
@@ -918,29 +1319,59 @@ var html = `
          <h1>Logfile Parser</h1>
       </header>
       <div id="table" tabindex="0">
-         <table id="tableHeader">
-            <colgroup>
-               <col class="timeCol">
-               <col class="facilityCol">
-               <col class="typeCol">
-               <col class="messageCol">
-            </colgroup>
-            <thead id ="header-fixed">
-               <tr id = "fixedHead">
-                  <th>Time
-                  <th>Facility
-                  <th>Type
-                  <th>Message
-            </thead>
+         <table id="tableContent" style="display:none;" class="fixedHead">
+         <div id="loader"></div>
+         <thead>
+               <tr>
+                  <th scope="col">Time
+                  <th scope="col">Facility
+                  <th scope="col">Type
+                  <th scope="col">Message
+         </thead>
+         <tbody></tbody>
          </table>
-         <table id="tableContent" style="display:none;">
+      </div>
+   </div>
+`;
+
+
+
+// Variable which contains the UI of the Process Health parser
+var phHtml = `
+<style>
+`+ css +`
+</style>
+
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+<body>
+   <div id="body">
+      <header>
+         <h1>Process Health</h1>
+      </header>
+      <div id="table" tabindex="0">
+         <table id="tableContent" style="display:none;" class="fixedHead">
             <div id="loader"></div>
-            <colgroup>
-               <col class="timeCol">
-               <col class="facilityCol">
-               <col class="typeCol">
-               <col class="messageCol">
-            </colgroup>
+            <thead>
+               <tr>
+                  <th scope="col">dateTime <i class="fa-regular fa-circle-question" title="System date / time converted into UTC"></i>
+                  <th scope="col">pyDateTime
+                  <th scope="col">procCpu <i class="fa-regular fa-circle-question" title="CPU usage in % of one CPU core"></i>
+                  <th scope="col">threadCpu <i class="fa-regular fa-circle-question" title="CPU usage in % for the python thread"></i>
+                  <th scope="col">pyMem <i class="fa-regular fa-circle-question" title="Memory usage for the python part of the client in Mb"></i>
+                  <th scope="col">virtualMem <i class="fa-regular fa-circle-question" title="Total memory usage of the client in Mb"></i>
+                  <th scope="col">runnable1 <i class="fa-regular fa-circle-question" title="How many python threads are waiting to be run"></i>
+                  <th scope="col">runnable2 <i class="fa-regular fa-circle-question" title="How many python threads are waiting to be run"></i>
+                  <th scope="col">watchdog time <i class="fa-regular fa-circle-question" title="Time spent for watchdog in ms"></i>
+                  <th scope="col" class="pointer">FPS <i class="fa-regular fa-circle-question" title="Frames per second"></i></th>
+                  <th scope="col">serviceCalls
+                  <th scope="col">callsFromClient
+                  <th scope="col">bytesReceived <i class="fa-regular fa-circle-question" title="Bytes recieved from the EVE Server (Not including chat, imageserver and other services)"></i>
+                  <th scope="col">bytesSent <i class="fa-regular fa-circle-question" title="Bytes sent to the EVE Server (Not including chat, imageserver and other services)"></i>
+                  <th scope="col">packetsReceived <i class="fa-regular fa-circle-question" title="Packets recieved from the EVE Server (Not including chat, imageserver and other services)"></i>
+                  <th scope="col">packetsSent <i class="fa-regular fa-circle-question" title="Bytes sent to the EVE Server (Not including chat, imageserver and other services)"></i>
+                  <th scope="col">sessionCount <i class="fa-regular fa-circle-question" title="Should always be 1"></i>
+                  <th scope="col">tidiFactor <i class="fa-regular fa-circle-question" title="Time Dilation - 1.0 = No TiDi"></i>
+            </thead>
             <tbody></tbody>
          </table>
       </div>
@@ -948,6 +1379,98 @@ var html = `
 `;
 
 
+// Variable which contains the UI of the Method Calls parser
+var McHtml = `
+<style>
+`+ css +`
+</style>
+
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+<body>
+  <header id="gheader">
+      <nav id="gpanel">
+         <ul id="gnav">
+            <li>
+               <div id="averageMacho"> Average machoNet::GetTime duration:</div>
+               <div id="peakMacho"> Peak machoNet::GetTime duration:</div>
+         </ul>
+      </nav>
+   </header>
+   <div id="body">
+      <header>
+         <h1>Method Calls</h1>
+      </header>
+      <div id="table" tabindex="0">
+         <table id="tableContent" style="display:none;" class="fixedHead">
+            <div id="loader"></div>
+            <thead>
+               <tr>
+                  <th scope="col">Time <i class="fa-regular fa-circle-question" title="System date / time converted into UTC"></i>
+                  <th scope="col">Method <i class="fa-regular fa-circle-question" title="Python method which was called"></i>
+                  <th scope="col">Duration in ms <i class="fa-regular fa-circle-question" title="How long it took to complete the method call"></i>
+            </thead>
+            <tbody></tbody>
+         </table>
+      </div>
+   </div>
+`;
+
+
+// Variable which contains the UI of the Outstanding Calls parser
+var ocHtml = `
+<style>
+`+ css +`
+</style>
+
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+<body>
+   <div id="body">
+      <header>
+         <h1>Outstanding Calls</h1>
+      </header>
+      <div id="table" tabindex="0">
+         <table id="tableContent" style="display:none;" class="fixedHead">
+            <div id="loader"></div>
+            <thead>
+               <tr>
+                  <th scope="col">Time <i class="fa-regular fa-circle-question" title="System date / time converted into UTC"></i>
+                  <th scope="col">Method <i class="fa-regular fa-circle-question" title="Python method which was called but is not yet finished"></i>
+            </thead>
+            <tbody></tbody>
+         </table>
+      </div>
+   </div>
+`;
+
+
+// Variable which contains the UI of the Last Crashes parser
+var lcHtml = `
+<style>
+`+ css +`
+</style>
+
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+<body>
+   <div id="body">
+      <header>
+         <h1>Last Crashes</h1>
+      </header>
+      <div id="table" tabindex="0">
+         <table id="tableContent" style="display:none;" class="fixedHead">
+            <div id="loader"></div>
+            <thead>
+               <tr>
+                  <th scope="col">Time <i class="fa-regular fa-circle-question" title="System date / time converted into UTC"></i>
+                  <th scope="col">Crash ID
+            </thead>
+            <tbody></tbody>
+         </table>
+      </div>
+   </div>
+`;
+
+
+// HTML for the darkMode Switch
 var darkModeSwitch = `
     <span>
       <input type="checkbox" class="checkbox" id="checkbox">
@@ -963,46 +1486,51 @@ var darkModeSwitch = `
     </span>
     `
 
+// CSS for the darkMode Switch
 var darkModeSwitchCss = `
+    .checkbox {
+      opacity: 0;
+      position: absolute;
+    }
 
-.checkbox {
-  opacity: 0;
-  position: absolute;
-}
+    .checkbox-label {
+      box-sizing: border-box;
+      background-color: #323232;
+      width: 50px;
+      height: 26px;
+      border-radius: 50px;
+      position: relative;
+      padding: 5px;
+      cursor: pointer;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
 
-.checkbox-label {
-  box-sizing: border-box;
-  background-color: #323232;
-  width: 50px;
-  height: 26px;
-  border-radius: 50px;
-  position: relative;
-  padding: 5px;
-  cursor: pointer;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
+    .fa-moon {
+      color: #f1c40f;
+    }
 
-.fa-moon {color: #f1c40f;}
+    .fa-sun {
+      color: #f39c12;
+    }
 
-.fa-sun {color: #f39c12;}
+    .checkbox-label .ball {
+      background-color: #fff;
+      width: 22px;
+      height: 22px;
+      position: absolute;
+      left: 2px;
+      top: 2px;
+      border-radius: 50%;
+      transition: transform 0.2s linear;
+    }
 
-.checkbox-label .ball {
-  background-color: #fff;
-  width: 22px;
-  height: 22px;
-  position: absolute;
-  left: 2px;
-  top: 2px;
-  border-radius: 50%;
-  transition: transform 0.2s linear;
-}
-
-.checkbox:checked + .checkbox-label .ball {
-  transform: translateX(24px);
-}
+    .checkbox:checked + .checkbox-label .ball {
+      transform: translateX(24px);
+    }
 `
+
 
 // We wait until the searchbar is loaded before running the function addDarkmodeToggle
 var searchbar = 'input[data-test-id="search-dialog-input"';
@@ -1021,3 +1549,138 @@ function addDarkmodeToggle() {
     }
 }
 
+
+// Rough minimum requirements for EVE
+var minRequirements = {
+    OS: {
+        Windows: {
+            BuildNo: "7600"
+        },
+        Mac: {
+            MajorVersion: "10",
+            MinorVersion: "14"
+        }
+    },
+    CPU: {
+        Intel: {
+            Cores: "2",
+            Frequency: "2000"
+        },
+        Apple: {
+            Cores: "8"
+        },
+        AMD: {
+            Cores: "2",
+            Frequency: "2000"
+        }
+    },
+    Graphics: {
+        D3D_SUPPORT: "11",
+        Video_Memory: "1073741824"
+    },
+    RAM: "4294967296"
+};
+
+
+// Rough recommended requirements for EVE
+var recRequirements = {
+    OS: {
+        Windows: {
+            BuildNo: "10240"
+        },
+        Mac: {
+            MajorVersion: "12",
+            MinorVersion: "0",
+            Bitness: "x64"
+        }
+    },
+    CPU: {
+        Intel: {
+            Cores: "4",
+            Frequency: "3600"
+        },
+        Apple: {
+            Cores: "10"
+        },
+        AMD: {
+            Cores: "8",
+            Frequency: "3000"
+        }
+    },
+    Graphics: {
+        D3D_SUPPORT: "11",
+        Video_Memory: "8289934592"
+    },
+    RAM: "17179869184"
+};
+
+
+// Function to convert the PDMData.txt into a javascript object
+function convertTextToObject(text) {
+    var lines = text.split("\n");
+    var stack = [];
+    var currentObject = {};
+    var result = currentObject;
+    var tabRegex = /^(\t*)/;
+
+    for (var i = 0; i < lines.length; i++) {
+        var line = lines[i];
+        var tabs = line.match(tabRegex)[0].length;
+        line = line.trim();
+
+        if (line.startsWith("{") && line.endsWith("}")) {
+            var newObject = {};
+
+            if (stack.length > tabs) {
+                stack.splice(tabs); // Go up to the appropriate nesting level
+            }
+
+            if (stack.length === 0) {
+                result[line.substring(1, line.length - 1)] = newObject;
+            } else {
+                var parent = stack[stack.length - 1];
+                var objectKey = line.substring(1, line.length - 1);
+
+                if (!parent[objectKey]) {
+                    parent[objectKey] = newObject;
+                } else {
+                    if (!Array.isArray(parent[objectKey])) {
+                        parent[objectKey] = [parent[objectKey]];
+                    }
+                    parent[objectKey].push(newObject);
+                }
+            }
+
+            currentObject = newObject;
+            stack.push(currentObject);
+        } else if (line.startsWith("}")) {
+            stack.pop();
+            currentObject = stack[stack.length - 1];
+        } else if (line.includes(":")) {
+            var keyValue = line.split(":");
+            var key = keyValue[0].trim();
+            var value = keyValue[1].trim();
+
+            if (value === "{EMPTY}") {
+                value = "";
+            }
+
+            currentObject[key] = value;
+        }
+    }
+
+    return result;
+}
+
+
+// Floating Div for the PDMData.txt file which contains our "Quick Info" about the specs of the players PC
+var pdmHtml = `
+<style>
+`+ css +`
+</style>
+<div class="floating-div">
+  <div><h2>Quick Info:</h2></div>
+  <div id="driverAge">The graphics driver is `+ driverAge +` days old.</div>
+  <div id="Requirements"></div>
+</div>
+`
