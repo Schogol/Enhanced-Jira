@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     1.9
+// @version     2.0
 // @author      ISD BH Schogol
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira and also parses Log Files submitted from the EVE client
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -728,13 +728,13 @@ function ParsePhLogs() {
             pyDateTime = row.insertCell(++cellIndex);
             pyDateTime.innerHTML = table[i][1];
             procCpu = row.insertCell(++cellIndex);
-            procCpu.innerHTML = table[i][2];
+            procCpu.innerHTML = Math.round(Number(table[i][2]));
             threadCpu = row.insertCell(++cellIndex);
-            threadCpu.innerHTML = table[i][3];
+            threadCpu.innerHTML = Math.round(Number(table[i][3]));
             pyMem = row.insertCell(++cellIndex);
-            pyMem.innerHTML = table[i][4];
+            pyMem.innerHTML = Math.round(Number(table[i][4]));;
             virtualMem = row.insertCell(++cellIndex);
-            virtualMem.innerHTML = table[i][5];
+            virtualMem.innerHTML = Math.round(Number(table[i][5]));
             runnable1 = row.insertCell(++cellIndex);
             runnable1.innerHTML = table[i][6];
             runnable2 = row.insertCell(++cellIndex);
@@ -764,6 +764,11 @@ function ParsePhLogs() {
             packetsSent = row.insertCell(++cellIndex);
             packetsSent.innerHTML = table[i][15];
             sessionCount = row.insertCell(++cellIndex);
+
+            if (table[i][16] >= "2") {
+                sessionCount.className += 'red';
+            }
+
             sessionCount.innerHTML = table[i][16];
             tidiFactor = row.insertCell(++cellIndex);
 
@@ -1357,8 +1362,8 @@ var phHtml = `
                   <th scope="col">pyDateTime
                   <th scope="col">procCpu <i class="fa-regular fa-circle-question" title="CPU usage in % of one CPU core"></i>
                   <th scope="col">threadCpu <i class="fa-regular fa-circle-question" title="CPU usage in % for the python thread"></i>
-                  <th scope="col">pyMem <i class="fa-regular fa-circle-question" title="Memory usage for the python part of the client in Mb"></i>
-                  <th scope="col">virtualMem <i class="fa-regular fa-circle-question" title="Total memory usage of the client in Mb"></i>
+                  <th scope="col">pyMem <i class="fa-regular fa-circle-question" title="Memory usage for the python part of the client in MB"></i>
+                  <th scope="col">virtualMem <i class="fa-regular fa-circle-question" title="Total memory usage of the client in MB"></i>
                   <th scope="col">runnable1 <i class="fa-regular fa-circle-question" title="How many python threads are waiting to be run"></i>
                   <th scope="col">runnable2 <i class="fa-regular fa-circle-question" title="How many python threads are waiting to be run"></i>
                   <th scope="col">watchdog time <i class="fa-regular fa-circle-question" title="Time spent for watchdog in ms"></i>
