@@ -535,38 +535,52 @@ function addClickEvent3() {
 
 // Swap out the UI when looking at a log file and add the buttons to toggle message types at the top of the page
 function SwapUI() {
-    $('code > span:empty').remove()
-    $('span[data-testid="code-block"]').find('span > span.comment').remove()
-    rows = $("span[data-testid='code-block']").text();
-
     if ($("span[data-testid='code-block']:contains(Time	Facility	Type	Message)")[0] && savedVariables[1][1]) {
+        $('code > span:empty').remove();
+        $('span[data-testid="code-block"]').find('span > span.comment').remove();
+        rows = $("span[data-testid='code-block']").text();
         $("span[data-testid='code-block']").html(html);
         setTimeout(ParseLogs, 250);
     }
 
     else if ($("span[data-testid='code-block']:contains(dateTime	pyDateTime	procCpu	threadCpu	pyMem	virtualMem	runnable1	runnable2	watchdog time	spf	serviceCalls	callsFromClient	bytesReceived	bytesSent	packetsReceived	packetsSent	sessionCount	tidiFactor)")[0] && savedVariables[1][1]) {
+        $('code > span:empty').remove();
+        $('span[data-testid="code-block"]').find('span > span.comment').remove();
+        rows = $("span[data-testid='code-block']").text();
         $("span[data-testid='code-block']").html(phHtml);
         setTimeout(ParsePhLogs, 250);
     }
 
     else if ($("span[data-testid='code-block']:contains(Time	Method	Duration [ms])")[0] && savedVariables[1][1]) {
+        $('code > span:empty').remove();
+        $('span[data-testid="code-block"]').find('span > span.comment').remove();
+        rows = $("span[data-testid='code-block']").text();
         $("span[data-testid='code-block']").html(McHtml);
         setTimeout(ParseMcLogs, 250);
     }
 
     else if (oc && savedVariables[1][1]) {
+        $('code > span:empty').remove();
+        $('span[data-testid="code-block"]').find('span > span.comment').remove();
+        rows = $("span[data-testid='code-block']").text();
         $("span[data-testid='code-block']").html(ocHtml);
         oc = false;
         setTimeout(ParseOcLogs, 250);
     }
 
     else if (lc && savedVariables[1][1]) {
+        $('code > span:empty').remove();
+        $('span[data-testid="code-block"]').find('span > span.comment').remove();
+        rows = $("span[data-testid='code-block']").text();
         $("span[data-testid='code-block']").html(lcHtml);
         lc = false;
         setTimeout(ParseOcLogs, 250);
     }
 
     else if (pdm && savedVariables[1][1]) {
+        $('code > span:empty').remove();
+        $('span[data-testid="code-block"]').find('span > span.comment').remove();
+        rows = $("span[data-testid='code-block']").text();
         $("span[data-testid='code-block']").append(pdmHtml);
         pdmdata = convertTextToObject(rows);
 
