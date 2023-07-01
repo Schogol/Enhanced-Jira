@@ -94,7 +94,7 @@ GM_addValueChangeListener("dropdowns", function(key, oldValue, newValue, remote)
 // Iterate through all variables in savedVariables and load their locally saved values or set them to true if they are not set yet
 for (let i = 0; i < savedVariables.length; i++) {
     savedVariables[i][1] = GM_getValue (savedVariables[i][0], "");
-    if (savedVariables[i][1] == "") {
+    if (savedVariables[i][1] === "") {
         GM_setValue (savedVariables[i][0], true);
         savedVariables[i][1] = GM_getValue (savedVariables[i][0], "");
     }
