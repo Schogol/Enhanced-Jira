@@ -301,7 +301,6 @@ function toggleDarkmode() {
 };
 
 // waitForKeyElements waits until the it finds the "Give Feedback" element of the page and then removes it because we dont want that to take up space.
-
 var feedbackItem = 'button[data-testid="issue-navigator.common.ui.feedback.feedback-button"]';
 waitForKeyElements (feedbackItem, removeFeedbackButton);
 
