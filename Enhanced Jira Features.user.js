@@ -30,9 +30,9 @@ var today = new Date();
 var savedVariables = [["key",""], ["parser", ""], ["scrollbar", ""], ["dropdowns", ""], ["buttons", ""]];
 
 
-// Listener which triggers when the locally scaved scrollbar value is changed. If the new value is "no" we remove the custom scrollbar. If the new value is "yes" we add the custom scrollbar.
+// Listener which triggers when the locally scaved scrollbar value is changed. If the new value is false we remove the custom scrollbar. If the new value is true we add the custom scrollbar.
 GM_addValueChangeListener("scrollbar", function(key, oldValue, newValue, remote) {
-    if (newValue == "no") {
+    if (!newValue) {
         $('style:contains("*::-webkit-scrollbar { width: 11px !important; height: 11px !important;}")').remove();
     } else {
         GM_addStyle(
@@ -45,9 +45,9 @@ GM_addValueChangeListener("scrollbar", function(key, oldValue, newValue, remote)
 });
 
 
-// Listener which triggers when the locally scaved buttons value is changed. If the new value is "no" we remove the custom buttons. If the new value is "yes" we add the custom buttons.
+// Listener which triggers when the locally scaved buttons value is changed. If the new value is false we remove the custom buttons. If the new value is true we add the custom buttons.
 GM_addValueChangeListener("buttons", function(key, oldValue, newValue, remote) {
-    if (newValue == "no") {
+    if (!newValue) {
         $('#translateButton').remove();
         $('#GMButton').remove();
         $('#ConvertToDefectButton').remove();
@@ -58,9 +58,9 @@ GM_addValueChangeListener("buttons", function(key, oldValue, newValue, remote) {
 });
 
 
-// Listener which triggers when the locally scaved dropdowns value is changed. If the new value is "no" we remove functionality of the LinkedIssue dropdowns. If the new value is "yes" we add the dropdowns to LinkedIssues.
+// Listener which triggers when the locally scaved dropdowns value is changed. If the new value is false we remove functionality of the LinkedIssue dropdowns. If the new value is true we add the dropdowns to LinkedIssues.
 GM_addValueChangeListener("dropdowns", function(key, oldValue, newValue, remote) {
-    if (newValue == "no") {
+    if (!newValue) {
         let reasons = ['duplicates', 'added to idea', 'blocks', 'is blocked by', 'clones', 'is cloned by', 'is duplicated by', 'has to be finished together with', 'has to be done before', 'has to be done after', 'earliest end is start of', 'start is earliest end of', 'has to be started together with', 'split to', 'split from', 'is parent of', 'is child of', 'is idea for', 'implements', 'is implemented by', 'merged from', 'merged into', 'reviews', 'is reviewed by', 'causes', 'is caused by', 'relates to']
 
         for (let i = 0; i < reasons.length; i++) {
@@ -91,18 +91,18 @@ GM_addValueChangeListener("dropdowns", function(key, oldValue, newValue, remote)
 });
 
 
-// Iterate through all variables in savedVariables and load their locally saved values or set them to "yes" if they are not set yet
+// Iterate through all variables in savedVariables and load their locally saved values or set them to true if they are not set yet
 for (let i = 0; i < savedVariables.length; i++) {
     savedVariables[i][1] = GM_getValue (savedVariables[i][0], "");
     if (savedVariables[i][1] == "") {
-        GM_setValue (savedVariables[i][0], "yes");
+        GM_setValue (savedVariables[i][0], true);
         savedVariables[i][1] = GM_getValue (savedVariables[i][0], "");
     }
 }
 
 
 // Check if the Translation API key is set. If it isn't then prompt for the user to input the key.
-if (!savedVariables[0][1] || savedVariables[0][1] == "yes") {
+if (!savedVariables[0][1]) {
     savedVariables[0][1] = prompt (
         'Translation API key not set. Please enter the key:',
         ''
@@ -112,7 +112,7 @@ if (!savedVariables[0][1] || savedVariables[0][1] == "yes") {
 
 
 // Activate a custom scrollbar if the scrollbar value is set to yes
-if (savedVariables[2][1] == "yes") {
+if (savedVariables[2][1]) {
     GM_addStyle(
 `*::-webkit-scrollbar { width: 11px !important; height: 11px !important;}\
 *::-webkit-scrollbar-thumb { border-radius: 10px !important; background: linear-gradient(left, #96A6BF, #63738C) !important;box-shadow: inset 0 0 1px 1px #828f9e !important;}\
@@ -127,7 +127,7 @@ GM_registerMenuCommand ("Change Translation API Key", promptAndChangeStoredValue
 
 
 // Add menu command that will allow to toggle On/Off the Log Parser.
-if (savedVariables[1][1] == "yes") {
+if (savedVariables[1][1]) {
     menu_parser = GM_registerMenuCommand ("Disable Log Parser", toggleParser);
 }
 else {
@@ -137,7 +137,7 @@ else {
 
 
 // Add menu command that will allow to toggle On/Off the custom scrollbar.
-if (savedVariables[2][1] == "yes") {
+if (savedVariables[2][1]) {
     menu_scrollbar = GM_registerMenuCommand ("Disable Custom Scrollbar", toggleScrollbar);
 }
 else {
@@ -147,7 +147,7 @@ else {
 
 
 // Add menu command that will allow to toggle On/Off the dropdown lists on Linked Issues.
-if (savedVariables[3][1] == "yes") {
+if (savedVariables[3][1]) {
     menu_dropdowns = GM_registerMenuCommand ("Disable Linked Issue Dropdowns", toggleDropdown);
 }
 else {
@@ -157,7 +157,7 @@ else {
 
 
 // Add menu command that will allow to toggle On/Off the extra buttons on bug reports.
-if (savedVariables[4][1] == "yes") {
+if (savedVariables[4][1]) {
     menu_buttons = GM_registerMenuCommand ("Disable Extra Buttons", toggleButtons);
 }
 else {
@@ -186,7 +186,7 @@ function promptAndChangeStoredValue () {
 };
 
 
-// Function which toggles between "yes" and "no" for the parser variable and saves it locally
+// Function which refreshes the Tampermonkey menu
 function refreshMenu() {
     GM_unregisterMenuCommand(menu_parser);
     GM_unregisterMenuCommand(menu_scrollbar);
@@ -194,28 +194,28 @@ function refreshMenu() {
     GM_unregisterMenuCommand(menu_buttons);
     GM_unregisterMenuCommand(menu_darkmode);
 
-    if (savedVariables[1][1] == "yes") {
+    if (savedVariables[1][1]) {
         menu_parser = GM_registerMenuCommand ("Disable Log Parser", toggleParser);
     }
     else {
         menu_parser = GM_registerMenuCommand ("Enable Log Parser", toggleParser);
     }
 
-    if (savedVariables[2][1] == "yes") {
+    if (savedVariables[2][1]) {
         menu_scrollbar = GM_registerMenuCommand ("Disable Custom Scrollbar", toggleScrollbar);
     }
     else {
         menu_scrollbar = GM_registerMenuCommand ("Enable Custom Scrollbar", toggleScrollbar);
     }
 
-    if (savedVariables[3][1] == "yes") {
+    if (savedVariables[3][1]) {
         menu_dropdowns = GM_registerMenuCommand ("Disable Linked Issue Dropdowns", toggleDropdown);
     }
     else {
         menu_dropdowns = GM_registerMenuCommand ("Enable Linked Issue Dropdowns", toggleDropdown);
     }
 
-    if (savedVariables[4][1] == "yes") {
+    if (savedVariables[4][1]) {
         menu_buttons = GM_registerMenuCommand ("Disable Extra Buttons", toggleButtons);
     }
     else {
@@ -235,39 +235,39 @@ function refreshMenu() {
 // This function could replace the following 4 functions if Tampermonkey accepted parameters in the GM_registerMenuCommand function
 
 function toggleFeature(i) {
-    savedVariables[i][1] = (savedVariables[i][1] == "yes") ? "no" : "yes";
+    savedVariables[i][1] = savedVariables[i][1] ? false : true;
     GM_setValue (savedVariables[i][0], savedVariables[i][1]);
 };
 */
 
 
-// Function which toggles between "yes" and "no" for the parser variable and saves it locally
+// Function which toggles between true and false for the parser variable and saves it locally
 function toggleParser() {
-    savedVariables[1][1] = (savedVariables[1][1] == "yes") ? "no" : "yes";
+    savedVariables[1][1] = savedVariables[1][1] ? false : true;
     GM_setValue (savedVariables[1][0], savedVariables[1][1]);
     refreshMenu();
 };
 
 
-// Function which toggles between "yes" and "no" for the scrollbar variable and saves it locally
+// Function which toggles between true and false for the scrollbar variable and saves it locally
 function toggleScrollbar() {
-    savedVariables[2][1] = (savedVariables[2][1] == "yes") ? "no" : "yes";
+    savedVariables[2][1] = savedVariables[2][1] ? false : true;
     GM_setValue (savedVariables[2][0], savedVariables[2][1]);
     refreshMenu();
 };
 
 
-// Function which toggles between "yes" and "no" for the dropdowns variable and saves it locally
+// Function which toggles between true and false for the dropdowns variable and saves it locally
 function toggleDropdown() {
-    savedVariables[3][1] = (savedVariables[3][1] == "yes") ? "no" : "yes";
+    savedVariables[3][1] = savedVariables[3][1] ? false : true;
     GM_setValue (savedVariables[3][0], savedVariables[3][1]);
     refreshMenu();
 };
 
 
-// Function which toggles between "yes" and "no" for the buttons variable and saves it locally
+// Function which toggles between true and false for the buttons variable and saves it locally
 function toggleButtons() {
-    savedVariables[4][1] = (savedVariables[4][1] == "yes") ? "no" : "yes";
+    savedVariables[4][1] = savedVariables[4][1] ? false : true;
     GM_setValue (savedVariables[4][0], savedVariables[4][1]);
     refreshMenu();
 };
@@ -318,7 +318,7 @@ waitForKeyElements (issueItem, checkIssueType);
 
 // Check if the issue is a Bug report. If it is then we add the extra buttons
 function checkIssueType() {
-    if ($('a[data-testid="issue.views.issue-base.foundation.breadcrumbs.current-issue.item"]:contains("EBR")').length > 0 & savedVariables[4][1] == "yes") {
+    if ($('a[data-testid="issue.views.issue-base.foundation.breadcrumbs.current-issue.item"]:contains("EBR")').length > 0 && savedVariables[4][1]) {
         addButtons();
     }
 };
@@ -468,7 +468,7 @@ waitForKeyElements (linkedIssues, createDropdowns);
 function createDropdowns() {
     let reasons = ['duplicates', 'added to idea', 'blocks', 'is blocked by', 'clones', 'is cloned by', 'is duplicated by', 'has to be finished together with', 'has to be done before', 'has to be done after', 'earliest end is start of', 'start is earliest end of', 'has to be started together with', 'split to', 'split from', 'is parent of', 'is child of', 'is idea for', 'implements', 'is implemented by', 'merged from', 'merged into', 'reviews', 'is reviewed by', 'causes', 'is caused by', 'relates to']
 
-    if (savedVariables[3][1] == "yes") {
+    if (savedVariables[3][1]) {
         for (let i = 0; i < reasons.length; i++) {
             if ($('h3 > span:contains(' + reasons[i] + ')')) {
                 let children = $('h3 > span:contains(' + reasons[i] + ')').parent().next().children().length;
@@ -539,34 +539,34 @@ function SwapUI() {
     $('span[data-testid="code-block"]').find('span > span.comment').remove()
     rows = $("span[data-testid='code-block']").text();
 
-    if ($("span[data-testid='code-block']:contains(Time	Facility	Type	Message)")[0] && savedVariables[1][1] == "yes") {
+    if ($("span[data-testid='code-block']:contains(Time	Facility	Type	Message)")[0] && savedVariables[1][1]) {
         $("span[data-testid='code-block']").html(html);
         setTimeout(ParseLogs, 250);
     }
 
-    else if ($("span[data-testid='code-block']:contains(dateTime	pyDateTime	procCpu	threadCpu	pyMem	virtualMem	runnable1	runnable2	watchdog time	spf	serviceCalls	callsFromClient	bytesReceived	bytesSent	packetsReceived	packetsSent	sessionCount	tidiFactor)")[0] && savedVariables[1][1] == "yes") {
+    else if ($("span[data-testid='code-block']:contains(dateTime	pyDateTime	procCpu	threadCpu	pyMem	virtualMem	runnable1	runnable2	watchdog time	spf	serviceCalls	callsFromClient	bytesReceived	bytesSent	packetsReceived	packetsSent	sessionCount	tidiFactor)")[0] && savedVariables[1][1]) {
         $("span[data-testid='code-block']").html(phHtml);
         setTimeout(ParsePhLogs, 250);
     }
 
-    else if ($("span[data-testid='code-block']:contains(Time	Method	Duration [ms])")[0] && savedVariables[1][1] == "yes") {
+    else if ($("span[data-testid='code-block']:contains(Time	Method	Duration [ms])")[0] && savedVariables[1][1]) {
         $("span[data-testid='code-block']").html(McHtml);
         setTimeout(ParseMcLogs, 250);
     }
 
-    else if (oc && savedVariables[1][1] == "yes") {
+    else if (oc && savedVariables[1][1]) {
         $("span[data-testid='code-block']").html(ocHtml);
         oc = false;
         setTimeout(ParseOcLogs, 250);
     }
 
-    else if (lc && savedVariables[1][1] == "yes") {
+    else if (lc && savedVariables[1][1]) {
         $("span[data-testid='code-block']").html(lcHtml);
         lc = false;
         setTimeout(ParseOcLogs, 250);
     }
 
-    else if (pdm && savedVariables[1][1] == "yes") {
+    else if (pdm && savedVariables[1][1]) {
         $("span[data-testid='code-block']").append(pdmHtml);
         pdmdata = convertTextToObject(rows);
 
