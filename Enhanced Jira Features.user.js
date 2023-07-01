@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.2
+// @version     2.3
 // @author      ISD BH Schogol
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira and also parses Log Files submitted from the EVE client
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
 // @downloadURL https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
 // @match       https://ccpgames.atlassian.net/jira*
-// @match       https://ccpgames.atlassian.net/browse/*
-// @match       https://ccpgames.atlassian.net/issues/*
+// @match       https://ccpgames.atlassian.net/browse*
+// @match       https://ccpgames.atlassian.net/issues*
 // @require     https://gist.github.com/raw/2625891/waitForKeyElements.js
 // @require     https://ajax.googleapis.com/ajax/libs/jquery/3.3.1/jquery.min.js
 // @grant       GM_addStyle
@@ -19,7 +19,7 @@
 
 
 // Creating various variables which we use later on
-var rows, oc, lc, pdm, pdmdata, driverAge = "unknown";
+var rows, oc, lc, pdm, pdmdata, driverAge = "unknown", menu_parser, menu_scrollbar, menu_dropdowns, menu_buttons, menu_darkmode;
 
 
 // Current Date
@@ -30,141 +30,10 @@ var today = new Date();
 var savedVariables = [["key",""], ["parser", ""], ["scrollbar", ""], ["dropdowns", ""], ["buttons", ""]];
 
 
-// Iterate through all variables in savedVariables and load their locally saved values or set them to "yes" if they are not set yet
-for (let i = 0; i < savedVariables.length; i++) {
-    savedVariables[i][1] = GM_getValue (savedVariables[i][0], "");
-    if (savedVariables[i][1] == "") {
-        GM_setValue (savedVariables[i][0], "yes");
-        savedVariables[i][1] = GM_getValue (savedVariables[i], "");
-    }
-}
-
-
-// Check if the Translation API key is set. If it isn't then prompt for the user to input the key.
-if (!savedVariables[0][1] || savedVariables[0][1] == "yes") {
-    savedVariables[0][1] = prompt (
-        'Translation API key not set. Please enter the key:',
-        ''
-    );
-    GM_setValue (savedVariables[0][0], savedVariables[0][1]);
-}
-
-
-// Activate a custom scrollbar if the scrollbar value is set to yes
-if (savedVariables[2][1] == "yes") {
-    GM_addStyle(
-`*::-webkit-scrollbar { width: 11px !important; height: 11px !important;}\
-*::-webkit-scrollbar-thumb { border-radius: 10px !important; background: linear-gradient(left, #96A6BF, #63738C) !important;box-shadow: inset 0 0 1px 1px #828f9e !important;}\
-.notion-scroller.horizontal { margin-bottom: 30px !important;}\
-.notion-scroller.vertical { margin-bottom: 0px !important;}`
-    );
-};
-
-
-// Add menu command that allows the Translation API key to be changed.
-GM_registerMenuCommand ("Change Translation API Key", promptAndChangeStoredValue);
-
-
-// Add menu command that will allow to toggle On/Off the Log Parser.
-GM_registerMenuCommand ("Toggle Log Parser On / Off", toggleParser);
-
-
-// Add menu command that will allow to toggle On/Off the custom scrollbar.
-GM_registerMenuCommand ("Toggle Custom Scrollbar On / Off", toggleScrollbar);
-
-
-// Add menu command that will allow to toggle On/Off the dropdown lists on Linked Issues.
-GM_registerMenuCommand ("Toggle Linked Issue Dropdowns On / Off", toggleDropdown);
-
-
-// Add menu command that will allow to toggle On/Off the extra buttons on bug reports.
-GM_registerMenuCommand ("Toggle Extra Buttons On / Off", toggleButtons);
-
-
-// Add menu command that will allow to toggle On/Off darkmode.
-GM_registerMenuCommand ("Toggle Dark Mode On / Off", toggleDarkmode);
-
-
-// Function which prompts the user to input a value for the Translation API Key and saves it locally
-function promptAndChangeStoredValue () {
-    savedVariables[0][1] = prompt (
-        'Change Translation API Key:',
-        ''
-    );
-    GM_setValue (savedVariables[0][0], savedVariables[0][1]);
-};
-
-
-/*
-// This function could replace the following 4 functions if Tampermonkey accepted parameters in the GM_registerMenuCommand function
-
-function toggleFeature(i) {
-    savedVariables[i][1] = (savedVariables[i][1] == "yes") ? "no" : "yes";
-    GM_setValue (savedVariables[i][0], savedVariables[i][1]);
-};
-*/
-
-
-// Function which toggles between "yes" and "no" for the parser variable and saves it locally
-function toggleParser() {
-    savedVariables[1][1] = (savedVariables[1][1] == "yes") ? "no" : "yes";
-    GM_setValue (savedVariables[1][0], savedVariables[1][1]);
-};
-
-
-// Function which toggles between "yes" and "no" for the scrollbar variable and saves it locally
-function toggleScrollbar() {
-    savedVariables[2][1] = (savedVariables[2][1] == "yes") ? "no" : "yes";
-    GM_setValue (savedVariables[2][0], savedVariables[2][1]);
-};
-
-
-// Function which toggles between "yes" and "no" for the dropdowns variable and saves it locally
-function toggleDropdown() {
-    savedVariables[3][1] = (savedVariables[3][1] == "yes") ? "no" : "yes";
-    GM_setValue (savedVariables[3][0], savedVariables[3][1]);
-};
-
-
-// Function which toggles between "yes" and "no" for the buttons variable and saves it locally
-function toggleButtons() {
-    savedVariables[4][1] = (savedVariables[4][1] == "yes") ? "no" : "yes";
-    GM_setValue (savedVariables[4][0], savedVariables[4][1]);
-};
-
-
-// Function which toggles darkmode on / off by sending the nescessary PUT command to the atlassian server to change the dark mode setting. It then reloads the page
-function toggleDarkmode() {
-    if ($('html[data-color-mode="dark"]')[0]) {
-        $('input[type=checkbox]').prop('checked', false);
-        $.ajax({
-            url: 'https://ccpgames.atlassian.net/rest/api/3/mypreferences?key=jira.user.theme.preference',
-            type: 'PUT',
-            contentType: 'application/json',
-            charset: 'utf-8',
-            Accept: 'application/json,text/javascript,*/*',
-            data: '{"value":"light"}',
-        })
-    } else {
-        $('input[type=checkbox]').prop('checked', true);
-        $.ajax({
-            url: 'https://ccpgames.atlassian.net/rest/api/3/mypreferences?key=jira.user.theme.preference',
-            type: 'PUT',
-            contentType: 'application/json',
-            charset: 'utf-8',
-            Accept: 'application/json,text/javascript,*/*',
-            data: '{"value":"dark"}',
-        })
-    }
-    window.location.reload(false)
-};
-
-
 // Listener which triggers when the locally scaved scrollbar value is changed. If the new value is "no" we remove the custom scrollbar. If the new value is "yes" we add the custom scrollbar.
 GM_addValueChangeListener("scrollbar", function(key, oldValue, newValue, remote) {
     if (newValue == "no") {
         $('style:contains("*::-webkit-scrollbar { width: 11px !important; height: 11px !important;}")').remove();
-        $('style:contains("color-scheme: dark")')[0].remove();
     } else {
         GM_addStyle(
             '*::-webkit-scrollbar { width: 11px !important; height: 11px !important;}\
@@ -172,7 +41,6 @@ GM_addValueChangeListener("scrollbar", function(key, oldValue, newValue, remote)
 .notion-scroller.horizontal { margin-bottom: 30px !important;}\
 .notion-scroller.vertical { margin-bottom: 0px !important;}'
         );
-        GM_addStyle(cssDark);
     }
 });
 
@@ -222,6 +90,215 @@ GM_addValueChangeListener("dropdowns", function(key, oldValue, newValue, remote)
     }
 });
 
+
+// Iterate through all variables in savedVariables and load their locally saved values or set them to "yes" if they are not set yet
+for (let i = 0; i < savedVariables.length; i++) {
+    savedVariables[i][1] = GM_getValue (savedVariables[i][0], "");
+    if (savedVariables[i][1] == "") {
+        GM_setValue (savedVariables[i][0], "yes");
+        savedVariables[i][1] = GM_getValue (savedVariables[i][0], "");
+    }
+}
+
+
+// Check if the Translation API key is set. If it isn't then prompt for the user to input the key.
+if (!savedVariables[0][1] || savedVariables[0][1] == "yes") {
+    savedVariables[0][1] = prompt (
+        'Translation API key not set. Please enter the key:',
+        ''
+    );
+    GM_setValue (savedVariables[0][0], savedVariables[0][1]);
+}
+
+
+// Activate a custom scrollbar if the scrollbar value is set to yes
+if (savedVariables[2][1] == "yes") {
+    GM_addStyle(
+`*::-webkit-scrollbar { width: 11px !important; height: 11px !important;}\
+*::-webkit-scrollbar-thumb { border-radius: 10px !important; background: linear-gradient(left, #96A6BF, #63738C) !important;box-shadow: inset 0 0 1px 1px #828f9e !important;}\
+.notion-scroller.horizontal { margin-bottom: 30px !important;}\
+.notion-scroller.vertical { margin-bottom: 0px !important;}`
+    );
+};
+
+
+// Add menu command that allows the Translation API key to be changed.
+GM_registerMenuCommand ("Change Translation API Key", promptAndChangeStoredValue);
+
+
+// Add menu command that will allow to toggle On/Off the Log Parser.
+if (savedVariables[1][1] == "yes") {
+    menu_parser = GM_registerMenuCommand ("Disable Log Parser", toggleParser);
+}
+else {
+    menu_parser = GM_registerMenuCommand ("Enable Log Parser", toggleParser);
+}
+
+
+
+// Add menu command that will allow to toggle On/Off the custom scrollbar.
+if (savedVariables[2][1] == "yes") {
+    menu_scrollbar = GM_registerMenuCommand ("Disable Custom Scrollbar", toggleScrollbar);
+}
+else {
+    menu_scrollbar = GM_registerMenuCommand ("Enable Custom Scrollbar", toggleScrollbar);
+}
+
+
+
+// Add menu command that will allow to toggle On/Off the dropdown lists on Linked Issues.
+if (savedVariables[3][1] == "yes") {
+    menu_dropdowns = GM_registerMenuCommand ("Disable Linked Issue Dropdowns", toggleDropdown);
+}
+else {
+    menu_dropdowns = GM_registerMenuCommand ("Enable Linked Issue Dropdowns", toggleDropdown);
+}
+
+
+
+// Add menu command that will allow to toggle On/Off the extra buttons on bug reports.
+if (savedVariables[4][1] == "yes") {
+    menu_buttons = GM_registerMenuCommand ("Disable Extra Buttons", toggleButtons);
+}
+else {
+    menu_buttons = GM_registerMenuCommand ("Enable Extra Buttons", toggleButtons);
+}
+
+
+
+// Add menu command that will allow to toggle On/Off darkmode.
+if ($('html[data-color-mode="dark"]')[0]) {
+    menu_darkmode = GM_registerMenuCommand ("Disable Dark Mode", toggleDarkmode);
+}
+else {
+    menu_darkmode = GM_registerMenuCommand ("Enable Dark Mode", toggleDarkmode);
+};
+
+
+
+// Function which prompts the user to input a value for the Translation API Key and saves it locally
+function promptAndChangeStoredValue () {
+    savedVariables[0][1] = prompt (
+        'Change Translation API Key:',
+        ''
+    );
+    GM_setValue (savedVariables[0][0], savedVariables[0][1]);
+};
+
+
+// Function which toggles between "yes" and "no" for the parser variable and saves it locally
+function refreshMenu() {
+    GM_unregisterMenuCommand(menu_parser);
+    GM_unregisterMenuCommand(menu_scrollbar);
+    GM_unregisterMenuCommand(menu_dropdowns);
+    GM_unregisterMenuCommand(menu_buttons);
+    GM_unregisterMenuCommand(menu_darkmode);
+
+    if (savedVariables[1][1] == "yes") {
+        menu_parser = GM_registerMenuCommand ("Disable Log Parser", toggleParser);
+    }
+    else {
+        menu_parser = GM_registerMenuCommand ("Enable Log Parser", toggleParser);
+    }
+
+    if (savedVariables[2][1] == "yes") {
+        menu_scrollbar = GM_registerMenuCommand ("Disable Custom Scrollbar", toggleScrollbar);
+    }
+    else {
+        menu_scrollbar = GM_registerMenuCommand ("Enable Custom Scrollbar", toggleScrollbar);
+    }
+
+    if (savedVariables[3][1] == "yes") {
+        menu_dropdowns = GM_registerMenuCommand ("Disable Linked Issue Dropdowns", toggleDropdown);
+    }
+    else {
+        menu_dropdowns = GM_registerMenuCommand ("Enable Linked Issue Dropdowns", toggleDropdown);
+    }
+
+    if (savedVariables[4][1] == "yes") {
+        menu_buttons = GM_registerMenuCommand ("Disable Extra Buttons", toggleButtons);
+    }
+    else {
+        menu_buttons = GM_registerMenuCommand ("Enable Extra Buttons", toggleButtons);
+    }
+
+    if ($('html[data-color-mode="dark"]')[0]) {
+        menu_darkmode = GM_registerMenuCommand ("Disable Dark Mode", toggleDarkmode);
+    }
+    else {
+        menu_darkmode = GM_registerMenuCommand ("Enable Dark Mode", toggleDarkmode);
+    }
+}
+
+
+/*
+// This function could replace the following 4 functions if Tampermonkey accepted parameters in the GM_registerMenuCommand function
+
+function toggleFeature(i) {
+    savedVariables[i][1] = (savedVariables[i][1] == "yes") ? "no" : "yes";
+    GM_setValue (savedVariables[i][0], savedVariables[i][1]);
+};
+*/
+
+
+// Function which toggles between "yes" and "no" for the parser variable and saves it locally
+function toggleParser() {
+    savedVariables[1][1] = (savedVariables[1][1] == "yes") ? "no" : "yes";
+    GM_setValue (savedVariables[1][0], savedVariables[1][1]);
+    refreshMenu();
+};
+
+
+// Function which toggles between "yes" and "no" for the scrollbar variable and saves it locally
+function toggleScrollbar() {
+    savedVariables[2][1] = (savedVariables[2][1] == "yes") ? "no" : "yes";
+    GM_setValue (savedVariables[2][0], savedVariables[2][1]);
+    refreshMenu();
+};
+
+
+// Function which toggles between "yes" and "no" for the dropdowns variable and saves it locally
+function toggleDropdown() {
+    savedVariables[3][1] = (savedVariables[3][1] == "yes") ? "no" : "yes";
+    GM_setValue (savedVariables[3][0], savedVariables[3][1]);
+    refreshMenu();
+};
+
+
+// Function which toggles between "yes" and "no" for the buttons variable and saves it locally
+function toggleButtons() {
+    savedVariables[4][1] = (savedVariables[4][1] == "yes") ? "no" : "yes";
+    GM_setValue (savedVariables[4][0], savedVariables[4][1]);
+    refreshMenu();
+};
+
+
+// Function which toggles darkmode on / off by sending the nescessary PUT command to the atlassian server to change the dark mode setting. It then reloads the page
+function toggleDarkmode() {
+    if ($('html[data-color-mode="dark"]')[0]) {
+        $('input[type=checkbox]').prop('checked', false);
+        $.ajax({
+            url: 'https://ccpgames.atlassian.net/rest/api/3/mypreferences?key=jira.user.theme.preference',
+            type: 'PUT',
+            contentType: 'application/json',
+            charset: 'utf-8',
+            Accept: 'application/json,text/javascript,*/*',
+            data: '{"value":"light"}',
+        })
+    } else {
+        $('input[type=checkbox]').prop('checked', true);
+        $.ajax({
+            url: 'https://ccpgames.atlassian.net/rest/api/3/mypreferences?key=jira.user.theme.preference',
+            type: 'PUT',
+            contentType: 'application/json',
+            charset: 'utf-8',
+            Accept: 'application/json,text/javascript,*/*',
+            data: '{"value":"dark"}',
+        })
+    }
+    refreshMenu();
+    window.location.reload(false)
+};
 
 // waitForKeyElements waits until the it finds the "Give Feedback" element of the page and then removes it because we dont want that to take up space.
 var feedbackItem = 'button[data-testid="issue-navigator.common.ui.feedback.feedback-button"]';
@@ -1542,7 +1619,7 @@ var searchbar = 'input[data-test-id="search-dialog-input"';
 waitForKeyElements (searchbar, addDarkmodeToggle);
 
 
-// This adds the CSS and Button (An input checkbox box) to the left of the search box. If the saved variable for the darkmode is "yes" then we check the checkbox and add the dark mode CSS
+// This adds the CSS and Button (An input checkbox box) to the left of the search box. If the darkmode is enabled then we check the checkbox
 function addDarkmodeToggle() {
     GM_addStyle(darkModeSwitchCss);
     if ($('html[data-color-mode="dark"]')[0] || $('html[data-color-mode="light"]')[0]) {
