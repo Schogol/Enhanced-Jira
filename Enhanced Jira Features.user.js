@@ -111,7 +111,7 @@ if (!savedVariables[0][1]) {
 }
 
 
-// Activate a custom scrollbar if the scrollbar value is set to yes
+// Activate a custom scrollbar if the scrollbar value is set to true
 if (savedVariables[2][1]) {
     GM_addStyle(
 `*::-webkit-scrollbar { width: 11px !important; height: 11px !important;}\
