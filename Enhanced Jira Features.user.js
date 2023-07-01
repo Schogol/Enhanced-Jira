@@ -301,6 +301,7 @@ function toggleDarkmode() {
 };
 
 // waitForKeyElements waits until the it finds the "Give Feedback" element of the page and then removes it because we dont want that to take up space.
+
 var feedbackItem = 'button[data-testid="issue-navigator.common.ui.feedback.feedback-button"]';
 waitForKeyElements (feedbackItem, removeFeedbackButton);
 
@@ -637,14 +638,14 @@ function ParseMcLogs() {
     var peak = 0;
     rows = rows.replace(/(\t{2,})+/g, "\t").replace(/([\r\n]){2,}/g, "\r\n").replace(/([\r\n])[*]{3}(.*)(?=[*]{3})[*]{3}/g, "\r\n\t\t\tLogging error occurred").replace(/[\<]/g, function(c) {return "&lt;";}).replace(/\n$/, "").split("\n");
 
-    /**
+ /**
  * Object to which we save the table
  */
     var logs = {};
     logs.tableInfo = [];
 
 
-    /**
+ /**
  * Adds each row from 'rows' to the 'tableContent' table.
  * rowQuantity: Quantity of rows which will be loaded
  */
@@ -689,7 +690,7 @@ function ParseMcLogs() {
         }
     };
 
-    /**
+ /**
  * Fill the table with the log data
  */
     for (var i = 1; i < rows.length; ++i) {
@@ -712,7 +713,7 @@ function ParseMcLogs() {
 
 
 
-    /**
+ /**
  * Remove the loader and show the content
  */
     document.getElementById("loader").style.display = "none";
@@ -724,14 +725,14 @@ function ParseMcLogs() {
 function ParseOcLogs() {
     rows = rows.replace(/(\t{2,})+/g, "\t").replace(/([\r\n]){2,}/g, "\r\n").replace(/([\r\n])[*]{3}(.*)(?=[*]{3})[*]{3}/g, "\r\n\t\t\tLogging error occurred").replace(/[\<]/g, function(c) {return "&lt;";}).replace(/\n$/, "").split("\n");
 
-    /**
+ /**
  * Object to which we save the table
  */
     var logs = {};
     logs.tableInfo = [];
 
 
-    /**
+ /**
  * Adds each row from 'rows' to the 'tableContent' table.
  * rowQuantity: Quantity of rows which will be loaded
  */
@@ -756,7 +757,7 @@ function ParseOcLogs() {
         }
     };
 
-    /**
+ /**
  * Fill the table with the log data
  */
     for (var i = 0; i < rows.length; ++i) {
@@ -768,7 +769,7 @@ function ParseOcLogs() {
 
 
 
-    /**
+ /**
  * Remove the loader and show the content
  */
     document.getElementById("loader").style.display = "none";
@@ -780,14 +781,14 @@ function ParseOcLogs() {
 function ParsePhLogs() {
     rows = rows.replace(/(\t{2,})+/g, "\t").replace(/([\r\n]){2,}/g, "\r\n").replace(/([\r\n])[*]{3}(.*)(?=[*]{3})[*]{3}/g, "\r\n\t\t\tLogging error occurred").replace(/[\<]/g, function(c) {return "&lt;";}).replace(/\n$/, "").split("\n");
 
-    /**
+ /**
  * Object to which we save the table
  */
     var logs = {};
     logs.tableInfo = [];
 
 
-    /**
+ /**
  * Adds each row from 'rows' to the 'tableContent' table.
  * rowQuantity: Quantity of rows which will be loaded
  */
@@ -865,7 +866,7 @@ function ParsePhLogs() {
         }
     };
 
-    /**
+ /**
  * Fill the table with the log data
  */
     for (var i = 1; i < rows.length; ++i) {
@@ -874,7 +875,7 @@ function ParsePhLogs() {
     }
     logs.showRow((rows.length - 2));
 
-    /**
+ /**
  * Clickhandler for when the user clicks on the FPS /spf row. We toggle between spf and FPS on click
  */
     var clickHandler = function() {
@@ -890,7 +891,7 @@ function ParsePhLogs() {
     $('#tableContent > thead > tr > th:nth-child(10)').on('click', clickHandler());
 
 
-    /**
+ /**
  * Remove the loader and show the content
  */
     document.getElementById("loader").style.display = "none";
@@ -903,13 +904,13 @@ function ParsePhLogs() {
 function ParseLogs() {
     rows = rows.replace(/(\t{2,})+/g, "\t").replace(/([\r\n]){2,}/g, "\r\n").replace(/([\r\n])[*]{3}(.*)(?=[*]{3})[*]{3}/g, "\r\n\t\t\tLogging error occurred").replace(/[\<]/g, function(c) {return "&lt;";}).replace(/\n$/, "").split("\n");
 
-    /**
+ /**
  * Object to which we save the table
  */
     var logs = {};
     logs.tableInfo = [];
 
-    /**
+ /**
  * Adds each row from 'rows' to the 'tableContent' table.
  * rowQuantity: Quantity of rows which will be loaded
  */
@@ -930,7 +931,7 @@ function ParseLogs() {
             typeCell = row.insertCell(++cellIndex);
 
 
-            /**
+ /**
  * Switch for checking if the current row is a notice, warning, error or info message
  * and add the according class to the row
  */
@@ -949,7 +950,7 @@ function ParseLogs() {
                     break;
             }
 
-            /**
+ /**
  * Check if the message contains the beginning of an exception and set excTime (Exception time) to the time of the current message
  * Also adds a border to the top of the row
  */
@@ -959,7 +960,7 @@ function ParseLogs() {
             }
 
 
-            /**
+ /**
  * Check if the message contains the beginning of a stacktrace,
  * then set sttTime (Stacktrace time) to the time of the current message and add a border to the top of the row
  */
@@ -969,7 +970,7 @@ function ParseLogs() {
             }
 
 
-            /**
+ /**
  * If the time of the current message is the same time as it was when the exception started
  * then add the 'exception' class to the row
  */
@@ -978,7 +979,7 @@ function ParseLogs() {
             }
 
 
-            /**
+ /**
  * If there is an "Exception End" message in the current log row,
  * then add the 'borderbot' class to the row and set excTime to its default value
  */
@@ -988,7 +989,7 @@ function ParseLogs() {
             }
 
 
-            /**
+ /**
  * If excTime is not empty but it doesnt match the time of the current row,
  * then add the 'borderbot' class to the row and set excTime to its default value
  */
@@ -998,7 +999,7 @@ function ParseLogs() {
             }
 
 
-            /**
+ /**
  * If there is an "Stacktrace End" message in the current log row,
  * then add the 'borderbot' class to the row and set sttTime to its default value
  */
@@ -1008,7 +1009,7 @@ function ParseLogs() {
             }
 
 
-            /**
+ /**
  * If sttTime is not empty but it doesnt match the time of the current row,
  * then add the 'borderbot' class to the row and set sttTime to its default value
  */
@@ -1023,7 +1024,7 @@ function ParseLogs() {
             messageCell.innerHTML = table[i][3];
 
 
-            /**
+ /**
  * Currently unused clickHandler
  */
             clickHandler = function(row) {
@@ -1037,7 +1038,7 @@ function ParseLogs() {
     };
 
 
-    /**
+ /**
  * Fill the table with the log data
  */
     for (var i = 1; i < rows.length; ++i) {
@@ -1047,7 +1048,7 @@ function ParseLogs() {
     logs.showRow((rows.length - 1));
 
 
-    /**
+ /**
  * Remove the loader and show the content
  */
     document.getElementById("loader").style.display = "none";
