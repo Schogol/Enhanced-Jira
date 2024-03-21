@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.5
+// @version     2.6
 // @author      ISD BH Schogol
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira and also parses Log Files submitted from the EVE client
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -1071,6 +1071,10 @@ function ParseLogs() {
 
 // CSS for all parsed Logs
 var css = `
+    * {
+    color: #e6e6e6;
+    }
+
 	.pointer {
       cursor: pointer;
     }
@@ -1083,10 +1087,12 @@ var css = `
     #peakMacho {
       cursor: pointer;
       text-align: right;
+      color: #e6e6e6;
     }
 
     #averageMacho {
       text-align: right;
+      color: #e6e6e6;
     }
 
     #gpanel {
@@ -1123,11 +1129,11 @@ var css = `
     }
 
     .red {
-      background: #f99;
+      background: #531a1a;
     }
 
     .yellow {
-      background: #ff9;
+      background: #67670b;
     }
 
     td:first-child, th:first-child {
@@ -1176,6 +1182,11 @@ var css = `
       transition: .3s linear;
       overflow-y: scroll;
       margin-top: 28px;
+      background-color: #1D2125;
+    }
+
+    span[data-testid="code-block"] {
+    background-color: #1d2125d6;
     }
 
     #table table {
