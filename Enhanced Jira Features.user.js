@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.4
+// @version     2.5
 // @author      ISD BH Schogol
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira and also parses Log Files submitted from the EVE client
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -350,11 +350,11 @@ function addButtons() {
 
             // The regex might be a bit janky but it removes some unneccessary spaces in the text which we send to the API.
             // By changing the "target:" attribute we could chose a different language than english if needed
-            data: '{"q":"'+ $("h1[data-test-id='issue.views.issue-base.foundation.summary.heading']").text().replace(/"/g,'').replace(/ {2,}/g,' ')+'", "q":"'+ $("div[data-component-selector='jira-issue-view-rich-text-inline-edit-view-container']").children().eq(0).text().replace(/"/g,'').replace(/ {2,}/g,' ')+'", "q":"'+ $("div[data-component-selector='jira-issue-view-rich-text-inline-edit-view-container']").children().eq(1).text().replace(/"/g,'').replace(/ {2,}/g,' ')+'", "target":"en", "format":"text"}',
+            data: '{"q":"'+ $("h1[data-testid='issue.views.issue-base.foundation.summary.heading']").text().replace(/"/g,'').replace(/ {2,}/g,' ')+'", "q":"'+ $("div[data-component-selector='jira-issue-view-rich-text-inline-edit-view-container']").children().eq(0).text().replace(/"/g,'').replace(/ {2,}/g,' ')+'", "q":"'+ $("div[data-component-selector='jira-issue-view-rich-text-inline-edit-view-container']").children().eq(1).text().replace(/"/g,'').replace(/ {2,}/g,' ')+'", "target":"en", "format":"text"}',
 
             // When we receive a translation back from the API we replace the original Title, Description and Repro-Steps with the translation we get from Google.
             success: function (data) {
-                $("h1[data-test-id='issue.views.issue-base.foundation.summary.heading']").text(data.data.translations[0].translatedText);
+                $("h1[data-testid='issue.views.issue-base.foundation.summary.heading']").text(data.data.translations[0].translatedText);
                 $("div[data-component-selector='jira-issue-view-rich-text-inline-edit-view-container']").children().eq(1).replaceWith(data.data.translations[2].translatedText.replace(/\n\n/g, '<br><br>'));
                 $("div[data-component-selector='jira-issue-view-rich-text-inline-edit-view-container']").children().eq(0).replaceWith(data.data.translations[1].translatedText.replace(/\n/g, '<br><br>'));
             },
@@ -1151,10 +1151,6 @@ var css = `
       border-right: 1.5px solid #aaaaaa;
     }
 
-    .row {
-      background: #FFF;
-    }
-
     #body {
       margin-top: -12px;
       overflow: auto;
@@ -1192,7 +1188,7 @@ var css = `
       box-sizing: content-box;
       word-wrap: break-word;
       table-layout: fixed;
-      color: #333;
+      color: #e6e6e6;
     }
 
     #loader {
@@ -1293,19 +1289,19 @@ var cssLogParser = `
     }
 
     .notice {
-      background: #99ff99;
+      background: #296429;
     }
 
     .warning {
-      background: #ff9;
+      background: #67670b;
     }
 
     .error {
-      background: #f99;
+      background: #531a1a;
     }
 
     .info {
-      background: #7dcbff;
+      background: #1f313d;
     }
 
     #gpanel {
