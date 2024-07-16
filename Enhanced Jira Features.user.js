@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.6
+// @version     2.6.1
 // @author      ISD BH Schogol
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira and also parses Log Files submitted from the EVE client
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -30,7 +30,7 @@ var today = new Date();
 var savedVariables = [["key",""], ["parser", ""], ["scrollbar", ""], ["dropdowns", ""], ["buttons", ""]];
 
 
-// Listener which triggers when the locally scaved scrollbar value is changed. If the new value is false we remove the custom scrollbar. If the new value is true we add the custom scrollbar.
+// Listener which triggers when the locally saved "scrollbar" value is changed. If the new value is false we remove the custom scrollbar. If the new value is true we add the custom scrollbar.
 GM_addValueChangeListener("scrollbar", function(key, oldValue, newValue, remote) {
     if (!newValue) {
         $('style:contains("*::-webkit-scrollbar { width: 11px !important; height: 11px !important;}")').remove();
@@ -45,7 +45,7 @@ GM_addValueChangeListener("scrollbar", function(key, oldValue, newValue, remote)
 });
 
 
-// Listener which triggers when the locally scaved buttons value is changed. If the new value is false we remove the custom buttons. If the new value is true we add the custom buttons.
+// Listener which triggers when the locally saved "buttons" value is changed. If the new value is false we remove the custom buttons. If the new value is true we add the custom buttons.
 GM_addValueChangeListener("buttons", function(key, oldValue, newValue, remote) {
     if (!newValue) {
         $('#translateButton').remove();
@@ -58,7 +58,7 @@ GM_addValueChangeListener("buttons", function(key, oldValue, newValue, remote) {
 });
 
 
-// Listener which triggers when the locally scaved dropdowns value is changed. If the new value is false we remove functionality of the LinkedIssue dropdowns. If the new value is true we add the dropdowns to LinkedIssues.
+// Listener which triggers when the locally saved "dropdowns" value is changed. If the new value is false we remove functionality of the LinkedIssue dropdowns. If the new value is true we add the dropdowns to LinkedIssues.
 GM_addValueChangeListener("dropdowns", function(key, oldValue, newValue, remote) {
     if (!newValue) {
         let reasons = ['duplicates', 'added to idea', 'blocks', 'is blocked by', 'clones', 'is cloned by', 'is duplicated by', 'has to be finished together with', 'has to be done before', 'has to be done after', 'earliest end is start of', 'start is earliest end of', 'has to be started together with', 'split to', 'split from', 'is parent of', 'is child of', 'is idea for', 'implements', 'is implemented by', 'merged from', 'merged into', 'reviews', 'is reviewed by', 'causes', 'is caused by', 'relates to']
@@ -491,7 +491,7 @@ waitForKeyElements(selector, SwapUI);
 
 
 // When we detect the "title row" of a processHealth file then we swap out the content of the log file with a parsed, more readable version of it with some extra features
-var phSelector = "span[data-testid='code-block']:contains(dateTime	pyDateTime	procCpu	threadCpu	pyMem	virtualMem	runnable1	runnable2	watchdog time	spf	serviceCalls	callsFromClient	bytesReceived	bytesSent	packetsReceived	packetsSent	sessionCount	tidiFactor)";
+var phSelector = "span[data-testid='code-block']:contains(dateTime	pyDateTime	procCpu	threadCpu	pyMem	virtualMem	taskletsProcessed	taskletsQueued	watchdog time	spf	serviceCalls	callsFromClient	bytesReceived	bytesSent	packetsReceived	packetsSent	sessionCount	tidiFactor)";
 waitForKeyElements(phSelector, SwapUI);
 
 
@@ -543,7 +543,7 @@ function SwapUI() {
         setTimeout(ParseLogs, 250);
     }
 
-    else if ($("span[data-testid='code-block']:contains(dateTime	pyDateTime	procCpu	threadCpu	pyMem	virtualMem	runnable1	runnable2	watchdog time	spf	serviceCalls	callsFromClient	bytesReceived	bytesSent	packetsReceived	packetsSent	sessionCount	tidiFactor)")[0] && savedVariables[1][1]) {
+    else if ($("span[data-testid='code-block']:contains(dateTime	pyDateTime	procCpu	threadCpu	pyMem	virtualMem	taskletsProcessed	taskletsQueued	watchdog time	spf	serviceCalls	callsFromClient	bytesReceived	bytesSent	packetsReceived	packetsSent	sessionCount	tidiFactor)")[0] && savedVariables[1][1]) {
         $('code > span:empty').remove();
         $('span[data-testid="code-block"]').find('span > span.comment').remove();
         rows = $("span[data-testid='code-block']").text();
@@ -810,7 +810,7 @@ function ParsePhLogs() {
         var tableContent = document.getElementById('tableContent');
         var tableContentRowsLength = 0;
         var toIndex = tableContentRowsLength + rowQuantity;
-        for (var i = tableContentRowsLength, row, rowNumber, cellIndex, dateTime, pyDateTime, procCpu, threadCpu, pyMem, virtualMem, runnable1, runnable2, watchdogTime, spf, serviceCalls, callsFromClient, bytesReceived, bytesSent, packetsReceived, packetsSent, sessionCount, tidiFactor; i < toIndex; ++i) {
+        for (var i = tableContentRowsLength, row, rowNumber, cellIndex, dateTime, pyDateTime, procCpu, threadCpu, pyMem, virtualMem, taskletsProcessed, taskletsQueued, watchdogTime, spf, serviceCalls, callsFromClient, bytesReceived, bytesSent, packetsReceived, packetsSent, sessionCount, tidiFactor; i < toIndex; ++i) {
             row = document.createElement('tr');
             row.className = 'row';
             cellIndex = -1;
@@ -826,10 +826,10 @@ function ParsePhLogs() {
             pyMem.innerHTML = Math.round(Number(table[i][4]));;
             virtualMem = row.insertCell(++cellIndex);
             virtualMem.innerHTML = Math.round(Number(table[i][5]));
-            runnable1 = row.insertCell(++cellIndex);
-            runnable1.innerHTML = table[i][6];
-            runnable2 = row.insertCell(++cellIndex);
-            runnable2.innerHTML = table[i][7];
+            taskletsProcessed = row.insertCell(++cellIndex);
+            taskletsProcessed.innerHTML = table[i][6];
+            taskletsQueued = row.insertCell(++cellIndex);
+            taskletsQueued.innerHTML = table[i][7];
             watchdogTime = row.insertCell(++cellIndex);
             watchdogTime.innerHTML = Number(table[i][8]);
             spf = row.insertCell(++cellIndex);
@@ -1462,8 +1462,8 @@ var phHtml = `
                   <th scope="col">threadCpu <i class="fa-regular fa-circle-question" title="CPU usage in % for the python thread"></i>
                   <th scope="col">pyMem <i class="fa-regular fa-circle-question" title="Memory usage for the python part of the client in MB"></i>
                   <th scope="col">virtualMem <i class="fa-regular fa-circle-question" title="Total memory usage of the client in MB"></i>
-                  <th scope="col">runnable1 <i class="fa-regular fa-circle-question" title="How many python threads are waiting to be run"></i>
-                  <th scope="col">runnable2 <i class="fa-regular fa-circle-question" title="How many python threads are waiting to be run"></i>
+                  <th scope="col">taskletsProcessed <i class="fa-regular fa-circle-question" title="How many python threads have been run"></i>
+                  <th scope="col">taskletsQueued <i class="fa-regular fa-circle-question" title="How many python threads are waiting to be run"></i>
                   <th scope="col">watchdog time <i class="fa-regular fa-circle-question" title="Time spent for watchdog in ms"></i>
                   <th scope="col" class="pointer">FPS <i class="fa-regular fa-circle-question" title="Frames per second"></i></th>
                   <th scope="col">serviceCalls
