@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.6.1
+// @version     2.6.2
 // @author      ISD BH Schogol
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira and also parses Log Files submitted from the EVE client
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -15,6 +15,7 @@
 // @grant       GM_setValue
 // @grant       GM_registerMenuCommand
 // ==/UserScript==
+/* global $ */
 
 
 
@@ -330,15 +331,26 @@ function addButtons() {
     var issueID = $('a[data-testid="issue.views.issue-base.foundation.breadcrumbs.current-issue.item"]').text();
 
     // Grabbing the button and span class for the buttons (which constantly changes because react + atlassian ~_~)
-    let buttonClass = $('span[data-testid="issue.issue-view.views.issue-base.foundation.quick-add.quick-add-item.add-attachment"]').children(1).attr('class');
-    let spanClass = $('span[data-testid="issue.issue-view.views.issue-base.foundation.quick-add.quick-add-item.add-attachment"]').attr('class');
+    let buttonClass = $('button[data-testid="issue-view-foundation.quick-add.quick-add-items-compact.apps-button-dropdown--trigger"]').attr('class');
+    let innerSpanClass = $('button[data-testid="issue-view-foundation.quick-add.quick-add-items-compact.apps-button-dropdown--trigger"]').find('span').eq(0).attr('class');
+    let iconSpanClass = $('button[data-testid="issue-view-foundation.quick-add.quick-add-items-compact.apps-button-dropdown--trigger"]').find('span').eq(1).attr('class');
+    let labelSpanClass = $('button[data-testid="issue-view-foundation.quick-add.quick-add-items-compact.apps-button-dropdown--trigger"]').find('span').eq(2).attr('class');
 
     // Jira cloud ID which we need for some of the POST requests we send
     let ajscloudid = $('meta[name="ajs-cloud-id"]').attr('content');
 
 
-    var translatebutton= $('<span id="translateButton" class="' + spanClass + '" style="margin-left: 8px;"><button aria-label="Translate" class="' + buttonClass + '" type="button" tabindex="1"><span>Translate</span></button></span>');
-    $('span[data-testid="issue.issue-view.views.issue-base.foundation.quick-add.quick-add-item.add-attachment"]').parent().parent().append(translatebutton);
+    // Create Translate Button
+    if ($('#translateButton').length === 0) {
+    var translateButton = $(
+    '<button id="translateButton" aria-label="Translate" class="' + buttonClass + '" type="button" tabindex="1" style="margin-left: 8px;">' +
+    '<span class="' + innerSpanClass + '">' +
+    '</span>' +
+    '<span class="' + labelSpanClass + '">Translate</span>' +
+    '</button>'
+    );
+    $('button[data-testid="issue-view-foundation.quick-add.quick-add-items-compact.apps-button-dropdown--trigger"]').after(translateButton);
+    }
 
     // When the translate button is clicked we send the Issue title, description and reproduction steps to the Google translate API and change the original content to what we receive back from the API
     $("#translateButton").click(function () {
@@ -368,8 +380,17 @@ function addButtons() {
     });
 
 
-    var GMButton= $('<span id="GMButton" class="' + spanClass + '"><button class="' + buttonClass + '" type="button" tabindex="1"><span>Assign to GM</span></button></span>');
-    $('span[data-testid="issue.issue-view.views.issue-base.foundation.quick-add.quick-add-item.add-attachment"]').parent().parent().append(GMButton);
+    // Create GM Button
+    if ($('#GMButton').length === 0) {
+    var GMButton = $(
+    '<button id="GMButton" aria-label="GMButton" class="' + buttonClass + '" type="button" tabindex="1" style="margin-left: 8px;">' +
+    '<span class="' + innerSpanClass + '">' +
+    '</span>' +
+    '<span class="' + labelSpanClass + '">Assign to GM</span>' +
+    '</button>'
+    );
+    $('button[data-testid="issue-view-foundation.quick-add.quick-add-items-compact.apps-button-dropdown--trigger"]').after(GMButton);
+    }
 
     // When the Assign to GM button is clicked we change the Team to "EO - Game Masters" and also visually change the field so the user sees that it worked.
     $("#GMButton").click(function () {
@@ -414,9 +435,17 @@ function addButtons() {
 
 
 
-    var convertToDefectButton= $('<span id="ConvertToDefectButton" class="' + spanClass + '"><button class="' + buttonClass + '" type="button" tabindex="1"><span>Convert to Defect</span></button></span>');
-    $('span[data-testid="issue.issue-view.views.issue-base.foundation.quick-add.quick-add-item.add-attachment"]').parent().parent().append(convertToDefectButton);
-
+    // Create Convert To Defect Button
+    if ($('#convertToDefectButton').length === 0) {
+    var convertToDefectButton = $(
+    '<button id="convertToDefectButton" aria-label="ConvertToDefect" class="' + buttonClass + '" type="button" tabindex="1" style="margin-left: 8px;">' +
+    '<span class="' + innerSpanClass + '">' +
+    '</span>' +
+    '<span class="' + labelSpanClass + '">Convert to Defect</span>' +
+    '</button>'
+    );
+    $('button[data-testid="issue-view-foundation.quick-add.quick-add-items-compact.apps-button-dropdown--trigger"]').after(convertToDefectButton);
+    }
     // When the Convert to Defect button is clicked we trigger the Automation which converts the EBR into an EDR issue
     $("#ConvertToDefectButton").click(function () {
         $.ajax({
@@ -440,9 +469,17 @@ function addButtons() {
     });
 
 
-    var closeButton= $('<span id="closeButton" class="' + spanClass + '"><button class="' + buttonClass + '" type="button" tabindex="1"><span>Close</span></button></span>');
-    $('span[data-testid="issue.issue-view.views.issue-base.foundation.quick-add.quick-add-item.add-attachment"]').parent().parent().append(closeButton);
-
+    // Create close button
+    if ($('#closeButton').length === 0) {
+    var closeButton = $(
+    '<button id="CloseButton" aria-label="Close Button" class="' + buttonClass + '" type="button" tabindex="1" style="margin-left: 8px;">' +
+    '<span class="' + innerSpanClass + '">' +
+    '</span>' +
+    '<span class="' + labelSpanClass + '">Close</span>' +
+    '</button>'
+    );
+    $('button[data-testid="issue-view-foundation.quick-add.quick-add-items-compact.apps-button-dropdown--trigger"]').after(closeButton);
+    }
     // When the Close button is clicked we change the status to Closed by simulating clicks on the relevant buttons. This is extremely janky right now because I cant figure out a better way to do this.
     $("#closeButton").click(function () {
         $("div[data-testid='issue.views.issue-base.foundation.status.status-field-wrapper']").find("button").click()
