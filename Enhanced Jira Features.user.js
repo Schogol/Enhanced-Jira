@@ -438,7 +438,7 @@ function addButtons() {
     // Create Convert To Defect Button
     if ($('#convertToDefectButton').length === 0) {
     var convertToDefectButton = $(
-    '<button aria-expanded="false" aria-haspopup="true" label="Add content" data-testid="issue-view-foundation.quick-add.quick-add-items-compact.add-button-dropdown--trigger" id="convertToDefectButton" aria-label="ConvertToDefect" class="' + buttonClass + '" type="button" tabindex="0" style="margin-left: 8px;">' +
+    '<button id="convertToDefectButton" aria-label="ConvertToDefect" class="' + buttonClass + '" type="button" tabindex="0" style="margin-left: 8px;">' +
     '<span class="' + innerSpanClass + '">' +
     '</span>' +
     '<span class="' + labelSpanClass + '">Convert to Defect</span>' +
