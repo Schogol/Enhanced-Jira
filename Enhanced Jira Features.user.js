@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.6.2
+// @version     2.6.3
 // @author      ISD BH Schogol
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira and also parses Log Files submitted from the EVE client
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -51,7 +51,7 @@ GM_addValueChangeListener("buttons", function(key, oldValue, newValue, remote) {
     if (!newValue) {
         $('#translateButton').remove();
         $('#GMButton').remove();
-        $('#ConvertToDefectButton').remove();
+        $('#convertToDefectButton').remove();
         $('#closeButton').remove();
     } else {
         addButtons();
@@ -438,7 +438,7 @@ function addButtons() {
     // Create Convert To Defect Button
     if ($('#convertToDefectButton').length === 0) {
     var convertToDefectButton = $(
-    '<button id="convertToDefectButton" aria-label="ConvertToDefect" class="' + buttonClass + '" type="button" tabindex="1" style="margin-left: 8px;">' +
+    '<button aria-expanded="false" aria-haspopup="true" label="Add content" data-testid="issue-view-foundation.quick-add.quick-add-items-compact.add-button-dropdown--trigger" id="convertToDefectButton" aria-label="ConvertToDefect" class="' + buttonClass + '" type="button" tabindex="0" style="margin-left: 8px;">' +
     '<span class="' + innerSpanClass + '">' +
     '</span>' +
     '<span class="' + labelSpanClass + '">Convert to Defect</span>' +
@@ -447,17 +447,38 @@ function addButtons() {
     $('button[data-testid="issue-view-foundation.quick-add.quick-add-items-compact.apps-button-dropdown--trigger"]').after(convertToDefectButton);
     }
     // When the Convert to Defect button is clicked we trigger the Automation which converts the EBR into an EDR issue
-    $("#ConvertToDefectButton").click(function () {
+    $("#convertToDefectButton").click(function () {
+        console.log('test');
+        let ajscloudid = $('meta[name="ajs-cloud-id"]').attr('content');
         $.ajax({
-            url: 'https://ccpgames.atlassian.net/gateway/api/automation/internal-api/jira/' + ajscloudid + '/pro/rest/rules/invocation/10609113',
-            type: 'POST',
+            url: 'https://ccpgames.atlassian.net/rest/api/2/issue/EBR-221',
+            type: 'GET',
             contentType: 'application/json',
             charset: 'utf-8',
-            data: '{"targetIssueKeys":["' + issueID + '"]}',
+            data: '',
+
+            // Once the conversion succeeds we check for the "Issue Updated" message on screen and once it appears we refresh the page
+            success: function (data) {
+                $.ajax({
+                    url: 'https://ccpgames.atlassian.net/gateway/api/automation/internal-api/jira/' + ajscloudid + '/pro/rest/v1/rules/manual/invocation/10609113',
+                    type: 'POST',
+                    contentType: 'application/json',
+                    charset: 'utf-8',
+                    data: '{"objects":["ari:cloud:jira:' + ajscloudid + ':issue/' + data.id + '"]}',
+                    //Old:
+                    //data: '{"targetIssueKeys":["' + issueID + '"]}',
 
             // Once the conversion succeeds we check for the "Issue Updated" message on screen and once it appears we refresh the page
             success: function (data) {
                 var t=setInterval(function () {if ($('strong:contains(Issue Updated)')[0]) {clearInterval(t);window.location.reload(false);}},500);
+            },
+
+            // If we get an Error then we annoy the user by telling them that it failed and to check their Dev Console for errors
+            error: function(data){
+                console.log(JSON.stringify(data));
+                alert("This failed for some reason. Check Console for errors and report issues to Schogol :).");
+            }
+        })
             },
 
             // If we get an Error then we annoy the user by telling them that it failed and to check their Dev Console for errors
@@ -472,7 +493,7 @@ function addButtons() {
     // Create close button
     if ($('#closeButton').length === 0) {
     var closeButton = $(
-    '<button id="CloseButton" aria-label="Close Button" class="' + buttonClass + '" type="button" tabindex="1" style="margin-left: 8px;">' +
+    '<button id="closeButton" aria-label="Close Button" class="' + buttonClass + '" type="button" tabindex="1" style="margin-left: 8px;">' +
     '<span class="' + innerSpanClass + '">' +
     '</span>' +
     '<span class="' + labelSpanClass + '">Close</span>' +
