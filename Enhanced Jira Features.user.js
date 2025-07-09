@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.6.4
+// @version     2.6.5
 // @author      ISD BH Schogol 
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira and also parses Log Files submitted from the EVE client
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -341,12 +341,12 @@ function addButtons() {
 
 
     // Create Translate Button
-    if ($('#translateButton').length === 0) {
-    var translateButton = $(
-    '<button id="translateButton" aria-label="Translate" class="' + buttonClass + '" type="button" tabindex="1" style="margin-left: 8px;">' +
-    '<span class="' + innerSpanClass + '">' +
-    '</span>' +
-    '<span class="' + labelSpanClass + '">Translate</span>' +
+if ($('#translateButton').length === 0) {
+  var translateButton = $(
+    '<button id="translateButton" type="button" tabindex="1" class="' + buttonClass + '" ' +
+    'style="margin-left: 8px; width: fit-content; padding: 6px 12px; white-space: nowrap; display: inline-flex; align-items: center;">' +
+    '<span class="' + innerSpanClass + '"></span>' +
+    '<span style="font-size: 13px;">Translate</span>' +
     '</button>'
     );
     $('button[data-testid="issue-view-foundation.quick-add.quick-add-items-compact.apps-button-dropdown--trigger"]').after(translateButton);
@@ -381,12 +381,12 @@ function addButtons() {
 
 
     // Create GM Button
-    if ($('#GMButton').length === 0) {
-    var GMButton = $(
-    '<button id="GMButton" aria-label="GMButton" class="' + buttonClass + '" type="button" tabindex="1" style="margin-left: 8px;">' +
-    '<span class="' + innerSpanClass + '">' +
-    '</span>' +
-    '<span class="' + labelSpanClass + '">Assign to GM</span>' +
+if ($('#GMButton').length === 0) {
+  var GMButton = $(
+    '<button id="GMButton" aria-label="GMButton" class="' + buttonClass + '" type="button" tabindex="1" ' +
+    'style="margin-left: 8px; width: fit-content; padding: 6px 12px; white-space: nowrap; display: inline-flex; align-items: center;">' +
+    '<span class="' + innerSpanClass + '"></span>' +
+    '<span style="font-size: 13px;">Assign to GM</span>' +
     '</button>'
     );
     $('button[data-testid="issue-view-foundation.quick-add.quick-add-items-compact.apps-button-dropdown--trigger"]').after(GMButton);
@@ -436,12 +436,12 @@ function addButtons() {
 
 
     // Create Convert To Defect Button
-    if ($('#convertToDefectButton').length === 0) {
-    var convertToDefectButton = $(
-    '<button id="convertToDefectButton" aria-label="ConvertToDefect" class="' + buttonClass + '" type="button" tabindex="0" style="margin-left: 8px;">' +
-    '<span class="' + innerSpanClass + '">' +
-    '</span>' +
-    '<span class="' + labelSpanClass + '">Convert to Defect</span>' +
+if ($('#convertToDefectButton').length === 0) {
+  var convertToDefectButton = $(
+    '<button id="convertToDefectButton" aria-label="ConvertToDefect" class="' + buttonClass + '" type="button" tabindex="0" ' +
+    'style="margin-left: 8px; width: fit-content; padding: 6px 12px; white-space: nowrap; display: inline-flex; align-items: center;">' +
+    '<span class="' + innerSpanClass + '"></span>' +
+    '<span style="font-size: 13px;">Convert to Defect</span>' +
     '</button>'
     );
     $('button[data-testid="issue-view-foundation.quick-add.quick-add-items-compact.apps-button-dropdown--trigger"]').after(convertToDefectButton);
@@ -491,12 +491,12 @@ function addButtons() {
 
 
     // Create close button
-    if ($('#closeButton').length === 0) {
-    var closeButton = $(
-    '<button id="closeButton" aria-label="Close Button" class="' + buttonClass + '" type="button" tabindex="1" style="margin-left: 8px;">' +
-    '<span class="' + innerSpanClass + '">' +
-    '</span>' +
-    '<span class="' + labelSpanClass + '">Close</span>' +
+if ($('#closeButton').length === 0) {
+  var closeButton = $(
+    '<button id="closeButton" aria-label="Close Button" class="' + buttonClass + '" type="button" tabindex="1" ' +
+    'style="margin-left: 8px; width: fit-content; padding: 6px 12px; white-space: nowrap; display: inline-flex; align-items: center;">' +
+    '<span class="' + innerSpanClass + '"></span>' +
+    '<span style="font-size: 13px;">Close</span>' +
     '</button>'
     );
     $('button[data-testid="issue-view-foundation.quick-add.quick-add-items-compact.apps-button-dropdown--trigger"]').after(closeButton);
@@ -1324,9 +1324,8 @@ var css = `
       right: 18px;
       width: calc(33.33% - 25px);
       white-space: normal;
-    }
+      }
 `
-
 
 // Additional CSS only for the LogParser
 var cssLogParser = `
@@ -1693,21 +1692,46 @@ var darkModeSwitchCss = `
 
 // We wait until the searchbar is loaded before running the function addDarkmodeToggle
 var searchbar = 'input[data-test-id="search-dialog-input"';
-waitForKeyElements (searchbar, addDarkmodeToggle);
+waitForKeyElements(searchbar, addDarkmodeToggle);
 
 
-// This adds the CSS and Button (An input checkbox box) to the left of the search box. If the darkmode is enabled then we check the checkbox
+// This adds the CSS and Button (An input checkbox box) to the right of the search box. If the darkmode is enabled then we check the checkbox
 function addDarkmodeToggle() {
-    GM_addStyle(darkModeSwitchCss);
-    if ($('html[data-color-mode="dark"]')[0] || $('html[data-color-mode="light"]')[0]) {
-        $('input[data-test-id="search-dialog-input"').parent().parent().parent().parent().parent().parent().parent().parent().parent().prepend(darkModeSwitch);
-        if ($('html[data-color-mode="dark"]')[0]) {
-            $('input[type=checkbox]').prop('checked', true);
-        };
-        $('input[type=checkbox]').on( "click", toggleDarkmode);
-    }
-}
+  GM_addStyle(darkModeSwitchCss);
 
+  const target = $('[data-test-id="ak-spotlight-target-global-create-spotlight"]');
+
+  if (
+    target.length &&
+    ($('html[data-color-mode="dark"]').length || $('html[data-color-mode="light"]').length)
+  ) {
+    const button = target.find('button[data-testid="atlassian-navigation--create-button"]');
+    const buttonContainer = button.parent();
+
+    if (buttonContainer.length && $('#darkModeToggle').length === 0) {
+      // Set the parent container to flex to align items horizontally
+      buttonContainer.parent().css({
+        display: 'flex',
+        'align-items': 'center'
+      });
+
+      // Create toggle wrapper with margin-left and flex alignment
+      const toggleWrapper = $('<div id="darkModeToggle" style="margin-left: 12px; display: flex; align-items: center;"></div>')
+        .html(darkModeSwitch);
+
+      // Insert the toggle right after the button container
+      buttonContainer.after(toggleWrapper);
+
+      // Set initial checkbox state based on current color mode
+      if ($('html[data-color-mode="dark"]').length) {
+        $('#checkbox').prop('checked', true);
+      }
+
+      // Attach click event for toggling dark mode
+      $('#checkbox').on('click', toggleDarkmode);
+    }
+  }
+}
 
 // Rough minimum requirements for EVE
 var minRequirements = {
