@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
 // @version     2.6.5
-// @author      ISD BH Schogol
+// @author      ISD BH Schogol 
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira and also parses Log Files submitted from the EVE client
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
 // @downloadURL https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -348,9 +348,10 @@ if ($('#translateButton').length === 0) {
     '<span class="' + innerSpanClass + '"></span>' +
     '<span style="font-size: 13px;">Translate</span>' +
     '</button>'
-  );
-  $('button[data-testid="issue-view-foundation.quick-add.quick-add-items-compact.apps-button-dropdown--trigger"]').after(translateButton);
-}
+    );
+    $('button[data-testid="issue-view-foundation.quick-add.quick-add-items-compact.apps-button-dropdown--trigger"]').after(translateButton);
+    }
+
     // When the translate button is clicked we send the Issue title, description and reproduction steps to the Google translate API and change the original content to what we receive back from the API
     $("#translateButton").click(function () {
         $.ajax({
@@ -387,9 +388,9 @@ if ($('#GMButton').length === 0) {
     '<span class="' + innerSpanClass + '"></span>' +
     '<span style="font-size: 13px;">Assign to GM</span>' +
     '</button>'
-  );
-  $('button[data-testid="issue-view-foundation.quick-add.quick-add-items-compact.apps-button-dropdown--trigger"]').after(GMButton);
-}
+    );
+    $('button[data-testid="issue-view-foundation.quick-add.quick-add-items-compact.apps-button-dropdown--trigger"]').after(GMButton);
+    }
 
     // When the Assign to GM button is clicked we change the Team to "EO - Game Masters" and also visually change the field so the user sees that it worked.
     $("#GMButton").click(function () {
@@ -442,9 +443,9 @@ if ($('#convertToDefectButton').length === 0) {
     '<span class="' + innerSpanClass + '"></span>' +
     '<span style="font-size: 13px;">Convert to Defect</span>' +
     '</button>'
-  );
-  $('button[data-testid="issue-view-foundation.quick-add.quick-add-items-compact.apps-button-dropdown--trigger"]').after(convertToDefectButton);
-}
+    );
+    $('button[data-testid="issue-view-foundation.quick-add.quick-add-items-compact.apps-button-dropdown--trigger"]').after(convertToDefectButton);
+    }
     // When the Convert to Defect button is clicked we trigger the Automation which converts the EBR into an EDR issue
     $("#convertToDefectButton").click(function () {
         console.log('test');
@@ -497,9 +498,9 @@ if ($('#closeButton').length === 0) {
     '<span class="' + innerSpanClass + '"></span>' +
     '<span style="font-size: 13px;">Close</span>' +
     '</button>'
-  );
-  $('button[data-testid="issue-view-foundation.quick-add.quick-add-items-compact.apps-button-dropdown--trigger"]').after(closeButton);
-}
+    );
+    $('button[data-testid="issue-view-foundation.quick-add.quick-add-items-compact.apps-button-dropdown--trigger"]').after(closeButton);
+    }
     // When the Close button is clicked we change the status to Closed by simulating clicks on the relevant buttons. This is extremely janky right now because I cant figure out a better way to do this.
     $("#closeButton").click(function () {
         $("div[data-testid='issue.views.issue-base.foundation.status.status-field-wrapper']").find("button").click()
