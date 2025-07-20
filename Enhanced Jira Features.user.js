@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.6.5
-// @author      ISD BH Schogol 
+// @version     2.6.6
+// @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira and also parses Log Files submitted from the EVE client
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
 // @downloadURL https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -448,7 +448,6 @@ if ($('#convertToDefectButton').length === 0) {
     }
     // When the Convert to Defect button is clicked we trigger the Automation which converts the EBR into an EDR issue
     $("#convertToDefectButton").click(function () {
-        console.log('test');
         let ajscloudid = $('meta[name="ajs-cloud-id"]').attr('content');
         $.ajax({
             url: 'https://ccpgames.atlassian.net/rest/api/2/issue/EBR-221',
@@ -460,7 +459,7 @@ if ($('#convertToDefectButton').length === 0) {
             // Once the conversion succeeds we check for the "Issue Updated" message on screen and once it appears we refresh the page
             success: function (data) {
                 $.ajax({
-                    url: 'https://ccpgames.atlassian.net/gateway/api/automation/internal-api/jira/' + ajscloudid + '/pro/rest/v1/rules/manual/invocation/10609113',
+                    url: 'https://ccpgames.atlassian.net/gateway/api/automation/internal-api/jira/' + ajscloudid + '/pro/rest/v1/rules/manual/invocation/767335',
                     type: 'POST',
                     contentType: 'application/json',
                     charset: 'utf-8',
