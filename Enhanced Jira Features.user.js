@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.6.6
+// @version     2.6.7
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira and also parses Log Files submitted from the EVE client
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -450,7 +450,7 @@ if ($('#convertToDefectButton').length === 0) {
     $("#convertToDefectButton").click(function () {
         let ajscloudid = $('meta[name="ajs-cloud-id"]').attr('content');
         $.ajax({
-            url: 'https://ccpgames.atlassian.net/rest/api/2/issue/EBR-221',
+            url: 'https://ccpgames.atlassian.net/rest/api/2/issue/'+ issueID +'',
             type: 'GET',
             contentType: 'application/json',
             charset: 'utf-8',
