@@ -456,7 +456,6 @@ if ($('#convertToDefectButton').length === 0) {
             charset: 'utf-8',
             data: '',
 
-            // Once the conversion succeeds we check for the "Issue Updated" message on screen and once it appears we refresh the page
             success: function (data) {
                 $.ajax({
                     url: 'https://ccpgames.atlassian.net/gateway/api/automation/internal-api/jira/' + ajscloudid + '/pro/rest/v1/rules/manual/invocation/767335',
