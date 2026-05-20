@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.6.7
+// @version     2.6.8
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira and also parses Log Files submitted from the EVE client
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
 // @downloadURL https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
-// @match       https://ccpgames.atlassian.net/jira*
-// @match       https://ccpgames.atlassian.net/browse*
-// @match       https://ccpgames.atlassian.net/issues*
+// @match       https://fenriscreations.atlassian.net/jira*
+// @match       https://fenriscreations.atlassian.net/browse*
+// @match       https://fenriscreations.atlassian.net/issues*
 // @require     https://gist.github.com/raw/2625891/waitForKeyElements.js
 // @require     https://ajax.googleapis.com/ajax/libs/jquery/3.3.1/jquery.min.js
 // @grant       GM_addStyle
@@ -279,7 +279,7 @@ function toggleDarkmode() {
     if ($('html[data-color-mode="dark"]')[0]) {
         $('input[type=checkbox]').prop('checked', false);
         $.ajax({
-            url: 'https://ccpgames.atlassian.net/rest/api/3/mypreferences?key=jira.user.theme.preference',
+            url: 'https://fenriscreations.atlassian.net/rest/api/3/mypreferences?key=jira.user.theme.preference',
             type: 'PUT',
             contentType: 'application/json',
             charset: 'utf-8',
@@ -289,7 +289,7 @@ function toggleDarkmode() {
     } else {
         $('input[type=checkbox]').prop('checked', true);
         $.ajax({
-            url: 'https://ccpgames.atlassian.net/rest/api/3/mypreferences?key=jira.user.theme.preference',
+            url: 'https://fenriscreations.atlassian.net/rest/api/3/mypreferences?key=jira.user.theme.preference',
             type: 'PUT',
             contentType: 'application/json',
             charset: 'utf-8',
@@ -395,7 +395,7 @@ if ($('#GMButton').length === 0) {
     // When the Assign to GM button is clicked we change the Team to "EO - Game Masters" and also visually change the field so the user sees that it worked.
     $("#GMButton").click(function () {
         $.ajax({
-            url: 'https://ccpgames.atlassian.net/rest/api/2/issue/'+ $('a[data-testid="issue.views.issue-base.foundation.breadcrumbs.current-issue.item"]').text(),
+            url: 'https://fenriscreations.atlassian.net/rest/api/2/issue/'+ $('a[data-testid="issue.views.issue-base.foundation.breadcrumbs.current-issue.item"]').text(),
             type: 'PUT',
             contentType: 'application/json',
             charset: 'utf-8',
@@ -406,7 +406,7 @@ if ($('#GMButton').length === 0) {
                 $('div[data-testid="issue-field-heading-styled-field-heading.field"]:contains(Team)').parent().children('div').eq(1).text('EO - GameMasters');
                 // After changing the Team field to "EO - Game Masters" we change the Assignee field to "Unassigned" because GMs wont be able to see the BRs in their filters if they are assigned to someone.
                 $.ajax({
-                    url: 'https://ccpgames.atlassian.net/rest/api/3/issue/'+ $('a[data-testid="issue.views.issue-base.foundation.breadcrumbs.current-issue.item"]').text() + '/assignee',
+                    url: 'https://fenriscreations.atlassian.net/rest/api/3/issue/'+ $('a[data-testid="issue.views.issue-base.foundation.breadcrumbs.current-issue.item"]').text() + '/assignee',
                     type: 'PUT',
                     contentType: 'application/json',
                     charset: 'utf-8',
@@ -450,7 +450,7 @@ if ($('#convertToDefectButton').length === 0) {
     $("#convertToDefectButton").click(function () {
         let ajscloudid = $('meta[name="ajs-cloud-id"]').attr('content');
         $.ajax({
-            url: 'https://ccpgames.atlassian.net/rest/api/2/issue/'+ issueID +'',
+            url: 'https://fenriscreations.atlassian.net/rest/api/2/issue/'+ issueID +'',
             type: 'GET',
             contentType: 'application/json',
             charset: 'utf-8',
@@ -458,7 +458,7 @@ if ($('#convertToDefectButton').length === 0) {
 
             success: function (data) {
                 $.ajax({
-                    url: 'https://ccpgames.atlassian.net/gateway/api/automation/internal-api/jira/' + ajscloudid + '/pro/rest/v1/rules/manual/invocation/767335',
+                    url: 'https://fenriscreations.atlassian.net/gateway/api/automation/internal-api/jira/' + ajscloudid + '/pro/rest/v1/rules/manual/invocation/767335',
                     type: 'POST',
                     contentType: 'application/json',
                     charset: 'utf-8',
