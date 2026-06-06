@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.6.10
+// @version     2.7.0
 // @author      ISD BH Schogol, ISD Tulwar
-// @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira and also parses Log Files submitted from the EVE client
+// @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, and suggests similar existing defects on bug reports
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
 // @downloadURL https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
 // @match       https://fenriscreations.atlassian.net/jira*
@@ -14,13 +14,18 @@
 // @grant       GM_getValue
 // @grant       GM_setValue
 // @grant       GM_registerMenuCommand
+// @grant       GM_unregisterMenuCommand
+// @grant       GM_addValueChangeListener
+// @grant       GM_xmlhttpRequest
+// @connect      huggingface.co
+// @connect      cdn.jsdelivr.net
 // ==/UserScript==
 /* global $ */
 
 
 
 // Creating various variables which we use later on
-var rows, oc, lc, pdm, pdmdata, driverAge = "unknown", menu_parser, menu_scrollbar, menu_dropdowns, menu_buttons, menu_darkmode;
+var rows, oc, lc, pdm, pdmdata, driverAge = "unknown", menu_parser, menu_scrollbar, menu_dropdowns, menu_buttons, menu_darkmode, menu_similarDefects, menu_sdSync, menu_sdRebuild;
 
 
 // Current Date
@@ -28,7 +33,7 @@ var today = new Date();
 
 
 // Array which contains the locally saved values for a couple of variables
-var savedVariables = [["key",""], ["parser", ""], ["scrollbar", ""], ["dropdowns", ""], ["buttons", ""]];
+var savedVariables = [["key",""], ["parser", ""], ["scrollbar", ""], ["dropdowns", ""], ["buttons", ""], ["similarDefects", ""]];
 
 
 // Listener which triggers when the locally saved "scrollbar" value is changed. If the new value is false we remove the custom scrollbar. If the new value is true we add the custom scrollbar.
@@ -167,6 +172,22 @@ else {
 
 
 
+// Add menu command that will allow to toggle On/Off the "Similar Defects" suggestions on bug reports.
+if (savedVariables[5][1]) {
+    menu_similarDefects = GM_registerMenuCommand ("Disable Similar Defects", toggleSimilarDefects);
+}
+else {
+    menu_similarDefects = GM_registerMenuCommand ("Enable Similar Defects", toggleSimilarDefects);
+}
+
+// Action commands for the Similar Defects local database. Shown only while the feature is enabled, and
+// managed by refreshMenu (registerSimilarDefectActions) so they survive the disable/re-enable cycle - if
+// they were registered only once here they would be dropped when refreshMenu rebuilds the menu. The
+// callbacks reference EJF_SD lazily, so it is fine that the namespace is defined later in the file.
+registerSimilarDefectActions();
+
+
+
 // Add menu command that will allow to toggle On/Off darkmode.
 if ($('html[data-color-mode="dark"]')[0]) {
     menu_darkmode = GM_registerMenuCommand ("Disable Dark Mode", toggleDarkmode);
@@ -187,12 +208,26 @@ function promptAndChangeStoredValue () {
 };
 
 
+// (Re)register the Similar Defects action commands ("Sync defects now" / "Rebuild defect database").
+// Idempotent: it clears any existing ones first, then adds them only while the feature is enabled. Called
+// from the initial menu setup and from refreshMenu, so the commands correctly come back after a re-enable.
+function registerSimilarDefectActions() {
+    if (menu_sdSync) { GM_unregisterMenuCommand(menu_sdSync); menu_sdSync = null; }
+    if (menu_sdRebuild) { GM_unregisterMenuCommand(menu_sdRebuild); menu_sdRebuild = null; }
+    if (savedVariables[5][1]) {
+        menu_sdSync = GM_registerMenuCommand ("Sync defects now", function () { EJF_SD.sync.syncNow(); });
+        menu_sdRebuild = GM_registerMenuCommand ("Rebuild defect database", function () { EJF_SD.sync.rebuild(); });
+    }
+}
+
+
 // Function which refreshes the Tampermonkey menu
 function refreshMenu() {
     GM_unregisterMenuCommand(menu_parser);
     GM_unregisterMenuCommand(menu_scrollbar);
     GM_unregisterMenuCommand(menu_dropdowns);
     GM_unregisterMenuCommand(menu_buttons);
+    GM_unregisterMenuCommand(menu_similarDefects);
     GM_unregisterMenuCommand(menu_darkmode);
 
     if (savedVariables[1][1]) {
@@ -222,6 +257,16 @@ function refreshMenu() {
     else {
         menu_buttons = GM_registerMenuCommand ("Enable Extra Buttons", toggleButtons);
     }
+
+    if (savedVariables[5][1]) {
+        menu_similarDefects = GM_registerMenuCommand ("Disable Similar Defects", toggleSimilarDefects);
+    }
+    else {
+        menu_similarDefects = GM_registerMenuCommand ("Enable Similar Defects", toggleSimilarDefects);
+    }
+
+    // Re-add (or remove) the Sync / Rebuild action commands to match the toggle state.
+    registerSimilarDefectActions();
 
     if ($('html[data-color-mode="dark"]')[0]) {
         menu_darkmode = GM_registerMenuCommand ("Disable Dark Mode", toggleDarkmode);
@@ -270,6 +315,21 @@ function toggleDropdown() {
 function toggleButtons() {
     savedVariables[4][1] = savedVariables[4][1] ? false : true;
     GM_setValue (savedVariables[4][0], savedVariables[4][1]);
+    refreshMenu();
+};
+
+
+// Function which toggles the "Similar Defects" suggestions feature on / off and saves it locally.
+// When turned off we also remove the panel immediately.
+function toggleSimilarDefects() {
+    savedVariables[5][1] = savedVariables[5][1] ? false : true;
+    GM_setValue (savedVariables[5][0], savedVariables[5][1]);
+    if (!savedVariables[5][1]) {
+        $('#ejf-sd-panel').remove();
+        if (typeof EJF_SD !== 'undefined') { EJF_SD.ui.currentKey = null; }
+    } else if (typeof EJF_SD !== 'undefined') {
+        EJF_SD.ui.ensure();
+    }
     refreshMenu();
 };
 
@@ -1964,3 +2024,575 @@ var pdmHtml = `
   <div id="Requirements"></div>
 </div>
 `
+
+
+/* =========================================================================================
+ * Similar Defects feature (Phase 1: local DB + sync + BM25 keyword ranking + suggestions UI)
+ *
+ * Builds a local IndexedDB cache of all issues in the EDR and EO projects, and on a bug report
+ * (EBR) page shows a floating panel of the most relevant existing defects. Phase 1 ranks by BM25
+ * keyword similarity (fully local, no model); a later phase swaps in local semantic embeddings,
+ * which is why records already reserve `embedding` / `embeddingModelVersion` fields.
+ *
+ * Everything lives under the EJF_SD namespace to avoid polluting globals. Plain var/function +
+ * Promises + jQuery, matching the rest of this file. Jira REST calls are same-origin and rely on
+ * the browser session cookie (no auth header / no GM_xmlhttpRequest needed), exactly like the
+ * existing Translate / Convert-to-Defect calls.
+ * ========================================================================================= */
+var EJF_SD = {
+    HOST: 'https://fenriscreations.atlassian.net',
+    SCOPE: 'project in (EDR, EO)',                 // dataset definition (tweak here to change scope)
+    FIELDS: ['summary', 'description', 'status', 'resolution', 'components', 'updated', 'project'],
+    DB_NAME: 'EJF_SimilarDefects',
+    DB_VERSION: 1,
+    PAGE_SIZE: 100,
+    PAGE_DELAY_MS: 250,                            // polite gap between search pages
+    NEAR_LIMIT_DELAY_MS: 3000,                     // back off harder when the rate-limit budget is low
+    MAX_RETRIES: 5,
+    TOP_N: 8,
+    MODEL_VERSION: 'bm25-v1'                        // Phase 1 has no embeddings; bumped when Phase 2 lands
+};
+
+
+/* ---- utilities ---- */
+EJF_SD.util = {
+    // djb2 string hash -> short hex; used to detect whether an issue's TEXT changed (vs. metadata only)
+    hash: function (str) {
+        var h = 5381, i = str.length;
+        while (i) { h = (h * 33) ^ str.charCodeAt(--i); }
+        return (h >>> 0).toString(16);
+    },
+
+    // Flatten a Jira description to plain text. Handles both the v2 string form and the v3 ADF object form.
+    toPlainText: function (d) {
+        if (!d) { return ''; }
+        if (typeof d === 'string') { return d; }
+        var out = [];
+        (function walk(node) {
+            if (!node || typeof node !== 'object') { return; }
+            if (node.type === 'text' && typeof node.text === 'string') { out.push(node.text); }
+            if (node.content && node.content.length) {
+                for (var i = 0; i < node.content.length; i++) { walk(node.content[i]); }
+            }
+        })(d);
+        return out.join(' ');
+    },
+
+    // Convert a Jira ISO `updated` timestamp into the JQL literal "yyyy/MM/dd HH:mm".
+    // We subtract a 2 minute buffer so a slight timezone/rounding mismatch never SKIPS an updated issue
+    // (re-fetching a few extra issues is harmless - bulkPut is idempotent).
+    toJqlTime: function (iso) {
+        var d = new Date(iso);
+        if (isNaN(d.getTime())) { return null; }
+        d = new Date(d.getTime() - 2 * 60 * 1000);
+        function p(n) { return (n < 10 ? '0' : '') + n; }
+        return d.getFullYear() + '/' + p(d.getMonth() + 1) + '/' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+    },
+
+    delay: function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+};
+
+
+/* ---- storage layer: IndexedDB ---- */
+EJF_SD.db = {
+    _db: null,
+
+    open: function () {
+        if (EJF_SD.db._db) { return Promise.resolve(EJF_SD.db._db); }
+        return new Promise(function (resolve, reject) {
+            var req = window.indexedDB.open(EJF_SD.DB_NAME, EJF_SD.DB_VERSION);
+            req.onupgradeneeded = function (e) {
+                var db = e.target.result;
+                if (!db.objectStoreNames.contains('defects')) {
+                    var s = db.createObjectStore('defects', { keyPath: 'key' });
+                    s.createIndex('by_updated', 'updated', { unique: false });
+                    s.createIndex('by_project', 'project', { unique: false });
+                    s.createIndex('by_modelVersion', 'embeddingModelVersion', { unique: false });
+                }
+                if (!db.objectStoreNames.contains('meta')) {
+                    db.createObjectStore('meta', { keyPath: 'k' });
+                }
+            };
+            req.onsuccess = function (e) { EJF_SD.db._db = e.target.result; resolve(EJF_SD.db._db); };
+            req.onerror = function (e) { reject(e.target.error); };
+        });
+    },
+
+    _store: function (name, mode) {
+        return EJF_SD.db._db.transaction(name, mode).objectStore(name);
+    },
+
+    bulkPut: function (recs) {
+        return EJF_SD.db.open().then(function (db) {
+            return new Promise(function (resolve, reject) {
+                if (!recs.length) { resolve(0); return; }
+                var tx = db.transaction('defects', 'readwrite');
+                var store = tx.objectStore('defects');
+                for (var i = 0; i < recs.length; i++) { store.put(recs[i]); }
+                tx.oncomplete = function () { resolve(recs.length); };
+                tx.onerror = function (e) { reject(e.target.error); };
+            });
+        });
+    },
+
+    getDefect: function (key) {
+        return EJF_SD.db.open().then(function () {
+            return new Promise(function (resolve, reject) {
+                var r = EJF_SD.db._store('defects', 'readonly').get(key);
+                r.onsuccess = function () { resolve(r.result || null); };
+                r.onerror = function (e) { reject(e.target.error); };
+            });
+        });
+    },
+
+    allDefects: function () {
+        return EJF_SD.db.open().then(function () {
+            return new Promise(function (resolve, reject) {
+                var r = EJF_SD.db._store('defects', 'readonly').getAll();
+                r.onsuccess = function () { resolve(r.result || []); };
+                r.onerror = function (e) { reject(e.target.error); };
+            });
+        });
+    },
+
+    countDefects: function () {
+        return EJF_SD.db.open().then(function () {
+            return new Promise(function (resolve, reject) {
+                var r = EJF_SD.db._store('defects', 'readonly').count();
+                r.onsuccess = function () { resolve(r.result || 0); };
+                r.onerror = function (e) { reject(e.target.error); };
+            });
+        });
+    },
+
+    clearDefects: function () {
+        return EJF_SD.db.open().then(function () {
+            return new Promise(function (resolve, reject) {
+                var r = EJF_SD.db._store('defects', 'readwrite').clear();
+                r.onsuccess = function () { resolve(); };
+                r.onerror = function (e) { reject(e.target.error); };
+            });
+        });
+    },
+
+    getMeta: function (k) {
+        return EJF_SD.db.open().then(function () {
+            return new Promise(function (resolve, reject) {
+                var r = EJF_SD.db._store('meta', 'readonly').get(k);
+                r.onsuccess = function () { resolve(r.result ? r.result.v : null); };
+                r.onerror = function (e) { reject(e.target.error); };
+            });
+        });
+    },
+
+    setMeta: function (k, v) {
+        return EJF_SD.db.open().then(function () {
+            return new Promise(function (resolve, reject) {
+                var r = EJF_SD.db._store('meta', 'readwrite').put({ k: k, v: v });
+                r.onsuccess = function () { resolve(); };
+                r.onerror = function (e) { reject(e.target.error); };
+            });
+        });
+    }
+};
+
+
+/* ---- sync engine ---- */
+EJF_SD.sync = {
+    running: false,
+
+    // POST to a Jira REST endpoint with the session cookie; retries on HTTP 429 honoring Retry-After.
+    _apiPost: function (path, body) {
+        return new Promise(function (resolve, reject) {
+            (function attempt(retries) {
+                $.ajax({
+                    url: EJF_SD.HOST + path,
+                    type: 'POST',
+                    contentType: 'application/json',
+                    dataType: 'json',
+                    headers: { 'X-Atlassian-Token': 'no-check' },
+                    data: JSON.stringify(body)
+                }).done(function (data, status, xhr) {
+                    resolve({ data: data, xhr: xhr });
+                }).fail(function (xhr) {
+                    if (xhr.status === 429 && retries > 0) {
+                        var ra = parseInt(xhr.getResponseHeader('Retry-After'), 10);
+                        var wait = (isNaN(ra) ? 5 : ra) * 1000;
+                        setTimeout(function () { attempt(retries - 1); }, wait);
+                    } else {
+                        reject(new Error('Jira API ' + path + ' failed: HTTP ' + xhr.status));
+                    }
+                });
+            })(EJF_SD.MAX_RETRIES);
+        });
+    },
+
+    approximateCount: function () {
+        return EJF_SD.sync._apiPost('/rest/api/3/search/approximate-count', { jql: EJF_SD.SCOPE })
+            .then(function (r) { return (r.data && typeof r.data.count === 'number') ? r.data.count : null; })
+            .catch(function () { return null; });
+    },
+
+    // Map a raw Jira issue (v2 shape) into a stored defect record.
+    _mapIssue: function (issue) {
+        var f = issue.fields || {};
+        var summary = f.summary || '';
+        var description = EJF_SD.util.toPlainText(f.description);
+        var components = [];
+        if (f.components) { for (var i = 0; i < f.components.length; i++) { components.push(f.components[i].name); } }
+        return {
+            key: issue.key,
+            project: (f.project && f.project.key) || (issue.key.indexOf('-') > 0 ? issue.key.split('-')[0] : ''),
+            summary: summary,
+            description: description,
+            status: (f.status && f.status.name) || '',
+            resolution: (f.resolution && f.resolution.name) || null,
+            components: components,
+            updated: f.updated || '',
+            embedding: null,
+            embeddingModelVersion: null,
+            textHash: EJF_SD.util.hash(summary + '\n' + description)
+        };
+    },
+
+    // Page through /search/jql for a given jql, storing each page. Resumable via meta.resumeToken.
+    // opts: { startToken, startHighWater }
+    _run: function (jql, opts) {
+        opts = opts || {};
+        var token = opts.startToken || null;
+        var pages = 0, stored = 0;
+        var maxUpdated = opts.startHighWater || '';
+
+        function nextPage() {
+            var body = { jql: jql, fields: EJF_SD.FIELDS, maxResults: EJF_SD.PAGE_SIZE };
+            if (token) { body.nextPageToken = token; }
+            return EJF_SD.sync._apiPost('/rest/api/3/search/jql', body).then(function (r) {
+                var data = r.data || {};
+                var issues = data.issues || [];
+                var recs = [];
+                for (var i = 0; i < issues.length; i++) {
+                    var rec = EJF_SD.sync._mapIssue(issues[i]);
+                    if (rec.updated && rec.updated > maxUpdated) { maxUpdated = rec.updated; }
+                    recs.push(rec);
+                }
+                return EJF_SD.db.bulkPut(recs).then(function () {
+                    stored += recs.length;
+                    pages++;
+                    EJF_SD.rank._dirty = true;
+                    var nextToken = data.nextPageToken || null;
+                    // Persist progress so a reload mid-sync resumes rather than restarting.
+                    return EJF_SD.db.setMeta('resumeToken', (data.isLast || !nextToken) ? null : nextToken)
+                        .then(function () { return EJF_SD.db.setMeta('lastSyncHighWater', maxUpdated); })
+                        .then(function () {
+                            EJF_SD.ui.setStatus('Syncing… ' + stored + ' issues fetched');
+                            if (data.isLast || !nextToken) { return { stored: stored, highWater: maxUpdated }; }
+                            if (nextToken === token) { throw new Error('nextPageToken did not advance – stopping (Jira API quirk).'); }
+                            token = nextToken;
+                            var near = (r.xhr.getResponseHeader('X-RateLimit-NearLimit') === 'true');
+                            return EJF_SD.util.delay(near ? EJF_SD.NEAR_LIMIT_DELAY_MS : EJF_SD.PAGE_DELAY_MS).then(nextPage);
+                        });
+                });
+            });
+        }
+        return nextPage();
+    },
+
+    fullSync: function () {
+        return EJF_SD.db.getMeta('resumeToken').then(function (rt) {
+            return EJF_SD.db.getMeta('lastSyncHighWater').then(function (hw) {
+                var jql = EJF_SD.SCOPE + ' ORDER BY updated ASC';
+                return EJF_SD.sync._run(jql, { startToken: rt || null, startHighWater: hw || '' }).then(function (res) {
+                    return EJF_SD.db.setMeta('lastFullSyncAt', new Date().toISOString())
+                        .then(function () { return EJF_SD.db.setMeta('modelVersion', EJF_SD.MODEL_VERSION); })
+                        .then(function () { return res; });
+                });
+            });
+        });
+    },
+
+    incrementalSync: function () {
+        return EJF_SD.db.getMeta('lastSyncHighWater').then(function (hw) {
+            if (!hw) { return EJF_SD.sync.fullSync(); }
+            var since = EJF_SD.util.toJqlTime(hw);
+            if (!since) { return EJF_SD.sync.fullSync(); }
+            var jql = EJF_SD.SCOPE + ' AND updated >= "' + since + '" ORDER BY updated ASC';
+            return EJF_SD.sync._run(jql, { startHighWater: hw });
+        });
+    },
+
+    // Menu entry point: full sync if the DB is empty, otherwise an incremental catch-up.
+    syncNow: function () {
+        if (EJF_SD.sync.running) { EJF_SD.ui.toast('A sync is already running…'); return Promise.resolve(); }
+        EJF_SD.sync.running = true;
+        EJF_SD.ui.toast('Starting defect sync…');
+        EJF_SD.ui.setStatus('Starting sync…');
+        return EJF_SD.db.countDefects().then(function (n) {
+            return n === 0 ? EJF_SD.sync.fullSync() : EJF_SD.sync.incrementalSync();
+        }).then(function (res) {
+            return EJF_SD.db.countDefects().then(function (total) {
+                EJF_SD.sync.running = false;
+                EJF_SD.ui.toast('Defect sync complete – ' + total + ' defects in local DB.');
+                EJF_SD.ui.setStatus(total + ' defects in database');
+                if (EJF_SD.ui.currentKey) { EJF_SD.ui.render(EJF_SD.ui.currentKey); }
+                return res;
+            });
+        }).catch(function (e) {
+            EJF_SD.sync.running = false;
+            EJF_SD.db.setMeta('lastError', String(e && e.message || e));
+            EJF_SD.ui.setStatus('Sync error: ' + (e && e.message || e));
+            alert('Defect sync failed: ' + (e && e.message || e) + '\nReport issues to Schogol :).');
+        });
+    },
+
+    // Wipe the local DB and rebuild from scratch (also used after a model-version change in Phase 2).
+    rebuild: function () {
+        if (EJF_SD.sync.running) { EJF_SD.ui.toast('A sync is already running…'); return Promise.resolve(); }
+        if (!confirm('Rebuild the local defect database from scratch? This re-fetches every EDR/EO issue.')) { return Promise.resolve(); }
+        EJF_SD.sync.running = true;
+        EJF_SD.ui.toast('Rebuilding defect database…');
+        return EJF_SD.db.clearDefects()
+            .then(function () { return EJF_SD.db.setMeta('resumeToken', null); })
+            .then(function () { return EJF_SD.db.setMeta('lastSyncHighWater', ''); })
+            .then(function () { EJF_SD.rank._dirty = true; return EJF_SD.sync.fullSync(); })
+            .then(function () {
+                return EJF_SD.db.countDefects().then(function (total) {
+                    EJF_SD.sync.running = false;
+                    EJF_SD.ui.toast('Rebuild complete – ' + total + ' defects.');
+                    if (EJF_SD.ui.currentKey) { EJF_SD.ui.render(EJF_SD.ui.currentKey); }
+                });
+            })
+            .catch(function (e) {
+                EJF_SD.sync.running = false;
+                EJF_SD.ui.setStatus('Rebuild error: ' + (e && e.message || e));
+                alert('Rebuild failed: ' + (e && e.message || e));
+            });
+    }
+};
+
+
+/* ---- ranking: BM25 keyword similarity (Phase 1) ---- */
+EJF_SD.rank = {
+    _index: null,       // { N, avgdl, df:{}, docs:[{key,project,summary,status,tf:{},len}] }
+    _dirty: true,       // set true whenever sync writes; triggers a rebuild on next query
+    _building: null,
+    K1: 1.5,
+    B: 0.75,
+    STOP: (function () {
+        var s = {}, w = ('the a an and or of to in for on with is are was were be been it this that these those as at by from we you they i he she his her its their our your not no but if then than so such can will would should could may might do does did has have had into over under out up down off about your yours'.split(' '));
+        for (var i = 0; i < w.length; i++) { s[w[i]] = true; }
+        return s;
+    })(),
+
+    _tokenize: function (text) {
+        var raw = (text || '').toLowerCase().replace(/[^a-z0-9\s]+/g, ' ').split(/\s+/);
+        var out = [];
+        for (var i = 0; i < raw.length; i++) {
+            var t = raw[i];
+            if (t.length >= 2 && !EJF_SD.rank.STOP[t]) { out.push(t); }
+        }
+        return out;
+    },
+
+    _ensureIndex: function () {
+        if (EJF_SD.rank._index && !EJF_SD.rank._dirty) { return Promise.resolve(EJF_SD.rank._index); }
+        if (EJF_SD.rank._building) { return EJF_SD.rank._building; }
+        EJF_SD.rank._building = EJF_SD.db.allDefects().then(function (records) {
+            var df = {}, docs = [], totalLen = 0;
+            for (var i = 0; i < records.length; i++) {
+                var rec = records[i];
+                var toks = EJF_SD.rank._tokenize((rec.summary || '') + ' ' + (rec.description || ''));
+                var tf = {}, seen = {};
+                for (var j = 0; j < toks.length; j++) {
+                    var tk = toks[j];
+                    tf[tk] = (tf[tk] || 0) + 1;
+                    if (!seen[tk]) { df[tk] = (df[tk] || 0) + 1; seen[tk] = true; }
+                }
+                totalLen += toks.length;
+                docs.push({ key: rec.key, project: rec.project, summary: rec.summary, status: rec.status, resolution: rec.resolution, tf: tf, len: toks.length });
+            }
+            EJF_SD.rank._index = { N: docs.length, avgdl: docs.length ? (totalLen / docs.length) : 0, df: df, docs: docs };
+            EJF_SD.rank._dirty = false;
+            EJF_SD.rank._building = null;
+            return EJF_SD.rank._index;
+        }).catch(function (e) { EJF_SD.rank._building = null; throw e; });
+        return EJF_SD.rank._building;
+    },
+
+    // Rank stored defects against the query text. Returns up to TOP_N {key,project,summary,status,score}.
+    suggest: function (text, excludeKey) {
+        return EJF_SD.rank._ensureIndex().then(function (idx) {
+            if (!idx || !idx.N) { return []; }
+            var qTokens = EJF_SD.rank._tokenize(text);
+            var qSet = {};
+            for (var i = 0; i < qTokens.length; i++) { qSet[qTokens[i]] = true; }
+            var terms = Object.keys(qSet);
+            if (!terms.length) { return []; }
+            var k1 = EJF_SD.rank.K1, b = EJF_SD.rank.B, avgdl = idx.avgdl || 1;
+            // precompute idf per query term
+            var idf = {};
+            for (var t = 0; t < terms.length; t++) {
+                var n = idx.df[terms[t]] || 0;
+                idf[terms[t]] = Math.log(1 + (idx.N - n + 0.5) / (n + 0.5));
+            }
+            var scored = [];
+            for (var d = 0; d < idx.docs.length; d++) {
+                var doc = idx.docs[d];
+                if (excludeKey && doc.key === excludeKey) { continue; }
+                var score = 0;
+                for (var q = 0; q < terms.length; q++) {
+                    var tf = doc.tf[terms[q]];
+                    if (!tf) { continue; }
+                    var denom = tf + k1 * (1 - b + b * (doc.len / avgdl));
+                    score += idf[terms[q]] * (tf * (k1 + 1)) / denom;
+                }
+                if (score > 0) { scored.push({ key: doc.key, project: doc.project, summary: doc.summary, status: doc.status, resolution: doc.resolution, score: score }); }
+            }
+            scored.sort(function (a, c) { return c.score - a.score; });
+            return scored.slice(0, EJF_SD.TOP_N);
+        });
+    }
+};
+
+
+/* ---- UI: floating suggestions panel ---- */
+EJF_SD.ui = {
+    currentKey: null,
+    _toastTimer: null,
+
+    css: '\
+#ejf-sd-panel { position: fixed; right: 18px; bottom: 18px; width: 340px; max-height: 52vh; z-index: 9000;\
+  background: #1D2125; color: #e6e6e6; border: 1px solid #3a434d; border-radius: 6px; box-shadow: 0 4px 18px rgba(0,0,0,.45);\
+  font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif; font-size: 12px; display: flex; flex-direction: column; overflow: hidden; }\
+#ejf-sd-head { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: #282d33; cursor: default; }\
+#ejf-sd-title { font-weight: 700; flex: 1; }\
+#ejf-sd-mode { font-size: 10px; background: #3a434d; padding: 1px 6px; border-radius: 8px; }\
+#ejf-sd-collapse { cursor: pointer; padding: 0 4px; font-weight: 700; }\
+#ejf-sd-status { padding: 6px 10px; color: #aab3bd; border-bottom: 1px solid #2c333a; }\
+#ejf-sd-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; }\
+#ejf-sd-list li { padding: 7px 10px; border-bottom: 1px solid #2c333a; }\
+#ejf-sd-list a { color: #4c9aff; font-weight: 700; text-decoration: none; }\
+#ejf-sd-list a:hover { text-decoration: underline; }\
+.ejf-sd-proj { font-size: 10px; background: #3a434d; padding: 0 5px; border-radius: 7px; margin-left: 6px; }\
+.ejf-sd-score { float: right; color: #7a8694; font-size: 10px; }\
+.ejf-sd-sum { margin-top: 2px; color: #e6e6e6; }\
+.ejf-sd-meta { margin-top: 2px; color: #7a8694; font-size: 10px; }\
+#ejf-sd-panel.collapsed #ejf-sd-status, #ejf-sd-panel.collapsed #ejf-sd-list { display: none; }\
+#ejf-sd-toast { position: fixed; right: 18px; bottom: 18px; z-index: 9001; background: #333; color: #eee; padding: 8px 14px;\
+  border-radius: 6px; box-shadow: 0 4px 18px rgba(0,0,0,.45); font-family: -apple-system,Arial,sans-serif; font-size: 12px; max-width: 320px; }',
+
+    injectCss: function () {
+        if (!EJF_SD.ui._cssInjected) { GM_addStyle(EJF_SD.ui.css); EJF_SD.ui._cssInjected = true; }
+    },
+
+    // Brief transient message (e.g. sync started/finished), independent of the panel.
+    toast: function (msg) {
+        EJF_SD.ui.injectCss();
+        var $t = $('#ejf-sd-toast');
+        if (!$t.length) { $t = $('<div id="ejf-sd-toast"></div>').appendTo(document.body); }
+        $t.text(msg).show();
+        if (EJF_SD.ui._toastTimer) { clearTimeout(EJF_SD.ui._toastTimer); }
+        EJF_SD.ui._toastTimer = setTimeout(function () { $('#ejf-sd-toast').fadeOut(400); }, 4000);
+    },
+
+    setStatus: function (msg) { $('#ejf-sd-status').text(msg); },
+
+    _ensurePanel: function () {
+        EJF_SD.ui.injectCss();
+        if ($('#ejf-sd-panel').length) { return; }
+        var $p = $(
+            '<div id="ejf-sd-panel">' +
+            '  <div id="ejf-sd-head"><span id="ejf-sd-title">Similar defects</span>' +
+            '    <span id="ejf-sd-mode">Keyword</span><span id="ejf-sd-collapse" title="Collapse / expand">–</span></div>' +
+            '  <div id="ejf-sd-status"></div>' +
+            '  <ul id="ejf-sd-list"></ul>' +
+            '</div>'
+        );
+        $p.find('#ejf-sd-collapse').on('click', function () { $('#ejf-sd-panel').toggleClass('collapsed'); });
+        $p.appendTo(document.body);
+    },
+
+    _item: function (r) {
+        var pct = Math.round(Math.min(1, r.score / 12) * 100); // rough 0-100 display of an unbounded BM25 score
+        var meta = r.status || '';
+        if (r.resolution) { meta += (meta ? ' · ' : '') + r.resolution; }
+        var $li = $('<li></li>');
+        $('<a></a>').attr('href', '/browse/' + r.key).attr('target', '_self').text(r.key).appendTo($li);
+        $('<span class="ejf-sd-proj"></span>').text(r.project || '').appendTo($li);
+        $('<span class="ejf-sd-score"></span>').text(pct + '%').appendTo($li);
+        $('<div class="ejf-sd-sum"></div>').text(r.summary || '').appendTo($li);
+        if (meta) { $('<div class="ejf-sd-meta"></div>').text(meta).appendTo($li); }
+        return $li;
+    },
+
+    // Read the open issue's text from the DOM (reusing the Translate selectors); fall back to a REST GET.
+    getIssueText: function (key) {
+        var title = $("h1[data-testid='issue.views.issue-base.foundation.summary.heading']").text() || '';
+        var $rt = $("div[data-component-selector='jira-issue-view-rich-text-inline-edit-view-container']");
+        var part0 = $rt.children().eq(0).text() || '';
+        var part1 = $rt.children().eq(1).text() || '';
+        var domText = (title + '\n' + part0 + '\n' + part1).replace(/\s+/g, ' ').trim();
+        if (domText.length > (title.length + 2)) { return Promise.resolve(domText); }
+        // DOM not ready / empty body - fall back to the REST API.
+        return new Promise(function (resolve) {
+            $.ajax({ url: EJF_SD.HOST + '/rest/api/2/issue/' + key + '?fields=summary,description', dataType: 'json' })
+                .done(function (d) {
+                    var f = d.fields || {};
+                    resolve(((f.summary || '') + '\n' + EJF_SD.util.toPlainText(f.description)).trim());
+                })
+                .fail(function () { resolve(domText); });
+        });
+    },
+
+    render: function (key) {
+        EJF_SD.ui._ensurePanel();
+        $('#ejf-sd-list').empty();
+        EJF_SD.ui.setStatus('Finding similar defects…');
+        EJF_SD.ui.getIssueText(key).then(function (text) {
+            return EJF_SD.db.countDefects().then(function (n) {
+                if (!n) {
+                    EJF_SD.ui.setStatus('No local data yet – open the Tampermonkey menu and click “Sync defects now”.');
+                    return;
+                }
+                if (!text) { EJF_SD.ui.setStatus('Could not read this issue’s text.'); return; }
+                return EJF_SD.rank.suggest(text, key).then(function (results) {
+                    if (!results.length) { EJF_SD.ui.setStatus('No similar defects found (' + n + ' indexed).'); return; }
+                    EJF_SD.ui.setStatus(results.length + ' suggestions · ' + n + ' defects indexed');
+                    var $list = $('#ejf-sd-list');
+                    for (var i = 0; i < results.length; i++) { $list.append(EJF_SD.ui._item(results[i])); }
+                });
+            });
+        }).catch(function (e) { EJF_SD.ui.setStatus('Error: ' + (e && e.message || e)); });
+    },
+
+    // Show/refresh the panel only on EBR bug reports; re-query when the issue key changes.
+    ensure: function () {
+        if (!savedVariables[5][1]) { return; }
+        var $bc = $('a[data-testid="issue.views.issue-base.foundation.breadcrumbs.current-issue.item"]');
+        if (!$bc.length) { return; }
+        var key = $.trim($bc.first().text());
+        if (!/^EBR-/.test(key)) {
+            // not a bug report - remove any stale panel
+            if ($('#ejf-sd-panel').length) { $('#ejf-sd-panel').remove(); }
+            EJF_SD.ui.currentKey = null;
+            return;
+        }
+        if ($('#ejf-sd-panel').length && EJF_SD.ui.currentKey === key) { return; }
+        EJF_SD.ui.currentKey = key;
+        EJF_SD.ui.render(key);
+    }
+};
+
+
+/* ---- init: watch the DOM and (re)inject the panel across Atlassian's React re-renders / SPA nav ---- */
+(function () {
+    if (!window.indexedDB) { return; }   // feature unavailable in this environment
+    var scheduled = false;
+    var observer = new MutationObserver(function () {
+        if (scheduled) { return; }
+        scheduled = true;
+        setTimeout(function () { scheduled = false; try { EJF_SD.ui.ensure(); } catch (e) { /* swallow */ } }, 300);
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+    // also try once on load in case the breadcrumb is already present
+    setTimeout(function () { try { EJF_SD.ui.ensure(); } catch (e) { /* swallow */ } }, 1500);
+})();
