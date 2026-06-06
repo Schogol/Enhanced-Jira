@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.6.9
+// @version     2.6.10
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira and also parses Log Files submitted from the EVE client
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -323,6 +323,39 @@ function checkIssueType() {
         addButtons();
     }
 };
+
+
+// Re-adds our buttons whenever they go missing. Atlassian renders the issue action bar with React and,
+// once the issue data finishes loading, re-renders it ~2s after the initial paint (confirmed: a single
+// re-render that swaps the whole quick-add toolbar for fresh nodes; it also happens again when navigating
+// between issues in the SPA). That re-render throws away the buttons we injected as siblings of the
+// quick-add trigger, and because waitForKeyElements only fires its callback once per element it never puts
+// them back. So instead we watch the DOM and re-inject whenever they disappear. addButtons() already guards
+// each button with an "if length === 0" check, so calling it repeatedly only fills in what's missing and
+// never duplicates.
+// We observe document.body rather than the toolbar container on purpose: the trigger's parent is an
+// anonymous <div> with no id/class/data-testid, so there is no stable selector to scope a narrower observer
+// to. The guard below early-exits in microseconds, so watching broadly is cheap.
+function ensureButtonsPresent() {
+    if (!savedVariables[4][1]) { return; }                                    // user toggled the buttons off
+    if ($('#translateButton').length) { return; }                            // already present, nothing to do
+    if (!$('a[data-testid="issue.views.issue-base.foundation.breadcrumbs.current-issue.item"]:contains("EBR")').length) { return; } // not a bug report
+    if (!$('button[data-testid="issue-view-foundation.quick-add.quick-add-items-compact.apps-button-dropdown--trigger"]').length) { return; } // action bar not ready yet
+    addButtons();
+}
+
+// Throttle: a single issue-view re-render fires a burst of mutations, so we coalesce them and run the
+// (cheap, early-exiting) check at most once every 200ms rather than on every individual mutation.
+var ejfButtonGuardScheduled = false;
+var ejfButtonObserver = new MutationObserver(function () {
+    if (ejfButtonGuardScheduled) { return; }
+    ejfButtonGuardScheduled = true;
+    setTimeout(function () {
+        ejfButtonGuardScheduled = false;
+        ensureButtonsPresent();
+    }, 200);
+});
+ejfButtonObserver.observe(document.body, { childList: true, subtree: true });
 
 
 // Adds the different buttons to the "command-bar" and defines what they do
