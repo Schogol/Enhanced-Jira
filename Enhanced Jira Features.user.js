@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.6.8
+// @version     2.6.9
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira and also parses Log Files submitted from the EVE client
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -556,6 +556,15 @@ var McSelector = "span[data-testid='code-block']:contains(Time	Method	Duration [
 waitForKeyElements(McSelector, SwapUI);
 
 
+// The logs.txt attached directly to a report (as opposed to the one inside the igbr.zip) is now rendered
+// by CodeMirror, which wraps every line in a <div class="cm-line"> instead of a <span data-testid="code-block">.
+// CodeMirror only keeps the visible lines in the DOM, so we detect the file by its (always-present) header
+// row and let SwapUI pull the full text out of CodeMirror's in-memory state. (processHealth / methodCalls
+// only ever appear inside the igbr.zip, which still uses the <span> layout, so they need no CodeMirror path.)
+var cmSelector = ".cm-line:contains(Time\tFacility\tType\tMessage)";
+waitForKeyElements(cmSelector, SwapUI);
+
+
 // When we detect the oustandingCalls.txt file link inside the igbr.zip then we run the addClickEvent function
 var ocSelector = 'span[data-item-title="true"]:contains(outstandingcalls.txt)';
 waitForKeyElements(ocSelector, addClickEvent);
@@ -589,9 +598,66 @@ function addClickEvent3() {
 }
 
 
+// Reads the complete text of a file rendered by the new CodeMirror-based viewer.
+// CodeMirror only keeps the lines currently in view inside the DOM, but it holds the whole document
+// in its in-memory editor state. The userscript sandbox can't reach CodeMirror's internal DOM property,
+// so we run the read in the page context via an injected <script> and hand the text back through a
+// shared, hidden DOM node (which both contexts can see).
+function getCmDocText() {
+    var NODE_ID = 'EJF_cmdoc_transfer';
+
+    var transfer = document.getElementById(NODE_ID);
+    if (!transfer) {
+        transfer = document.createElement('div');
+        transfer.id = NODE_ID;
+        transfer.style.display = 'none';
+        document.documentElement.appendChild(transfer);
+    }
+    transfer.textContent = '';
+
+    var pageCode =
+        '(function(){var out=document.getElementById(' + JSON.stringify(NODE_ID) + ');try{' +
+        'var c=document.querySelector(".cm-content");' +
+        'var dv=c&&c.cmView;' +
+        'var v=dv&&(dv.view||(dv.rootView&&dv.rootView.view)||dv.editorView);' +
+        'out.textContent=(v&&v.state)?v.state.doc.toString():"";' +
+        '}catch(e){out.textContent="";}})();';
+
+    var s = document.createElement('script');
+    s.textContent = pageCode;
+    (document.head || document.documentElement).appendChild(s);
+    if (s.parentNode) { s.parentNode.removeChild(s); }
+
+    // The injected script runs synchronously the moment it is inserted, so the text is ready now.
+    var text = transfer.textContent || '';
+    transfer.textContent = '';
+    return text;
+}
+
+
 // Swap out the UI when looking at a log file and add the buttons to toggle message types at the top of the page
 function SwapUI() {
-    if ($("span[data-testid='code-block']:contains(Time	Facility	Type	Message)")[0] && savedVariables[1][1]) {
+    // --- New CodeMirror-based viewer (files attached directly to the report) ---
+    // Detect the file type from its (always-rendered) header row, pull the complete text straight out of
+    // CodeMirror's state, drop our parser UI into the editor container, then reuse the existing parsers.
+    // Files inside the igbr.zip still use the old <span> layout and are handled by the original code below.
+    if ($('.cm-content').length && !$("span[data-testid='code-block']").length && savedVariables[1][1]
+        && $(".cm-line:contains(Time\tFacility\tType\tMessage)")[0]) {
+        rows = getCmDocText();
+        $('.cm-editor').html(html);
+        // The parser's scrollable #table is position:absolute (top:85px; bottom:0), so it sizes itself
+        // against the nearest positioned ancestor. In the old <span> viewer that ancestor filled the screen;
+        // CodeMirror's .cm-editor is position:relative but only a sliver tall, which collapses #table and
+        // clips every row. Pin #table to the viewport instead (the media viewer is full-screen) so all rows
+        // are visible and scrollable.
+        $('#table').css({ position: 'fixed', top: '85px', bottom: '0', left: '0', width: '100%' });
+        setTimeout(ParseLogs, 250);
+        // NB: no early return here. The <span> checks below are no-ops on this layout (no code-block span),
+        // but we must fall through to the "$('#gpanel a').click(...)" handler at the end of SwapUI so the
+        // Toggle Notice / Warnings / Errors / Exceptions filter buttons get wired up.
+    }
+
+    else if ($("span[data-testid='code-block']:contains(Time	Facility	Type	Message)")[0] && savedVariables[1][1]) {
         $('code > span:empty').remove();
         $('span[data-testid="code-block"]').find('span > span.comment').remove();
         rows = $("span[data-testid='code-block']").text();
