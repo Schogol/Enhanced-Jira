@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.9.1
+// @version     2.9.3
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, and suggests similar existing defects on bug reports
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -2381,6 +2381,7 @@ EJF_SD.logsig = {
 #ejf-logmatch-collapse { cursor: pointer; padding: 0 4px; font-weight: 700; }\
 #ejf-logmatch-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; }\
 #ejf-logmatch-panel.collapsed #ejf-logmatch-list { display: none; }\
+#ejf-logmatch-panel.ejf-logmatch-up { flex-direction: column-reverse; }\
 .ejf-logmatch-item { padding: 7px 10px; border-bottom: 1px solid #2c333a; cursor: pointer; }\
 .ejf-logmatch-item:hover { background: #22272b; }\
 .ejf-logmatch-item a { color: #4c9aff; font-weight: 700; text-decoration: none; }\
@@ -2489,6 +2490,7 @@ EJF_SD.logsig = {
             var isCollapsed = panel.classList.toggle('collapsed');
             collapse.textContent = isCollapsed ? '+' : '–';
             try { if (typeof GM_setValue === 'function') { GM_setValue(EJF_SD.logsig.COLLAPSE_KEY, isCollapsed); } } catch (e) { /* ignore */ }
+            EJF_SD.logsig._fitVertical(panel);   // on expand, grow upward if there's no room below
         });
 
         EJF_SD.logsig._applyPos(panel);
@@ -2530,20 +2532,57 @@ EJF_SD.logsig = {
         panel.style.top = top + 'px';
         panel.style.right = 'auto';
         panel.style.bottom = 'auto';
+        panel._ejfTop = top;              // remember the intended top so _fitVertical can re-anchor on expand
+        EJF_SD.logsig._fitVertical(panel);
+    },
+
+    // Keep the (expanded) panel on-screen vertically (same "drop-up" approach as the Similar Defects panel):
+    // when positioned by a dragged/saved top and the expanded panel would run off the bottom, pin it by the
+    // bottom and reverse the column so the title bar stays put and the list grows UPWARD above it. Only acts
+    // when we manage the position via top (dragged / restored), not in the default placement.
+    _fitVertical: function (panel) {
+        if (!panel) { return; }
+        if (typeof panel._ejfTop !== 'number') { return; }
+        if (panel.classList.contains('collapsed')) {
+            panel.classList.remove('ejf-logmatch-up');
+            panel.style.maxHeight = '';
+            panel.style.bottom = 'auto';
+            panel.style.top = panel._ejfTop + 'px';
+            return;
+        }
+        var margin = 8, vh = window.innerHeight;
+        panel.classList.remove('ejf-logmatch-up');
+        panel.style.maxHeight = '';
+        panel.style.bottom = 'auto';
+        panel.style.top = panel._ejfTop + 'px';
+        var headEl = document.getElementById('ejf-logmatch-head');
+        var headerH = headEl ? headEl.offsetHeight : 34;
+        var fullH = panel.offsetHeight;
+        if (panel._ejfTop + fullH <= vh - margin) { return; }   // fits growing down -> keep normal layout
+        var headerBottom = panel._ejfTop + headerH;
+        panel.style.top = 'auto';
+        panel.style.bottom = (vh - headerBottom) + 'px';
+        panel.style.maxHeight = Math.max(80, Math.min(Math.round(vh * 0.70), headerBottom - margin)) + 'px';
+        panel.classList.add('ejf-logmatch-up');
     },
 
     // Drag by the header; persist the dropped position. The collapse control is excluded so it still toggles.
     _makeDraggable: function (panel, head, collapse) {
         var dragging = false, startX = 0, startY = 0, baseLeft = 0, baseTop = 0;
+        // We drag by the HEADER's intended top (panel._ejfTop) and let _fitVertical decide, on every move,
+        // whether the list grows down (room below) or flips to "drop-up" (no room) - so the flip happens
+        // live while dragging, not only on release. We clamp the header top by the header height (not the
+        // full panel height) so the header can be moved right down to the bottom edge to trigger drop-up.
         function onMove(e) {
             if (!dragging) { return; }
-            var w = panel.offsetWidth, h = panel.offsetHeight;
+            var w = panel.offsetWidth;
+            var headerH = head ? head.offsetHeight : 34;
             var left = Math.min(Math.max(0, baseLeft + (e.clientX - startX)), Math.max(0, window.innerWidth - w));
-            var top = Math.min(Math.max(0, baseTop + (e.clientY - startY)), Math.max(0, window.innerHeight - h));
+            var top = Math.min(Math.max(0, baseTop + (e.clientY - startY)), Math.max(0, window.innerHeight - headerH));
             panel.style.left = left + 'px';
-            panel.style.top = top + 'px';
             panel.style.right = 'auto';
-            panel.style.bottom = 'auto';
+            panel._ejfTop = top;                 // _fitVertical sets top/bottom from this (anchor or drop-up)
+            EJF_SD.logsig._fitVertical(panel);
             e.preventDefault();
         }
         function onUp() {
@@ -2553,13 +2592,18 @@ EJF_SD.logsig = {
             document.removeEventListener('mousemove', onMove, true);
             document.removeEventListener('mouseup', onUp, true);
             var rect = panel.getBoundingClientRect();
-            try { if (typeof GM_setValue === 'function') { GM_setValue(EJF_SD.logsig.POS_KEY, { left: Math.round(rect.left), top: Math.round(rect.top) }); } } catch (e) { /* ignore */ }
+            var top = (typeof panel._ejfTop === 'number') ? panel._ejfTop : Math.round(rect.top);
+            try { if (typeof GM_setValue === 'function') { GM_setValue(EJF_SD.logsig.POS_KEY, { left: Math.round(rect.left), top: top }); } } catch (e) { /* ignore */ }
+            EJF_SD.logsig._fitVertical(panel);
         }
         head.addEventListener('mousedown', function (e) {
             if (e.which && e.which !== 1) { return; }            // left button only
             if (collapse && e.target === collapse) { return; }   // let the collapse toggle work
-            var rect = panel.getBoundingClientRect();
-            baseLeft = rect.left; baseTop = rect.top;
+            // Drag relative to the HEADER's current top (works whether we're top-anchored or in drop-up),
+            // so the header tracks the cursor and _fitVertical re-evaluates up/down on every move.
+            var hTop = head.getBoundingClientRect().top;
+            baseLeft = panel.getBoundingClientRect().left; baseTop = hTop;
+            panel._ejfTop = hTop;
             startX = e.clientX; startY = e.clientY;
             dragging = true;
             panel.classList.add('ejf-logmatch-dragging');
@@ -3656,6 +3700,7 @@ EJF_SD.ui = {
 #ejf-sd-loglink a:hover { text-decoration: underline; }\
 #ejf-sd-loglink .count { color: #cfd6dd; background: #3a434d; border-radius: 8px; padding: 0 7px; font-size: 10px; font-weight: 700; margin-left: 6px; }\
 #ejf-sd-panel.collapsed #ejf-sd-status, #ejf-sd-panel.collapsed #ejf-sd-loglink, #ejf-sd-panel.collapsed #ejf-sd-list { display: none; }\
+#ejf-sd-panel.ejf-sd-up { flex-direction: column-reverse; }\
 #ejf-sd-toast { position: fixed; right: 18px; bottom: 18px; z-index: 9001; background: #333; color: #eee; padding: 8px 14px;\
   border-radius: 6px; box-shadow: 0 4px 18px rgba(0,0,0,.45); font-family: -apple-system,Arial,sans-serif; font-size: 12px; max-width: 320px; }\
 #ejf-sd-tip { position: fixed; z-index: 9002; display: none; width: 420px; max-height: 60vh; overflow-y: auto;\
@@ -3833,6 +3878,44 @@ EJF_SD.ui = {
         var left = Math.min(Math.max(0, pos.left), maxLeft);
         var top = Math.min(Math.max(0, pos.top), maxTop);
         $p.css({ left: left + 'px', top: top + 'px', right: 'auto', bottom: 'auto' });
+        el._ejfTop = top;                 // remember the intended top so _fitVertical can re-anchor on expand
+        EJF_SD.ui._fitVertical();
+    },
+
+    // Keep the (expanded) panel on-screen vertically. When the panel is positioned by a dragged/saved top
+    // and the expanded panel would run off the BOTTOM of the viewport, flip to "drop-up": pin it by the
+    // bottom and reverse the column so the title bar stays put and the list grows UPWARD above it (height
+    // capped to the room above so its top never leaves the screen). Only acts when we manage the position
+    // via top (user dragged it, or a saved position was restored); the default bottom-anchored placement
+    // already grows upward correctly and is left untouched.
+    _fitVertical: function () {
+        var $p = $('#ejf-sd-panel');
+        if (!$p.length) { return; }
+        var el = $p[0];
+        if (typeof el._ejfTop !== 'number') { return; }
+        if ($p.hasClass('collapsed')) {                 // collapsed: just keep the title at the intended top
+            $p.removeClass('ejf-sd-up');
+            el.style.maxHeight = '';
+            el.style.bottom = 'auto';
+            el.style.top = el._ejfTop + 'px';
+            return;
+        }
+        var margin = 8, vh = window.innerHeight;
+        // Reset to a plain top-anchored layout to measure the full expanded height at the intended top.
+        $p.removeClass('ejf-sd-up');
+        el.style.maxHeight = '';
+        el.style.bottom = 'auto';
+        el.style.top = el._ejfTop + 'px';
+        var headEl = $p.find('#ejf-sd-head')[0];
+        var headerH = headEl ? headEl.offsetHeight : 36;
+        var fullH = el.offsetHeight;
+        if (el._ejfTop + fullH <= vh - margin) { return; }   // fits growing down -> keep the normal layout
+        // Would overflow the bottom -> drop up: pin the panel bottom at the header's bottom edge.
+        var headerBottom = el._ejfTop + headerH;
+        el.style.top = 'auto';
+        el.style.bottom = (vh - headerBottom) + 'px';
+        el.style.maxHeight = Math.max(80, Math.min(Math.round(vh * 0.52), headerBottom - margin)) + 'px';
+        $p.addClass('ejf-sd-up');
     },
 
     // Make the panel draggable by its header. Persists the final position to GM storage on drop so it is
@@ -3842,15 +3925,21 @@ EJF_SD.ui = {
         var $head = $p.find('#ejf-sd-head');
         var dragging = false, startX = 0, startY = 0, baseLeft = 0, baseTop = 0;
 
+        // We drag by the HEADER's intended top (el._ejfTop) and let _fitVertical decide, on every move,
+        // whether the list grows down (room below) or flips to "drop-up" (no room) - so the flip happens
+        // live while dragging, not only on release. The header top is clamped by the header height (not the
+        // full panel height) so the header can be moved right down to the bottom edge to trigger drop-up.
         function onMove(e) {
             if (!dragging) { return; }
-            var w = el.offsetWidth, h = el.offsetHeight;
+            var w = el.offsetWidth;
+            var headEl = $head[0];
+            var headerH = headEl ? headEl.offsetHeight : 36;
             var left = Math.min(Math.max(0, baseLeft + (e.clientX - startX)), Math.max(0, window.innerWidth - w));
-            var top = Math.min(Math.max(0, baseTop + (e.clientY - startY)), Math.max(0, window.innerHeight - h));
+            var top = Math.min(Math.max(0, baseTop + (e.clientY - startY)), Math.max(0, window.innerHeight - headerH));
             el.style.left = left + 'px';
-            el.style.top = top + 'px';
             el.style.right = 'auto';
-            el.style.bottom = 'auto';
+            el._ejfTop = top;                 // _fitVertical sets top/bottom from this (anchor or drop-up)
+            EJF_SD.ui._fitVertical();
             e.preventDefault();
         }
         function onUp() {
@@ -3860,13 +3949,18 @@ EJF_SD.ui = {
             document.removeEventListener('mousemove', onMove, true);
             document.removeEventListener('mouseup', onUp, true);
             var rect = el.getBoundingClientRect();
-            try { if (typeof GM_setValue === 'function') { GM_setValue(EJF_SD.ui.POS_KEY, { left: Math.round(rect.left), top: Math.round(rect.top) }); } } catch (e) { /* ignore */ }
+            var top = (typeof el._ejfTop === 'number') ? el._ejfTop : Math.round(rect.top);
+            try { if (typeof GM_setValue === 'function') { GM_setValue(EJF_SD.ui.POS_KEY, { left: Math.round(rect.left), top: top }); } } catch (e) { /* ignore */ }
+            EJF_SD.ui._fitVertical();
         }
         $head.on('mousedown', function (e) {
             if (e.which && e.which !== 1) { return; }                 // left button only
             if ($(e.target).closest('#ejf-sd-collapse').length) { return; }  // let the collapse toggle work
-            var rect = el.getBoundingClientRect();
-            baseLeft = rect.left; baseTop = rect.top;
+            // Drag relative to the HEADER's current top (works whether we're top-anchored or in drop-up),
+            // so the header tracks the cursor and _fitVertical re-evaluates up/down on every move.
+            var hTop = $head[0].getBoundingClientRect().top;
+            baseLeft = el.getBoundingClientRect().left; baseTop = hTop;
+            el._ejfTop = hTop;
             startX = e.clientX; startY = e.clientY;
             dragging = true;
             $p.addClass('ejf-sd-dragging');
@@ -3897,6 +3991,7 @@ EJF_SD.ui = {
             var isCollapsed = $('#ejf-sd-panel').toggleClass('collapsed').hasClass('collapsed');
             $(this).text(isCollapsed ? '+' : '–');   // reflect state in the control
             try { if (typeof GM_setValue === 'function') { GM_setValue(EJF_SD.ui.COLLAPSE_KEY, isCollapsed); } } catch (e) { /* ignore */ }
+            EJF_SD.ui._fitVertical();   // on expand, grow upward if there's no room below; on collapse, reset
         });
         $p.appendTo(document.body);
         EJF_SD.ui._applyPos($p);          // restore the user's saved position (if any)
@@ -4134,6 +4229,7 @@ EJF_SD.ui = {
                     })).then(function () {
                         var $list = $('#ejf-sd-list');
                         for (var i = 0; i < results.length; i++) { $list.append(EJF_SD.ui._item(results[i])); }
+                        EJF_SD.ui._fitVertical();   // list height changed - re-check it still fits / drops up
                     });
                 });
                 });
