@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.8.1
+// @version     2.8.3
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, and suggests similar existing defects on bug reports
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -2911,7 +2911,8 @@ EJF_SD.ui = {
 #ejf-sd-panel { position: fixed; right: 18px; bottom: 18px; width: 340px; max-height: 52vh; z-index: 9000;\
   background: #1D2125; color: #e6e6e6; border: 1px solid #3a434d; border-radius: 6px; box-shadow: 0 4px 18px rgba(0,0,0,.45);\
   font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif; font-size: 12px; display: flex; flex-direction: column; overflow: hidden; }\
-#ejf-sd-head { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: #282d33; cursor: default; }\
+#ejf-sd-head { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: #282d33; cursor: move; user-select: none; }\
+#ejf-sd-panel.ejf-sd-dragging { opacity: .92; }\
 #ejf-sd-title { font-weight: 700; flex: 1; }\
 #ejf-sd-mode { font-size: 10px; background: #3a434d; padding: 1px 6px; border-radius: 8px; }\
 #ejf-sd-collapse { cursor: pointer; padding: 0 4px; font-weight: 700; }\
@@ -2944,6 +2945,66 @@ EJF_SD.ui = {
 
     setStatus: function (msg) { $('#ejf-sd-status').text(msg); },
 
+    POS_KEY: 'sdPanelPos',         // GM flag holding the user's chosen panel position { left, top }
+    COLLAPSE_KEY: 'sdPanelCollapsed',  // GM flag holding whether the panel is minimized (collapsed)
+
+    // Apply a saved {left, top} to the panel, clamped so it always stays on-screen (the window may be
+    // smaller than when the position was saved). Switching to left/top overrides the default right/bottom
+    // anchoring from the CSS. A null/invalid saved value leaves the default bottom-right placement alone.
+    _applyPos: function ($p) {
+        var pos = null;
+        try { if (typeof GM_getValue === 'function') { pos = GM_getValue(EJF_SD.ui.POS_KEY, null); } } catch (e) { pos = null; }
+        if (!pos || typeof pos.left !== 'number' || typeof pos.top !== 'number') { return; }
+        var el = $p[0];
+        var w = el.offsetWidth || 340, h = el.offsetHeight || 60;
+        var maxLeft = Math.max(0, window.innerWidth - w);
+        var maxTop = Math.max(0, window.innerHeight - h);
+        var left = Math.min(Math.max(0, pos.left), maxLeft);
+        var top = Math.min(Math.max(0, pos.top), maxTop);
+        $p.css({ left: left + 'px', top: top + 'px', right: 'auto', bottom: 'auto' });
+    },
+
+    // Make the panel draggable by its header. Persists the final position to GM storage on drop so it is
+    // restored on the next page load. The collapse "–" control is excluded so clicking it still toggles.
+    _makeDraggable: function ($p) {
+        var el = $p[0];
+        var $head = $p.find('#ejf-sd-head');
+        var dragging = false, startX = 0, startY = 0, baseLeft = 0, baseTop = 0;
+
+        function onMove(e) {
+            if (!dragging) { return; }
+            var w = el.offsetWidth, h = el.offsetHeight;
+            var left = Math.min(Math.max(0, baseLeft + (e.clientX - startX)), Math.max(0, window.innerWidth - w));
+            var top = Math.min(Math.max(0, baseTop + (e.clientY - startY)), Math.max(0, window.innerHeight - h));
+            el.style.left = left + 'px';
+            el.style.top = top + 'px';
+            el.style.right = 'auto';
+            el.style.bottom = 'auto';
+            e.preventDefault();
+        }
+        function onUp() {
+            if (!dragging) { return; }
+            dragging = false;
+            $p.removeClass('ejf-sd-dragging');
+            document.removeEventListener('mousemove', onMove, true);
+            document.removeEventListener('mouseup', onUp, true);
+            var rect = el.getBoundingClientRect();
+            try { if (typeof GM_setValue === 'function') { GM_setValue(EJF_SD.ui.POS_KEY, { left: Math.round(rect.left), top: Math.round(rect.top) }); } } catch (e) { /* ignore */ }
+        }
+        $head.on('mousedown', function (e) {
+            if (e.which && e.which !== 1) { return; }                 // left button only
+            if ($(e.target).closest('#ejf-sd-collapse').length) { return; }  // let the collapse toggle work
+            var rect = el.getBoundingClientRect();
+            baseLeft = rect.left; baseTop = rect.top;
+            startX = e.clientX; startY = e.clientY;
+            dragging = true;
+            $p.addClass('ejf-sd-dragging');
+            document.addEventListener('mousemove', onMove, true);
+            document.addEventListener('mouseup', onUp, true);
+            e.preventDefault();
+        });
+    },
+
     _ensurePanel: function () {
         EJF_SD.ui.injectCss();
         if ($('#ejf-sd-panel').length) { return; }
@@ -2955,8 +3016,19 @@ EJF_SD.ui = {
             '  <ul id="ejf-sd-list"></ul>' +
             '</div>'
         );
-        $p.find('#ejf-sd-collapse').on('click', function () { $('#ejf-sd-panel').toggleClass('collapsed'); });
+        // Restore the saved minimized state before showing the panel.
+        var collapsed = false;
+        try { if (typeof GM_getValue === 'function') { collapsed = !!GM_getValue(EJF_SD.ui.COLLAPSE_KEY, false); } } catch (e) { collapsed = false; }
+        if (collapsed) { $p.addClass('collapsed'); }
+        $p.find('#ejf-sd-collapse').text(collapsed ? '+' : '–');
+        $p.find('#ejf-sd-collapse').on('click', function () {
+            var isCollapsed = $('#ejf-sd-panel').toggleClass('collapsed').hasClass('collapsed');
+            $(this).text(isCollapsed ? '+' : '–');   // reflect state in the control
+            try { if (typeof GM_setValue === 'function') { GM_setValue(EJF_SD.ui.COLLAPSE_KEY, isCollapsed); } } catch (e) { /* ignore */ }
+        });
         $p.appendTo(document.body);
+        EJF_SD.ui._applyPos($p);          // restore the user's saved position (if any)
+        EJF_SD.ui._makeDraggable($p);     // wire up header dragging
     },
 
     _item: function (r) {
