@@ -101,7 +101,10 @@ GM_addValueChangeListener("dropdowns", function(key, oldValue, newValue, remote)
 for (let i = 0; i < savedVariables.length; i++) {
     savedVariables[i][1] = GM_getValue (savedVariables[i][0], "");
     if (savedVariables[i][1] === "") {
-        GM_setValue (savedVariables[i][0], true);
+        // Similar Defects (index 5) is a BETA feature - default it OFF so it stays opt-in: a fresh install
+        // won't silently start downloading the embedding model + building the local defect DB. Everything
+        // else defaults ON. (Existing users keep whatever they already set; this only affects unset values.)
+        GM_setValue (savedVariables[i][0], (i === 5) ? false : true);
         savedVariables[i][1] = GM_getValue (savedVariables[i][0], "");
     }
 }
@@ -174,10 +177,10 @@ else {
 
 // Add menu command that will allow to toggle On/Off the "Similar Defects" suggestions on bug reports.
 if (savedVariables[5][1]) {
-    menu_similarDefects = GM_registerMenuCommand ("Disable Similar Defects", toggleSimilarDefects);
+    menu_similarDefects = GM_registerMenuCommand ("Disable Similar Defects (Beta)", toggleSimilarDefects);
 }
 else {
-    menu_similarDefects = GM_registerMenuCommand ("Enable Similar Defects", toggleSimilarDefects);
+    menu_similarDefects = GM_registerMenuCommand ("Enable Similar Defects (Beta)", toggleSimilarDefects);
 }
 
 // Action commands for the Similar Defects local database. Shown only while the feature is enabled, and
@@ -286,10 +289,10 @@ function refreshMenu() {
     }
 
     if (savedVariables[5][1]) {
-        menu_similarDefects = GM_registerMenuCommand ("Disable Similar Defects", toggleSimilarDefects);
+        menu_similarDefects = GM_registerMenuCommand ("Disable Similar Defects (Beta)", toggleSimilarDefects);
     }
     else {
-        menu_similarDefects = GM_registerMenuCommand ("Enable Similar Defects", toggleSimilarDefects);
+        menu_similarDefects = GM_registerMenuCommand ("Enable Similar Defects (Beta)", toggleSimilarDefects);
     }
 
     // Re-add (or remove) the Sync / Rebuild action commands to match the toggle state.
