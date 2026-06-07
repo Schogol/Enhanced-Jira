@@ -2432,6 +2432,33 @@ EJF_SD.sync = {
                 EJF_SD.ui.setStatus('Rebuild error: ' + (e && e.message || e));
                 alert('Rebuild failed: ' + (e && e.message || e));
             });
+    },
+
+    // Quiet background catch-up used by the auto-sync scheduler: incremental only (never the big initial
+    // build - that stays a deliberate manual action, so we skip an empty DB), no start/finish toasts, and it
+    // re-embeds + refreshes the open panel only when it actually fetched changed issues.
+    autoSync: function () {
+        if (EJF_SD.sync.running) { return Promise.resolve(); }
+        EJF_SD.sync.running = true;
+        return EJF_SD.db.countDefects().then(function (n) {
+            if (!n) { EJF_SD.sync.running = false; return; }   // don't auto-trigger the initial full sync
+            return EJF_SD.sync.incrementalSync().then(function (res) {
+                EJF_SD.sync.running = false;
+                var stored = (res && res.stored) || 0;
+                console.log('[EJF-SD] auto-sync done (' + stored + ' fetched)');
+                return EJF_SD.db.setMeta('lastAutoSyncAt', new Date().toISOString()).then(function () {
+                    if (stored > 0) {
+                        EJF_SD.embed.prepare(true);   // embed any new/changed defects
+                        if (EJF_SD.ui.currentKey) { EJF_SD.ui.render(EJF_SD.ui.currentKey); }
+                    }
+                    return res;
+                });
+            });
+        }).catch(function (e) {
+            EJF_SD.sync.running = false;
+            EJF_SD.db.setMeta('lastError', String(e && e.message || e));
+            console.log('[EJF-SD] auto-sync error:', e && e.message || e);
+        });
     }
 };
 
@@ -3027,6 +3054,51 @@ EJF_SD.ui = {
 })();
 
 
+/* ---- background auto-sync scheduler (Phase 3) ---- */
+// Periodically runs a quiet incremental sync so the local DB stays fresh without the user clicking
+// "Sync defects now". A best-effort cross-tab lease (GM storage) keeps multiple open Jira tabs from all
+// syncing at once; the in-tab `running` flag prevents overlap within a tab. The big initial build stays
+// manual - autoSync no-ops on an empty DB.
+EJF_SD.sched = {
+    INTERVAL_MS: 30 * 60 * 1000,   // run a catch-up roughly every 30 minutes
+    STARTUP_DELAY_MS: 20 * 1000,   // wait a bit after load so we don't compete with first paint / initial render
+    LEASE_TTL_MS: 5 * 60 * 1000,   // a lease older than this is treated as abandoned (tab closed mid-sync)
+    LEASE_KEY: 'sdSyncLease',
+    tabId: 'tab-' + Math.floor(Math.random() * 1e9) + '-' + Date.now(),
+    _timer: null,
+
+    // Best-effort single-syncer lease across tabs. Returns true if this tab may sync now. Not perfectly
+    // race-free, but a rare double-run is harmless (bulkPut is idempotent and embeddings are preserved).
+    _acquireLease: function () {
+        if (typeof GM_getValue !== 'function' || typeof GM_setValue !== 'function') { return true; }
+        var l = null;
+        try { l = GM_getValue(EJF_SD.sched.LEASE_KEY, null); } catch (e) { return true; }
+        var now = Date.now();
+        if (!l || !l.ts || (now - l.ts) > EJF_SD.sched.LEASE_TTL_MS || l.tabId === EJF_SD.sched.tabId) {
+            try { GM_setValue(EJF_SD.sched.LEASE_KEY, { tabId: EJF_SD.sched.tabId, ts: now }); } catch (e2) { /* ignore */ }
+            return true;
+        }
+        return false;
+    },
+
+    tick: function () {
+        if (!savedVariables[5][1]) { return; }            // feature disabled
+        if (!EJF_SD.sched._acquireLease()) { return; }    // another tab is the syncer right now
+        EJF_SD.sync.autoSync();
+    },
+
+    start: function () {
+        if (EJF_SD.sched._timer) { return; }
+        setTimeout(function () {
+            try { EJF_SD.sched.tick(); } catch (e) { /* swallow */ }
+            EJF_SD.sched._timer = setInterval(function () {
+                try { EJF_SD.sched.tick(); } catch (e) { /* swallow */ }
+            }, EJF_SD.sched.INTERVAL_MS);
+        }, EJF_SD.sched.STARTUP_DELAY_MS);
+    }
+};
+
+
 /* ---- init: watch the DOM and (re)inject the panel across Atlassian's React re-renders / SPA nav ---- */
 (function () {
     if (!window.indexedDB) { return; }   // feature unavailable in this environment
@@ -3039,4 +3111,6 @@ EJF_SD.ui = {
     observer.observe(document.body, { childList: true, subtree: true });
     // also try once on load in case the breadcrumb is already present
     setTimeout(function () { try { EJF_SD.ui.ensure(); } catch (e) { /* swallow */ } }, 1500);
+    // start the periodic background catch-up sync
+    EJF_SD.sched.start();
 })();
