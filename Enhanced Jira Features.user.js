@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.9.0
+// @version     2.9.1
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, and suggests similar existing defects on bug reports
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -21,6 +21,7 @@
 // @connect     cdn.jsdelivr.net
 // @connect     atlassian.net
 // @connect     atlassian.com
+// @connect     translate.googleapis.com
 // ==/UserScript==
 /* global $ */
 
@@ -112,16 +113,6 @@ for (let i = 0; i < savedVariables.length; i++) {
 }
 
 
-// Check if the Translation API key is set. If it isn't then prompt for the user to input the key.
-if (!savedVariables[0][1]) {
-    savedVariables[0][1] = prompt (
-        'Translation API key not set. Please enter the key:',
-        ''
-    );
-    GM_setValue (savedVariables[0][0], savedVariables[0][1]);
-}
-
-
 // Activate a custom scrollbar if the scrollbar value is set to true
 if (savedVariables[2][1]) {
     GM_addStyle(
@@ -131,10 +122,6 @@ if (savedVariables[2][1]) {
 .notion-scroller.vertical { margin-bottom: 0px !important;}`
     );
 };
-
-
-// Add menu command that allows the Translation API key to be changed.
-GM_registerMenuCommand ("Change Translation API Key", promptAndChangeStoredValue);
 
 
 // Add menu command that will allow to toggle On/Off the Log Parser.
@@ -201,16 +188,6 @@ else {
     menu_darkmode = GM_registerMenuCommand ("Enable Dark Mode", toggleDarkmode);
 };
 
-
-
-// Function which prompts the user to input a value for the Translation API Key and saves it locally
-function promptAndChangeStoredValue () {
-    savedVariables[0][1] = prompt (
-        'Change Translation API Key:',
-        ''
-    );
-    GM_setValue (savedVariables[0][0], savedVariables[0][1]);
-};
 
 
 // (Re)register the Similar Defects action commands ("Sync defects now" / "Rebuild defect database").
@@ -450,6 +427,39 @@ var ejfButtonObserver = new MutationObserver(function () {
 ejfButtonObserver.observe(document.body, { childList: true, subtree: true });
 
 
+// Free translation via Google's keyless "gtx" endpoint (translate_a/single). No API key, no cost - this
+// replaces the old paid Cloud Translation v2 API that kept hitting the free-tier quota. We POST (rather
+// than GET) so a long EVE description can't blow the URL length limit, and go through GM_xmlhttpRequest so
+// CORS is a non-issue (no session cookie needed). Source language is auto-detected (sl=auto -> tl=en).
+// Resolves to: the translated string, '' for empty input, or null on failure (HTTP error / throttle / parse).
+function ejfTranslateFree(text) {
+    return new Promise(function (resolve) {
+        var t = (text || '').trim();
+        if (!t) { resolve(''); return; }
+        GM_xmlhttpRequest({
+            method: 'POST',
+            url: 'https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+            data: 'q=' + encodeURIComponent(t),
+            onload: function (resp) {
+                try {
+                    if (resp.status < 200 || resp.status >= 300) { resolve(null); return; }
+                    // Response is a nested array: arr[0] is a list of sentence chunks, each chunk[0] is the
+                    // translated text; join them. (arr[2] is the detected source language, unused.)
+                    var arr = JSON.parse(resp.responseText);
+                    var out = (arr && arr[0])
+                        ? arr[0].map(function (c) { return (c && c[0]) ? c[0] : ''; }).join('')
+                        : '';
+                    resolve(out);
+                } catch (e) { resolve(null); }
+            },
+            onerror: function () { resolve(null); },
+            ontimeout: function () { resolve(null); }
+        });
+    });
+}
+
+
 // Adds the different buttons to the "command-bar" and defines what they do
 function addButtons() {
     // Variable which contains the current Issue ID which we need
@@ -477,31 +487,51 @@ if ($('#translateButton').length === 0) {
     $('button[data-testid="issue-view-foundation.quick-add.quick-add-items-compact.apps-button-dropdown--trigger"]').after(translateButton);
     }
 
-    // When the translate button is clicked we send the Issue title, description and reproduction steps to the Google translate API and change the original content to what we receive back from the API
+    // When the translate button is clicked we translate the Issue title + description blocks to English via
+    // Google's FREE keyless gtx endpoint (ejfTranslateFree). One request per text, run in parallel, then we
+    // replace the original Title / Description / Repro-Steps with the translation - same DOM mapping as before.
     $("#translateButton").click(function () {
-        $.ajax({
-            url: 'https://translation.googleapis.com/language/translate/v2?key=' + savedVariables[0][1],
-            type: 'POST',
-            contentType: 'application/json',
-            charset: 'utf-8',
-
-            // The regex might be a bit janky but it removes some unneccessary spaces in the text which we send to the API.
-            // By changing the "target:" attribute we could chose a different language than english if needed
-            data: '{"q":"'+ $("h1[data-testid='issue.views.issue-base.foundation.summary.heading']").text().replace(/"/g,'').replace(/ {2,}/g,' ')+'", "q":"'+ $("div[data-component-selector='jira-issue-view-rich-text-inline-edit-view-container']").children().eq(0).text().replace(/"/g,'').replace(/ {2,}/g,' ')+'", "q":"'+ $("div[data-component-selector='jira-issue-view-rich-text-inline-edit-view-container']").children().eq(1).text().replace(/"/g,'').replace(/ {2,}/g,' ')+'", "target":"en", "format":"text"}',
-
-            // When we receive a translation back from the API we replace the original Title, Description and Repro-Steps with the translation we get from Google.
-            success: function (data) {
-                $("h1[data-testid='issue.views.issue-base.foundation.summary.heading']").text(data.data.translations[0].translatedText);
-                $("div[data-component-selector='jira-issue-view-rich-text-inline-edit-view-container']").children().eq(1).replaceWith(data.data.translations[2].translatedText.replace(/\n\n/g, '<br><br>'));
-                $("div[data-component-selector='jira-issue-view-rich-text-inline-edit-view-container']").children().eq(0).replaceWith(data.data.translations[1].translatedText.replace(/\n/g, '<br><br>'));
-            },
-
-            // If we get an Error from the Google API then we annoy the user by telling them that it failed and to check their Dev Console for errors
-            error: function(data){
-                console.log(JSON.stringify(data));
-                alert("Cannot get translation. Check Console for errors and report issues to Schogol :). \r\nMake sure you have entered the correct key.");
+        var $title = $("h1[data-testid='issue.views.issue-base.foundation.summary.heading']");
+        var $desc = $("div[data-component-selector='jira-issue-view-rich-text-inline-edit-view-container']");
+        // Read with innerText (NOT jQuery .text()/textContent): innerText reflects the RENDERED text and
+        // inserts "\n" at <br> and paragraph/block boundaries, so the line structure survives into the
+        // translation. textContent would jam every paragraph together and the linebreaks would be lost
+        // before Google ever sees them. (gtx itself preserves the \n it's given.) Falls back to .text().
+        function readText($el) {
+            var el = $el[0];
+            return (el && typeof el.innerText === 'string' && el.innerText.length) ? el.innerText : $el.text();
+        }
+        // Write the translation INTO the existing <p> of a description block, keeping every wrapper. Jira
+        // renders each block as <div style="--ak-renderer-editor-font-normal-text: ..."> > .ak-renderer-document
+        // > <p>, and the body font is applied to that inner <p> via the CSS variable. So we keep the <p>
+        // (and its .ak-renderer-document parent) intact and only set its text. We use .text() with the raw
+        // newlines (no <br>): that same <p> already rendered the original multi-line text with its breaks
+        // visible, so its white-space CSS preserves our "\n" too - and .text() auto-escapes any < / & in the
+        // translation. Extra sibling paragraphs are removed since the whole block is merged into the first <p>.
+        function setBlockText($block, txt) {
+            if (!$block || !$block.length) { return; }
+            var $p = $block.find('p').first();
+            if ($p.length) {
+                $p.nextAll().remove();   // drop any following paragraphs - everything now lives in the first <p>
+                $p.text(txt);
+            } else {
+                $block.text(txt);        // no <p> found (unusual structure) - fall back to the block's text
             }
-        })
+        }
+        var titleText = readText($title);
+        var d0 = readText($desc.children().eq(0));
+        var d1 = readText($desc.children().eq(1));
+        Promise.all([ejfTranslateFree(titleText), ejfTranslateFree(d0), ejfTranslateFree(d1)])
+            .then(function (tr) {
+                // null == request failed (HTTP error / throttle / parse); all-null means nothing came back.
+                if (tr[0] === null && tr[1] === null && tr[2] === null) {
+                    alert("Cannot get translation - Google may be rate-limiting. Wait a moment and try again.\r\nReport issues to Schogol :).");
+                    return;
+                }
+                if (tr[0]) { $title.text(tr[0]); }
+                if (tr[1]) { setBlockText($desc.children().eq(0), tr[1]); }
+                if (tr[2]) { setBlockText($desc.children().eq(1), tr[2]); }
+            });
     });
 
 
@@ -2889,6 +2919,7 @@ EJF_SD.sync = {
                 EJF_SD.sync.running = false;
                 EJF_SD.ui.toast('Defect sync complete – ' + total + ' defects in local DB.');
                 EJF_SD.ui.setStatus(total + ' defects in database');
+                EJF_SD.sched.markSynced();   // a manual sync also resets the auto-sync 30-min clock
                 if (EJF_SD.ui.currentKey) { EJF_SD.ui.render(EJF_SD.ui.currentKey); }
                 EJF_SD.embed.prepare(true);   // embed new/changed defects in the background (no-op if model unavailable)
                 return res;
@@ -2915,6 +2946,7 @@ EJF_SD.sync = {
                 return EJF_SD.db.countDefects().then(function (total) {
                     EJF_SD.sync.running = false;
                     EJF_SD.ui.toast('Rebuild complete – ' + total + ' defects.');
+                    EJF_SD.sched.markSynced();   // a rebuild also resets the auto-sync 30-min clock
                     if (EJF_SD.ui.currentKey) { EJF_SD.ui.render(EJF_SD.ui.currentKey); }
                     EJF_SD.embed.prepare(true);   // re-embed everything in the background
                 });
@@ -2939,6 +2971,7 @@ EJF_SD.sync = {
                 var stored = (res && res.stored) || 0;
                 console.log('[EJF-SD] auto-sync done (' + stored + ' fetched)');
                 return EJF_SD.db.setMeta('lastAutoSyncAt', new Date().toISOString()).then(function () {
+                    EJF_SD.sched.markSynced();   // start the 30-min clock so reloads don't re-fetch
                     if (stored > 0) {
                         EJF_SD.embed.prepare(true);   // embed any new/changed defects
                         if (EJF_SD.ui.currentKey) { EJF_SD.ui.render(EJF_SD.ui.currentKey); }
@@ -4152,8 +4185,25 @@ EJF_SD.sched = {
     STARTUP_DELAY_MS: 20 * 1000,   // wait a bit after load so we don't compete with first paint / initial render
     LEASE_TTL_MS: 5 * 60 * 1000,   // a lease older than this is treated as abandoned (tab closed mid-sync)
     LEASE_KEY: 'sdSyncLease',
+    LAST_SYNC_KEY: 'sdLastSyncTs',  // epoch ms of the last completed sync (any kind), persisted + shared across tabs
     tabId: 'tab-' + Math.floor(Math.random() * 1e9) + '-' + Date.now(),
     _timer: null,
+
+    // True when a sync (auto / manual / rebuild) completed less than INTERVAL_MS ago. Used to gate the
+    // startup tick so a page RELOAD shortly after a recent sync does not re-fetch (and re-render the Similar
+    // Defects list) all over again - the user only wants a catch-up roughly every 30 minutes.
+    recentlySynced: function () {
+        if (typeof GM_getValue !== 'function') { return false; }
+        var last = 0;
+        try { last = GM_getValue(EJF_SD.sched.LAST_SYNC_KEY, 0) || 0; } catch (e) { last = 0; }
+        return !!last && (Date.now() - last) < EJF_SD.sched.INTERVAL_MS;
+    },
+
+    // Stamp "a sync just completed" so recentlySynced() starts the 30-minute clock. Called from every sync
+    // completion path (autoSync / syncNow / rebuild).
+    markSynced: function () {
+        try { if (typeof GM_setValue === 'function') { GM_setValue(EJF_SD.sched.LAST_SYNC_KEY, Date.now()); } } catch (e) { /* ignore */ }
+    },
 
     // Best-effort single-syncer lease across tabs. Returns true if this tab may sync now. Not perfectly
     // race-free, but a rare double-run is harmless (bulkPut is idempotent and embeddings are preserved).
@@ -4171,6 +4221,7 @@ EJF_SD.sched = {
 
     tick: function () {
         if (!savedVariables[5][1]) { return; }            // feature disabled
+        if (EJF_SD.sched.recentlySynced()) { return; }    // a sync ran < INTERVAL_MS ago (persisted) - don't re-fetch on reload
         if (!EJF_SD.sched._acquireLease()) { return; }    // another tab is the syncer right now
         EJF_SD.sync.autoSync();
     },
