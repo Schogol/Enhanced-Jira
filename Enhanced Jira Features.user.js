@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.8.3
+// @version     2.8.4
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, and suggests similar existing defects on bug reports
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -2948,6 +2948,27 @@ EJF_SD.ui = {
     POS_KEY: 'sdPanelPos',         // GM flag holding the user's chosen panel position { left, top }
     COLLAPSE_KEY: 'sdPanelCollapsed',  // GM flag holding whether the panel is minimized (collapsed)
 
+    // True while an attachment is open in Jira's full-screen media viewer (image / video / PDF / log file).
+    // The viewer renders in a high z-index portal but the panel sat on top of it, so we hide the panel while
+    // a viewer is open and show it again when it closes. We detect it via the media-viewer testids AND via
+    // our own injected log-parser UI (#gpanel), which lives inside that same viewer when a log file is opened.
+    _attachmentViewerOpen: function () {
+        return !!(
+            document.querySelector('[data-testid="media-viewer-popup"]') ||
+            document.querySelector('[data-testid="media-viewer-navigation-allotment"]') ||
+            document.querySelector('[data-testid="media-viewer"]') ||
+            document.getElementById('gpanel')
+        );
+    },
+
+    // Hide the panel while an attachment viewer is open; restore it (back to its CSS display:flex) afterwards.
+    updateVisibility: function () {
+        var $p = $('#ejf-sd-panel');
+        if (!$p.length) { return; }
+        if (EJF_SD.ui._attachmentViewerOpen()) { $p.css('display', 'none'); }
+        else if ($p.css('display') === 'none') { $p.css('display', ''); }
+    },
+
     // Apply a saved {left, top} to the panel, clamped so it always stays on-screen (the window may be
     // smaller than when the position was saved). Switching to left/top overrides the default right/bottom
     // anchoring from the CSS. A null/invalid saved value leaves the default bottom-right placement alone.
@@ -3029,6 +3050,7 @@ EJF_SD.ui = {
         $p.appendTo(document.body);
         EJF_SD.ui._applyPos($p);          // restore the user's saved position (if any)
         EJF_SD.ui._makeDraggable($p);     // wire up header dragging
+        EJF_SD.ui.updateVisibility();     // stay hidden if an attachment viewer is already open
     },
 
     _item: function (r) {
@@ -3173,7 +3195,11 @@ EJF_SD.sched = {
     var observer = new MutationObserver(function () {
         if (scheduled) { return; }
         scheduled = true;
-        setTimeout(function () { scheduled = false; try { EJF_SD.ui.ensure(); } catch (e) { /* swallow */ } }, 300);
+        setTimeout(function () {
+            scheduled = false;
+            try { EJF_SD.ui.ensure(); } catch (e) { /* swallow */ }
+            try { EJF_SD.ui.updateVisibility(); } catch (e2) { /* swallow */ }   // hide while an attachment viewer is open
+        }, 300);
     });
     observer.observe(document.body, { childList: true, subtree: true });
     // also try once on load in case the breadcrumb is already present
