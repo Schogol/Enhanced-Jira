@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.7.0
+// @version     2.8.0
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, and suggests similar existing defects on bug reports
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -25,7 +25,7 @@
 
 
 // Creating various variables which we use later on
-var rows, oc, lc, pdm, pdmdata, driverAge = "unknown", menu_parser, menu_scrollbar, menu_dropdowns, menu_buttons, menu_darkmode, menu_similarDefects, menu_sdSync, menu_sdRebuild;
+var rows, oc, lc, pdm, pdmdata, driverAge = "unknown", menu_parser, menu_scrollbar, menu_dropdowns, menu_buttons, menu_darkmode, menu_similarDefects, menu_sdSync, menu_sdRebuild, menu_sdBackend;
 
 
 // Current Date
@@ -214,10 +214,37 @@ function promptAndChangeStoredValue () {
 function registerSimilarDefectActions() {
     if (menu_sdSync) { GM_unregisterMenuCommand(menu_sdSync); menu_sdSync = null; }
     if (menu_sdRebuild) { GM_unregisterMenuCommand(menu_sdRebuild); menu_sdRebuild = null; }
+    if (menu_sdBackend) { GM_unregisterMenuCommand(menu_sdBackend); menu_sdBackend = null; }
     if (savedVariables[5][1]) {
         menu_sdSync = GM_registerMenuCommand ("Sync defects now", function () { EJF_SD.sync.syncNow(); });
         menu_sdRebuild = GM_registerMenuCommand ("Rebuild defect database", function () { EJF_SD.sync.rebuild(); });
+        // Label reflects what the toggle will switch TO. GPU is the default (sdTryWebgpu defaults to true) and
+        // is "on" unless the user opted out OR the sticky "GPU unstable" lock got set after a device loss.
+        var gpuOn = (typeof GM_getValue !== 'function') || (GM_getValue('sdTryWebgpu', true) && !GM_getValue('sdForceCpu', false));
+        menu_sdBackend = GM_registerMenuCommand(
+            gpuOn ? "Embedding backend: switch to CPU (stable)" : "Embedding backend: switch to GPU (faster, experimental)",
+            toggleEmbedBackend
+        );
     }
+}
+
+
+// Switch the embedding backend between GPU (WebGPU - fast but has been unstable on some GPUs/drivers) and
+// CPU (WASM - slow but rock-solid). The choice is persisted in GM flags that EJF_SD.embed.load() reads:
+// `sdTryWebgpu` opts into WebGPU, and `sdForceCpu` is the sticky lock the embed pass sets after a GPU device
+// loss. Switching to GPU clears that lock so WebGPU is actually retried. We reload afterwards so the pipeline
+// rebuilds cleanly on the chosen backend - embedding is resumable, so a reload never loses progress, and any
+// already-stored vectors stay valid (same model/version; q8 vs fp32 is just minor quantization noise).
+function toggleEmbedBackend() {
+    var gpuOn = (typeof GM_getValue !== 'function') || (GM_getValue('sdTryWebgpu', true) && !GM_getValue('sdForceCpu', false));
+    if (gpuOn) {
+        GM_setValue('sdTryWebgpu', false);   // back to CPU/WASM
+        GM_setValue('sdForceCpu', false);
+    } else {
+        GM_setValue('sdTryWebgpu', true);    // attempt WebGPU again
+        GM_setValue('sdForceCpu', false);    // clear the sticky "GPU unstable" lock so it is actually tried
+    }
+    window.location.reload(false);
 }
 
 
@@ -2050,7 +2077,8 @@ var EJF_SD = {
     NEAR_LIMIT_DELAY_MS: 3000,                     // back off harder when the rate-limit budget is low
     MAX_RETRIES: 5,
     TOP_N: 8,
-    MODEL_VERSION: 'bm25-v1'                        // Phase 1 has no embeddings; bumped when Phase 2 lands
+    MODEL_VERSION: 'gte-small-v3'                   // embedding model tag; bump to force a full re-embed
+                                                    // (v1 = NaN from fp16; v2 = fp32; v3 = boilerplate-stripped text)
 };
 
 
@@ -2076,6 +2104,28 @@ EJF_SD.util = {
             }
         })(d);
         return out.join(' ');
+    },
+
+    // Reduce an issue to just the comparable SIGNAL: its summary (weighted, since the one-line problem
+    // statement is the densest signal) + the human-written part of the description, with the EVE in-game
+    // bug-reporter boilerplate removed. That reporter dumps "Session Info" (character / solar system) and
+    // "Computer Info" (OS / GPU / CPU / memory spec) straight into the description; that text is near-identical
+    // across every report, so leaving it in makes every defect embed to nearly the same vector (and BM25 match
+    // on shared template words) - which is exactly why obvious duplicates were not surfacing. We also unwrap
+    // EVE <url=showinfo:ID>name</url> link markup, keeping the visible name AND the numeric IDs (a shared
+    // ship/type/message ID between two reports is a very strong duplicate signal).
+    // Used by BOTH the stored-defect indexing and the live query, so the two are always normalized the same.
+    cleanForCompare: function (summary, description) {
+        var s = (summary || '').replace(/\s+/g, ' ').trim();
+        var d = ' ' + (description || '') + ' ';
+        d = d.replace(/<url=[^>]*>/gi, ' ').replace(/<\/url>/gi, ' ');                          // unwrap in-game links
+        d = d.replace(/Session Info\s*:[\s\S]*?(?=Reproduction Steps|Computer Info|$)/i, ' ');  // drop char / solar system
+        d = d.replace(/Computer Info[\s\S]*$/i, ' ');                                            // drop the hardware dump (runs to the end)
+        d = d.replace(/\b(Reproduction Steps|Description)\b\s*:?/ig, ' ');                       // drop leftover section labels
+        d = d.replace(/\bNone\b/g, ' ');
+        d = d.replace(/\s+/g, ' ').trim();
+        // Weight the summary by repeating it twice so it dominates the pooled embedding / keyword stats.
+        return (s ? (s + '. ' + s + '. ') : '') + d;
     },
 
     // Convert a Jira ISO `updated` timestamp into the JQL literal "yyyy/MM/dd HH:mm".
@@ -2275,10 +2325,24 @@ EJF_SD.sync = {
                     if (rec.updated && rec.updated > maxUpdated) { maxUpdated = rec.updated; }
                     recs.push(rec);
                 }
-                return EJF_SD.db.bulkPut(recs).then(function () {
+                // Preserve existing embeddings for issues whose TEXT did not change, so an incremental
+                // re-fetch (or a metadata-only update) does not throw away work the embed pass already did.
+                // (For an initial full sync the DB is empty, so these lookups all return null and are cheap.)
+                return Promise.all(recs.map(function (rec) {
+                    return EJF_SD.db.getDefect(rec.key).then(function (old) {
+                        if (old && old.embedding && old.textHash === rec.textHash) {
+                            rec.embedding = old.embedding;
+                            rec.embeddingModelVersion = old.embeddingModelVersion;
+                        }
+                        return rec;
+                    });
+                })).then(function (merged) {
+                    return EJF_SD.db.bulkPut(merged);
+                }).then(function () {
                     stored += recs.length;
                     pages++;
                     EJF_SD.rank._dirty = true;
+                    EJF_SD.rank._dirtyVec = true;
                     var nextToken = data.nextPageToken || null;
                     // Persist progress so a reload mid-sync resumes rather than restarting.
                     return EJF_SD.db.setMeta('resumeToken', (data.isLast || !nextToken) ? null : nextToken)
@@ -2334,6 +2398,7 @@ EJF_SD.sync = {
                 EJF_SD.ui.toast('Defect sync complete – ' + total + ' defects in local DB.');
                 EJF_SD.ui.setStatus(total + ' defects in database');
                 if (EJF_SD.ui.currentKey) { EJF_SD.ui.render(EJF_SD.ui.currentKey); }
+                EJF_SD.embed.prepare(true);   // embed new/changed defects in the background (no-op if model unavailable)
                 return res;
             });
         }).catch(function (e) {
@@ -2359,6 +2424,7 @@ EJF_SD.sync = {
                     EJF_SD.sync.running = false;
                     EJF_SD.ui.toast('Rebuild complete – ' + total + ' defects.');
                     if (EJF_SD.ui.currentKey) { EJF_SD.ui.render(EJF_SD.ui.currentKey); }
+                    EJF_SD.embed.prepare(true);   // re-embed everything in the background
                 });
             })
             .catch(function (e) {
@@ -2400,7 +2466,7 @@ EJF_SD.rank = {
             var df = {}, docs = [], totalLen = 0;
             for (var i = 0; i < records.length; i++) {
                 var rec = records[i];
-                var toks = EJF_SD.rank._tokenize((rec.summary || '') + ' ' + (rec.description || ''));
+                var toks = EJF_SD.rank._tokenize(EJF_SD.util.cleanForCompare(rec.summary, rec.description));
                 var tf = {}, seen = {};
                 for (var j = 0; j < toks.length; j++) {
                     var tk = toks[j];
@@ -2418,8 +2484,8 @@ EJF_SD.rank = {
         return EJF_SD.rank._building;
     },
 
-    // Rank stored defects against the query text. Returns up to TOP_N {key,project,summary,status,score}.
-    suggest: function (text, excludeKey) {
+    // Rank stored defects against the query text. Returns up to `limit` (default TOP_N) scored results.
+    suggest: function (text, excludeKey, limit) {
         return EJF_SD.rank._ensureIndex().then(function (idx) {
             if (!idx || !idx.N) { return []; }
             var qTokens = EJF_SD.rank._tokenize(text);
@@ -2448,9 +2514,369 @@ EJF_SD.rank = {
                 if (score > 0) { scored.push({ key: doc.key, project: doc.project, summary: doc.summary, status: doc.status, resolution: doc.resolution, score: score }); }
             }
             scored.sort(function (a, c) { return c.score - a.score; });
-            return scored.slice(0, EJF_SD.TOP_N);
+            return scored.slice(0, limit || EJF_SD.TOP_N);
         });
     }
+};
+
+
+/* ---- embedding engine: local transformers.js (Phase 2) ----
+ * Lazily loads a small sentence-embedding model in the browser (no server, no API key) and embeds
+ * defect text into 384-dim normalized vectors. CSP on this instance is permissive (only frame-ancestors,
+ * WASM OK), so we load the library with a plain dynamic import() of a pinned CDN ESM build and let it
+ * fetch model weights directly. Any failure flips `unavailable` and the ranking layer falls back to BM25.
+ */
+EJF_SD.embed = {
+    MODEL: 'Xenova/gte-small',   // English, retrieval-tuned, 384-dim (better recall than all-MiniLM for dup-finding)
+    LIB_URL: 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.5.2/dist/transformers.min.js',
+    BATCH: 16,
+    MAX_CHARS: 1500,            // cap text per issue. Now that cleanForCompare strips the boilerplate, the
+                                // budget holds real content; raised back to 1500 (~380 tokens) since GPU
+                                // fp32/batch-32 handles it fast. (On the CPU fallback this is slower but the
+                                // single-item path + watchdog keep it safe.)
+    ready: false,              // model pipeline is loaded and usable
+    unavailable: false,        // load failed irrecoverably -> stay on BM25
+    backend: null,             // 'webgpu/fp16' etc (for diagnostics)
+    _cpuFallback: false,       // set after a GPU device loss -> rebuild on WASM only
+    _pipe: null,
+    _loading: null,
+    _preparing: null,
+    _prepared: false,
+
+    // Drop the current pipeline so the next embed call rebuilds it (used to recover from a lost GPU device).
+    _resetPipe: function () {
+        EJF_SD.embed._pipe = null;
+        EJF_SD.embed._loading = null;
+        EJF_SD.embed.ready = false;
+    },
+
+    // Load (once) the transformers.js pipeline. Resolves to the pipeline, or rejects and sets `unavailable`.
+    // Inference is kept OFF the main thread so the Jira tab never freezes: WebGPU runs on the GPU, and the
+    // WASM fallback runs in its own worker via env.backends.onnx.wasm.proxy. We pick WebGPU if it actually
+    // works (validated with a tiny warmup) and otherwise fall back to WASM.
+    load: function () {
+        if (EJF_SD.embed._pipe) { return Promise.resolve(EJF_SD.embed._pipe); }
+        if (EJF_SD.embed.unavailable) { return Promise.reject(new Error('embeddings unavailable')); }
+        if (EJF_SD.embed._loading) { return EJF_SD.embed._loading; }
+        EJF_SD.embed._loading = (function () {
+            return import(EJF_SD.embed.LIB_URL).then(function (mod) {
+                if (mod.env) {
+                    mod.env.allowLocalModels = false;     // always fetch from the hub/CDN
+                    mod.env.useBrowserCache = true;        // cache weights in CacheStorage after first download
+                    // Run the ONNX/WASM backend in a worker so embedding never blocks the page.
+                    try { mod.env.backends.onnx.wasm.proxy = true; } catch (e) { /* older builds: ignore */ }
+                }
+                // Pick a backend that actually works. We deliberately do NOT use fp16 on WebGPU for this
+                // model: gte-small's intermediate activations exceed the tiny fp16 range and overflow to
+                // Inf/NaN, so embeddings come back as NaN (cosine -> NaN, "%" shows NaN, semantic ranking
+                // becomes noise). fp32 on WebGPU is reliable; the WASM/CPU fallback uses q8 (small + fine on
+                // CPU). Each candidate is validated below, so any backend that yields bad numbers is rejected.
+                // After a GPU device loss we rebuild on WASM only; otherwise prefer WebGPU fp32 then WASM.
+                // WebGPU has proven unstable for this model: every dtype/batch size we tried eventually died
+                // with a device loss ("AbortError: Buffer unmapped") that can even HANG the worker - the
+                // batch promise never resolves or rejects, so the CPU fallback never triggers and the pass
+                // silently stalls. So the default is CPU/WASM only: slower but rock-solid and finite (no fp16
+                // NaN issues either). WebGPU is the DEFAULT backend (fast): `sdTryWebgpu` defaults to true and
+                // the menu toggle can flip it to CPU. After a WebGPU device loss the embed pass sets the sticky
+                // `sdForceCpu` lock, which keeps us on CPU across reloads (until GPU is re-enabled from the
+                // menu) so a bad GPU doesn't crash-loop.
+                var forceCpu = EJF_SD.embed._cpuFallback ||
+                    (typeof GM_getValue === 'function' && GM_getValue('sdForceCpu', false));
+                var tryGpu = !forceCpu &&
+                    (typeof GM_getValue !== 'function' || GM_getValue('sdTryWebgpu', true));
+                var attempts = tryGpu
+                    ? [{ device: 'webgpu', dtype: 'fp32' }, { device: 'wasm', dtype: 'q8' }]
+                    : [{ device: 'wasm', dtype: 'q8' }];
+                function buildWith(opts) {
+                    // Validate with a realistic, longer input rather than a single word. fp16/overflow issues
+                    // surface only on real-length text, so a tiny warmup would falsely "pass" and we'd store
+                    // NaN vectors. Require a finite, properly-normalized vector (sum of squares ~= 1).
+                    return mod.pipeline('feature-extraction', EJF_SD.embed.MODEL, opts).then(function (pipe) {
+                        var probe = 'The quick brown fox jumps over the lazy dog. ' +
+                            'Client crashes on undock with an access violation in the rendering thread after the latest patch.';
+                        return pipe(probe, { pooling: 'mean', normalize: true }).then(function (out) {
+                            var d = out && out.data, ss = 0, ok = !!(d && d.length);
+                            for (var i = 0; ok && i < d.length; i++) {
+                                if (!isFinite(d[i])) { ok = false; } else { ss += d[i] * d[i]; }
+                            }
+                            if (!ok || !(ss > 0.5)) { throw new Error('backend produced invalid embeddings (NaN/Inf/zero)'); }
+                            return pipe;
+                        });
+                    });
+                }
+                function tryFrom(i) {
+                    if (i >= attempts.length) { return Promise.reject(new Error('no usable embedding backend')); }
+                    return buildWith(attempts[i]).then(function (pipe) {
+                        EJF_SD.embed.backend = attempts[i].device + '/' + attempts[i].dtype;
+                        // fp32 GPU memory ~ batch x sequence-length. With MAX_CHARS at 1500, a batch of 32
+                        // long sequences can exhaust VRAM and trigger a device loss (the "BindGroup '...' is
+                        // invalid" cascade), so WebGPU uses 16 (16 x 1500 ~ the old, stable 32 x 512 footprint).
+                        // CPU/WASM runs one at a time: batched (array) inference hangs the worker there, while
+                        // the single-string path (same shape as the warmup) is reliable.
+                        EJF_SD.embed.BATCH = (attempts[i].device === 'webgpu') ? 16 : 1;
+                        return pipe;
+                    }, function () {
+                        return tryFrom(i + 1);
+                    });
+                }
+                return tryFrom(0);
+            }).then(function (pipe) {
+                EJF_SD.embed._pipe = pipe;
+                EJF_SD.embed.ready = true;
+                console.log('[EJF-SD] embedding model ready (backend: ' + EJF_SD.embed.backend + ')');
+                return pipe;
+            });
+        })().catch(function (e) {
+            EJF_SD.embed.unavailable = true;
+            EJF_SD.embed._loading = null;
+            console.log('[EJF-SD] embedding model unavailable, using keyword ranking. Reason:', e && e.message || e);
+            throw e;
+        });
+        return EJF_SD.embed._loading;
+    },
+
+    // Embed a single text -> normalized Float32Array(384).
+    embedOne: function (text) {
+        return EJF_SD.embed.load().then(function (pipe) {
+            var input = (text || ' ').slice(0, EJF_SD.embed.MAX_CHARS) || ' ';
+            return pipe(input, { pooling: 'mean', normalize: true }).then(function (out) {
+                return new Float32Array(out.data);
+            });
+        });
+    },
+
+    // Embed an array of texts -> array of normalized Float32Array(384).
+    embedBatch: function (texts) {
+        return EJF_SD.embed.load().then(function (pipe) {
+            var inputs = texts.map(function (t) { return (t || ' ').slice(0, EJF_SD.embed.MAX_CHARS) || ' '; });
+            // Single item: use the plain-string call - the exact shape the warmup proves works. On CPU/WASM
+            // here, passing an array (batched, padded) inference hangs the worker, but single strings are fine.
+            if (inputs.length === 1) {
+                return pipe(inputs[0], { pooling: 'mean', normalize: true }).then(function (out) {
+                    return [new Float32Array(out.data)];
+                });
+            }
+            return pipe(inputs, { pooling: 'mean', normalize: true }).then(function (out) {
+                var dim = out.dims[out.dims.length - 1];
+                var vecs = [];
+                for (var i = 0; i < inputs.length; i++) {
+                    vecs.push(new Float32Array(out.data.subarray(i * dim, (i + 1) * dim)));
+                }
+                return vecs;
+            });
+        });
+    },
+
+    // Embed every stored defect that lacks a current-version embedding, in batches, persisting as we go.
+    // Resumable: if interrupted, the next run just continues with whatever is still missing.
+    embedPass: function () {
+        return EJF_SD.embed.load().then(function () {
+            return EJF_SD.db.allDefects();
+        }).then(function (recs) {
+            var todo = [], curVer = 0;
+            for (var i = 0; i < recs.length; i++) {
+                if (recs[i].embedding && recs[i].embeddingModelVersion === EJF_SD.MODEL_VERSION) { curVer++; }
+                else { todo.push(recs[i]); }
+            }
+            console.log('[EJF-SD] embed pass: ' + todo.length + ' to embed, ' + curVer + ' already at ' +
+                EJF_SD.MODEL_VERSION + ' (of ' + recs.length + ' total, backend ' + EJF_SD.embed.backend + ')');
+            if (!todo.length) { EJF_SD.ui.setStatus('Embeddings up to date (' + curVer + ')'); return; }
+            EJF_SD.ui.toast('Embedding ' + todo.length + ' defects locally…');
+            var idx = 0;
+            function nextBatch() {
+                if (idx >= todo.length) { console.log('[EJF-SD] embed pass complete (' + todo.length + ' embedded)'); EJF_SD.rank._dirtyVec = true; return Promise.resolve(); }
+                var size = EJF_SD.embed.BATCH;
+                var slice = todo.slice(idx, idx + size);
+                var texts = slice.map(function (r) { return EJF_SD.util.cleanForCompare(r.summary, r.description); });
+                // Watchdog: a WebGPU device loss can HANG the worker so embedBatch never resolves OR rejects,
+                // which would silently stall the whole pass (and never reach the CPU-fallback catch below).
+                // Race it against a timeout so a hung batch is treated as a failure and recovers. CPU batches
+                // of 16 finish in ~1s (GPU even faster), so 90s is far above any legitimate batch time.
+                var t0 = Date.now();
+                var batchVecs = EJF_SD.embed.embedBatch(texts);
+                var watchdog = new Promise(function (_resolve, reject) {
+                    setTimeout(function () { reject(new Error('embed batch timed out after 45s')); }, 45000);
+                });
+                return Promise.race([batchVecs, watchdog]).then(function (vecs) {
+                    var dt = Date.now() - t0;
+                    // Guard against a SILENT device loss: WebGPU can log "BindGroup is invalid" validation
+                    // errors yet still resolve the batch with NaN/empty vectors. Storing those would mark the
+                    // defect "done" with a garbage embedding (then dropped at query time -> silently never
+                    // matches). Detect it and throw, so the catch below recovers (-> CPU) and retries the slice.
+                    for (var g = 0; g < vecs.length; g++) {
+                        if (!vecs[g] || vecs[g].length === 0 || !isFinite(vecs[g][0])) {
+                            throw new Error('embedding returned NaN/empty (likely GPU device loss)');
+                        }
+                    }
+                    for (var j = 0; j < slice.length; j++) {
+                        slice[j].embedding = vecs[j];
+                        slice[j].embeddingModelVersion = EJF_SD.MODEL_VERSION;
+                    }
+                    return EJF_SD.db.bulkPut(slice).then(function () {
+                        idx += slice.length;   // advance by what we actually embedded
+                        EJF_SD.rank._dirtyVec = true;
+                        // Log throughput periodically so we can see the real CPU speed (first item always logs).
+                        if (idx <= slice.length || idx % 50 === 0) {
+                            console.log('[EJF-SD] embedded ' + idx + '/' + todo.length + ' (' + size + ' in ' + dt + 'ms, ' + EJF_SD.embed.backend + ')');
+                        }
+                        EJF_SD.ui.setStatus('Embedding… ' + Math.min(idx, todo.length) + '/' + todo.length + ' (' + EJF_SD.embed.backend + ')');
+                        return EJF_SD.util.delay(0).then(nextBatch);   // yield to keep the UI responsive
+                    });
+                }).catch(function (e) {
+                    // A batch failed. On WebGPU this is almost always a device loss / "Buffer unmapped" /
+                    // "Buffer is invalid" cascade - driver instability, NOT a simple out-of-memory that a
+                    // smaller batch would fix (shrinking just crashes again a batch later). So on the FIRST
+                    // GPU failure we switch straight to the CPU/WASM backend, which is slower but doesn't
+                    // crash, and remember it (sticky GM flag) so future reloads skip WebGPU entirely instead
+                    // of re-crashing every time. idx is NOT advanced, so no embedding progress is lost.
+                    console.log('[EJF-SD] embed batch failed (' + EJF_SD.embed.backend + ', size ' + size + '):', e && e.message || e);
+                    EJF_SD.embed._resetPipe();
+                    if (!EJF_SD.embed._cpuFallback) {
+                        EJF_SD.embed._cpuFallback = true;
+                        try { GM_setValue('sdForceCpu', true); } catch (ignore) { /* GM unavailable */ }
+                        EJF_SD.ui.toast('GPU embedding is unstable on this machine — switching to CPU (slower but reliable). Remembered for next time.');
+                        return EJF_SD.util.delay(800).then(nextBatch);
+                    }
+                    throw e;   // CPU path also failing -> give up (ranking stays on BM25)
+                });
+            }
+            return nextBatch();
+        });
+    },
+
+    // Background entry point: load the model and embed anything outstanding, then refresh the panel.
+    // Idempotent per session unless `force` is passed (used right after a sync brings in new/changed text).
+    prepare: function (force) {
+        if (EJF_SD.embed.unavailable) { return Promise.resolve(); }
+        if (EJF_SD.embed._preparing) { return EJF_SD.embed._preparing; }
+        if (EJF_SD.embed._prepared && !force) { return Promise.resolve(); }
+        EJF_SD.embed._preparing = EJF_SD.db.countDefects().then(function (n) {
+            if (!n) { return; }   // nothing synced yet - don't download a model for an empty DB
+            return EJF_SD.embed.embedPass().then(function () {
+                EJF_SD.embed._prepared = true;
+                EJF_SD.rank._dirtyVec = true;
+                if (EJF_SD.ui.currentKey) { EJF_SD.ui.render(EJF_SD.ui.currentKey); }
+            });
+        }).then(function () {
+            EJF_SD.embed._preparing = null;
+        }).catch(function (e) {
+            EJF_SD.embed._preparing = null;
+            console.log('[EJF-SD] embed prepare skipped:', e && e.message || e);
+        });
+        return EJF_SD.embed._preparing;
+    }
+};
+
+
+/* ---- semantic ranking (Phase 2): cosine over stored embeddings, with BM25 fallback ---- */
+EJF_SD.rank._vecIndex = null;     // cached array of { key, project, summary, status, resolution, vec }
+EJF_SD.rank._dirtyVec = true;     // rebuild the in-memory vector cache on next semantic query
+EJF_SD.rank._buildingVec = null;
+
+// Build (and cache) the in-memory list of vectors for the current model version.
+EJF_SD.rank._ensureVecIndex = function () {
+    if (EJF_SD.rank._vecIndex && !EJF_SD.rank._dirtyVec) { return Promise.resolve(EJF_SD.rank._vecIndex); }
+    if (EJF_SD.rank._buildingVec) { return EJF_SD.rank._buildingVec; }
+    EJF_SD.rank._buildingVec = EJF_SD.db.allDefects().then(function (recs) {
+        var docs = [];
+        for (var i = 0; i < recs.length; i++) {
+            var r = recs[i];
+            if (r.embedding && r.embeddingModelVersion === EJF_SD.MODEL_VERSION) {
+                docs.push({ key: r.key, project: r.project, summary: r.summary, status: r.status, resolution: r.resolution, vec: r.embedding });
+            }
+        }
+        EJF_SD.rank._vecIndex = docs;
+        EJF_SD.rank._dirtyVec = false;
+        EJF_SD.rank._buildingVec = null;
+        return docs;
+    }).catch(function (e) { EJF_SD.rank._buildingVec = null; throw e; });
+    return EJF_SD.rank._buildingVec;
+};
+
+// Cosine similarity of two normalized vectors == dot product.
+EJF_SD.rank._dot = function (a, b) {
+    var s = 0, n = Math.min(a.length, b.length);
+    for (var i = 0; i < n; i++) { s += a[i] * b[i]; }
+    return s;
+};
+
+EJF_SD.rank.CAND = 50;     // candidates pulled from each retriever before fusion
+EJF_SD.rank.RRF_K = 60;    // Reciprocal-Rank-Fusion constant (standard default)
+
+// Cosine-score every stored vector against the query vector, sorted best-first. Returns [] if none embedded.
+EJF_SD.rank._semanticScored = function (qv, excludeKey) {
+    return EJF_SD.rank._ensureVecIndex().then(function (docs) {
+        var scored = [];
+        for (var d = 0; d < docs.length; d++) {
+            if (excludeKey && docs[d].key === excludeKey) { continue; }
+            var sc = EJF_SD.rank._dot(qv, docs[d].vec);
+            if (!isFinite(sc)) { continue; }   // defensively drop any corrupt (NaN/Inf) vector
+            scored.push({
+                key: docs[d].key, project: docs[d].project, summary: docs[d].summary,
+                status: docs[d].status, resolution: docs[d].resolution,
+                score: sc
+            });
+        }
+        scored.sort(function (a, c) { return c.score - a.score; });
+        return scored;
+    });
+};
+
+// Choose the best available ranking. With the model loaded we do HYBRID retrieval: fuse the semantic
+// (cosine) and BM25 keyword candidate lists with Reciprocal Rank Fusion. This is the key recall fix - exact
+// shared terms (item/module names, error strings) that embeddings smooth over are caught by BM25, while
+// paraphrases are caught by the embeddings, so the "obvious" duplicate surfaces far more reliably.
+// Returns { mode: 'Hybrid' | 'Keyword', results: [...] } with a display % already attached to each result.
+EJF_SD.rank.suggestBest = function (text, key) {
+    function keywordOnly() {
+        return EJF_SD.rank.suggest(text, key, EJF_SD.TOP_N).then(function (list) {
+            var top = (list[0] && list[0].score) || 0;
+            for (var i = 0; i < list.length; i++) { list[i].pct = top > 0 ? Math.round(list[i].score / top * 100) : 0; }
+            return { mode: 'Keyword', results: list };
+        });
+    }
+    if (EJF_SD.embed.unavailable || !EJF_SD.embed.ready) {
+        EJF_SD.embed.prepare();   // warm up the model in the background; show keyword results meanwhile
+        return keywordOnly();
+    }
+    return EJF_SD.embed.embedOne(text).then(function (qv) {
+        return EJF_SD.rank._semanticScored(qv, key).then(function (sem) {
+            if (!sem.length) { return keywordOnly(); }   // nothing embedded yet
+            return EJF_SD.rank.suggest(text, key, EJF_SD.rank.CAND).then(function (bm) {
+                var K = EJF_SD.rank.RRF_K;
+                var rrf = {}, meta = {}, cosByKey = {};
+                var semTop = sem.slice(0, EJF_SD.rank.CAND);
+                for (var i = 0; i < semTop.length; i++) { rrf[semTop[i].key] = (rrf[semTop[i].key] || 0) + 1 / (K + i); meta[semTop[i].key] = semTop[i]; }
+                for (var j = 0; j < bm.length; j++) { rrf[bm[j].key] = (rrf[bm[j].key] || 0) + 1 / (K + j); if (!meta[bm[j].key]) { meta[bm[j].key] = bm[j]; } }
+                for (var c = 0; c < sem.length; c++) { cosByKey[sem[c].key] = sem[c].score; }   // cosine for display (all docs)
+                var out = Object.keys(rrf).map(function (k) {
+                    var m = meta[k];
+                    var hasCos = (cosByKey[k] !== undefined && isFinite(cosByKey[k]));
+                    return {
+                        key: k, project: m.project, summary: m.summary, status: m.status, resolution: m.resolution,
+                        rrf: rrf[k], pct: hasCos ? Math.round(Math.max(0, Math.min(1, cosByKey[k])) * 100) : 0
+                    };
+                });
+                // RRF decides WHICH results make the cut (so strong keyword hits aren't lost even when their
+                // cosine is middling) - then present those top-N sorted by the displayed similarity % so the
+                // panel reads high-to-low, matching what the user sees.
+                out.sort(function (a, c2) { return c2.rrf - a.rrf; });
+                var topN = out.slice(0, EJF_SD.TOP_N);
+                topN.sort(function (a, c2) { return c2.pct - a.pct; });
+                return { mode: 'Hybrid', results: topN };
+            });
+        });
+    }).catch(function (e) {
+        // A query-time embed failed (e.g. a WebGPU device loss while viewing a report). If we were on the
+        // GPU, flip to the sticky CPU backend so the next query and the background pass use WASM instead of
+        // crashing again, then show keyword results for now.
+        if (EJF_SD.embed.backend && EJF_SD.embed.backend.indexOf('webgpu') === 0 && !EJF_SD.embed._cpuFallback) {
+            EJF_SD.embed._cpuFallback = true;
+            try { GM_setValue('sdForceCpu', true); } catch (ignore) { /* GM unavailable */ }
+            EJF_SD.embed._resetPipe();
+        }
+        return keywordOnly();
+    });
 };
 
 
@@ -2512,7 +2938,7 @@ EJF_SD.ui = {
     },
 
     _item: function (r) {
-        var pct = Math.round(Math.min(1, r.score / 12) * 100); // rough 0-100 display of an unbounded BM25 score
+        var pct = (typeof r.pct === 'number') ? r.pct : 0; // display % is computed per-mode in render()
         var meta = r.status || '';
         if (r.resolution) { meta += (meta ? ' · ' : '') + r.resolution; }
         var $li = $('<li></li>');
@@ -2527,19 +2953,20 @@ EJF_SD.ui = {
     // Read the open issue's text from the DOM (reusing the Translate selectors); fall back to a REST GET.
     getIssueText: function (key) {
         var title = $("h1[data-testid='issue.views.issue-base.foundation.summary.heading']").text() || '';
-        var $rt = $("div[data-component-selector='jira-issue-view-rich-text-inline-edit-view-container']");
-        var part0 = $rt.children().eq(0).text() || '';
-        var part1 = $rt.children().eq(1).text() || '';
-        var domText = (title + '\n' + part0 + '\n' + part1).replace(/\s+/g, ' ').trim();
-        if (domText.length > (title.length + 2)) { return Promise.resolve(domText); }
+        // Grab the WHOLE rich-text description container (not just the first couple of paragraphs) so the
+        // cleaner sees everything, then strip boilerplate. Same normalization as the stored side.
+        var descText = $("div[data-component-selector='jira-issue-view-rich-text-inline-edit-view-container']").text() || '';
+        if (descText.replace(/\s+/g, '').length > 0) {
+            return Promise.resolve(EJF_SD.util.cleanForCompare(title, descText));
+        }
         // DOM not ready / empty body - fall back to the REST API.
         return new Promise(function (resolve) {
             $.ajax({ url: EJF_SD.HOST + '/rest/api/2/issue/' + key + '?fields=summary,description', dataType: 'json' })
                 .done(function (d) {
                     var f = d.fields || {};
-                    resolve(((f.summary || '') + '\n' + EJF_SD.util.toPlainText(f.description)).trim());
+                    resolve(EJF_SD.util.cleanForCompare(f.summary || title, EJF_SD.util.toPlainText(f.description)));
                 })
-                .fail(function () { resolve(domText); });
+                .fail(function () { resolve(EJF_SD.util.cleanForCompare(title, descText)); });
         });
     },
 
@@ -2554,9 +2981,11 @@ EJF_SD.ui = {
                     return;
                 }
                 if (!text) { EJF_SD.ui.setStatus('Could not read this issue’s text.'); return; }
-                return EJF_SD.rank.suggest(text, key).then(function (results) {
+                return EJF_SD.rank.suggestBest(text, key).then(function (out) {
+                    var results = out.results || [];
+                    $('#ejf-sd-mode').text(out.mode);   // 'Hybrid' or 'Keyword'
                     if (!results.length) { EJF_SD.ui.setStatus('No similar defects found (' + n + ' indexed).'); return; }
-                    EJF_SD.ui.setStatus(results.length + ' suggestions · ' + n + ' defects indexed');
+                    EJF_SD.ui.setStatus(results.length + ' suggestions · ' + out.mode + ' · ' + n + ' indexed');
                     var $list = $('#ejf-sd-list');
                     for (var i = 0; i < results.length; i++) { $list.append(EJF_SD.ui._item(results[i])); }
                 });
@@ -2581,6 +3010,21 @@ EJF_SD.ui = {
         EJF_SD.ui.render(key);
     }
 };
+
+
+/* ---- one-time migration: make WebGPU the default backend ---- */
+// Earlier builds defaulted to CPU and could leave a sticky `sdForceCpu` lock set from debugging / a past
+// device loss. This build makes WebGPU the default, so clear that stale lock ONCE (and arm `sdTryWebgpu`) to
+// give GPU a fresh attempt. Any future device loss re-sets the lock as normal, so the crash-loop guard still
+// works and the menu toggle can still force CPU.
+(function () {
+    if (typeof GM_getValue !== 'function' || typeof GM_setValue !== 'function') { return; }
+    if (!GM_getValue('sdGpuDefault_v1', false)) {
+        GM_setValue('sdForceCpu', false);
+        GM_setValue('sdTryWebgpu', true);
+        GM_setValue('sdGpuDefault_v1', true);
+    }
+})();
 
 
 /* ---- init: watch the DOM and (re)inject the panel across Atlassian's React re-renders / SPA nav ---- */
