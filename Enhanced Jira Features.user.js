@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.8.0
+// @version     2.8.1
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, and suggests similar existing defects on bug reports
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -17,8 +17,8 @@
 // @grant       GM_unregisterMenuCommand
 // @grant       GM_addValueChangeListener
 // @grant       GM_xmlhttpRequest
-// @connect      huggingface.co
-// @connect      cdn.jsdelivr.net
+// @connect     huggingface.co
+// @connect     cdn.jsdelivr.net
 // ==/UserScript==
 /* global $ */
 
@@ -2607,9 +2607,9 @@ EJF_SD.embed = {
                 // batch promise never resolves or rejects, so the CPU fallback never triggers and the pass
                 // silently stalls. So the default is CPU/WASM only: slower but rock-solid and finite (no fp16
                 // NaN issues either). WebGPU is the DEFAULT backend (fast): `sdTryWebgpu` defaults to true and
-                // the menu toggle can flip it to CPU. After a WebGPU device loss the embed pass sets the sticky
-                // `sdForceCpu` lock, which keeps us on CPU across reloads (until GPU is re-enabled from the
-                // menu) so a bad GPU doesn't crash-loop.
+                // the menu toggle is the ONLY thing that switches backend - a GPU failure does NOT auto-fall
+                // back to CPU (it retries on GPU, then pauses). `sdForceCpu` is still honored if the menu sets
+                // it, but the embed/query paths no longer set it themselves.
                 var forceCpu = EJF_SD.embed._cpuFallback ||
                     (typeof GM_getValue === 'function' && GM_getValue('sdForceCpu', false));
                 var tryGpu = !forceCpu &&
@@ -2638,12 +2638,11 @@ EJF_SD.embed = {
                     if (i >= attempts.length) { return Promise.reject(new Error('no usable embedding backend')); }
                     return buildWith(attempts[i]).then(function (pipe) {
                         EJF_SD.embed.backend = attempts[i].device + '/' + attempts[i].dtype;
-                        // fp32 GPU memory ~ batch x sequence-length. With MAX_CHARS at 1500, a batch of 32
-                        // long sequences can exhaust VRAM and trigger a device loss (the "BindGroup '...' is
-                        // invalid" cascade), so WebGPU uses 16 (16 x 1500 ~ the old, stable 32 x 512 footprint).
-                        // CPU/WASM runs one at a time: batched (array) inference hangs the worker there, while
-                        // the single-string path (same shape as the warmup) is reliable.
-                        EJF_SD.embed.BATCH = (attempts[i].device === 'webgpu') ? 16 : 1;
+                        // fp32 GPU memory ~ batch x sequence-length. With MAX_CHARS at 1500, a large batch can
+                        // exhaust VRAM and trigger a device loss (the "BindGroup '...' is invalid" cascade), so
+                        // WebGPU uses a conservative 8. CPU/WASM runs one at a time: batched (array) inference
+                        // hangs the worker there, while the single-string path (same shape as the warmup) is reliable.
+                        EJF_SD.embed.BATCH = (attempts[i].device === 'webgpu') ? 8 : 1;
                         return pipe;
                     }, function () {
                         return tryFrom(i + 1);
@@ -2712,16 +2711,15 @@ EJF_SD.embed = {
                 EJF_SD.MODEL_VERSION + ' (of ' + recs.length + ' total, backend ' + EJF_SD.embed.backend + ')');
             if (!todo.length) { EJF_SD.ui.setStatus('Embeddings up to date (' + curVer + ')'); return; }
             EJF_SD.ui.toast('Embedding ' + todo.length + ' defects locally…');
-            var idx = 0;
+            var idx = 0, gpuRetries = 0;
             function nextBatch() {
                 if (idx >= todo.length) { console.log('[EJF-SD] embed pass complete (' + todo.length + ' embedded)'); EJF_SD.rank._dirtyVec = true; return Promise.resolve(); }
                 var size = EJF_SD.embed.BATCH;
                 var slice = todo.slice(idx, idx + size);
                 var texts = slice.map(function (r) { return EJF_SD.util.cleanForCompare(r.summary, r.description); });
                 // Watchdog: a WebGPU device loss can HANG the worker so embedBatch never resolves OR rejects,
-                // which would silently stall the whole pass (and never reach the CPU-fallback catch below).
-                // Race it against a timeout so a hung batch is treated as a failure and recovers. CPU batches
-                // of 16 finish in ~1s (GPU even faster), so 90s is far above any legitimate batch time.
+                // which would silently stall the whole pass. Race it against a timeout so a hung batch is
+                // treated as a failure and handled by the catch below (retry on the same backend, then pause).
                 var t0 = Date.now();
                 var batchVecs = EJF_SD.embed.embedBatch(texts);
                 var watchdog = new Promise(function (_resolve, reject) {
@@ -2753,21 +2751,19 @@ EJF_SD.embed = {
                         return EJF_SD.util.delay(0).then(nextBatch);   // yield to keep the UI responsive
                     });
                 }).catch(function (e) {
-                    // A batch failed. On WebGPU this is almost always a device loss / "Buffer unmapped" /
-                    // "Buffer is invalid" cascade - driver instability, NOT a simple out-of-memory that a
-                    // smaller batch would fix (shrinking just crashes again a batch later). So on the FIRST
-                    // GPU failure we switch straight to the CPU/WASM backend, which is slower but doesn't
-                    // crash, and remember it (sticky GM flag) so future reloads skip WebGPU entirely instead
-                    // of re-crashing every time. idx is NOT advanced, so no embedding progress is lost.
+                    // A batch failed (on WebGPU, usually a device loss). We deliberately do NOT auto-switch to
+                    // CPU - the backend is the user's choice via the Tampermonkey menu. idx is NOT advanced, so
+                    // no progress is lost: retry a few times on the SAME backend to ride out a transient blip,
+                    // and if it keeps failing, pause the pass (it resumes on the next reload / scheduled sync)
+                    // and tell the user they can switch backend from the menu.
                     console.log('[EJF-SD] embed batch failed (' + EJF_SD.embed.backend + ', size ' + size + '):', e && e.message || e);
                     EJF_SD.embed._resetPipe();
-                    if (!EJF_SD.embed._cpuFallback) {
-                        EJF_SD.embed._cpuFallback = true;
-                        try { GM_setValue('sdForceCpu', true); } catch (ignore) { /* GM unavailable */ }
-                        EJF_SD.ui.toast('GPU embedding is unstable on this machine — switching to CPU (slower but reliable). Remembered for next time.');
-                        return EJF_SD.util.delay(800).then(nextBatch);
+                    gpuRetries++;
+                    if (gpuRetries <= 3) {
+                        return EJF_SD.util.delay(1500).then(nextBatch);
                     }
-                    throw e;   // CPU path also failing -> give up (ranking stays on BM25)
+                    EJF_SD.ui.toast('Embedding keeps failing on ' + (EJF_SD.embed.backend || 'GPU') + ' — paused. Reload to retry, or switch backend from the Tampermonkey menu.');
+                    throw e;   // give up this pass (progress saved; ranking stays on BM25 meanwhile)
                 });
             }
             return nextBatch();
@@ -2896,15 +2892,11 @@ EJF_SD.rank.suggestBest = function (text, key) {
                 return { mode: 'Hybrid', results: topN };
             });
         });
-    }).catch(function (e) {
-        // A query-time embed failed (e.g. a WebGPU device loss while viewing a report). If we were on the
-        // GPU, flip to the sticky CPU backend so the next query and the background pass use WASM instead of
-        // crashing again, then show keyword results for now.
-        if (EJF_SD.embed.backend && EJF_SD.embed.backend.indexOf('webgpu') === 0 && !EJF_SD.embed._cpuFallback) {
-            EJF_SD.embed._cpuFallback = true;
-            try { GM_setValue('sdForceCpu', true); } catch (ignore) { /* GM unavailable */ }
-            EJF_SD.embed._resetPipe();
-        }
+    }).catch(function () {
+        // A query-time embed failed (e.g. a WebGPU device loss while viewing a report). We do NOT auto-switch
+        // to CPU - that's the user's choice via the menu. Just drop the (possibly dead) pipeline so the next
+        // query rebuilds on the same backend, and show keyword results for now.
+        EJF_SD.embed._resetPipe();
         return keywordOnly();
     });
 };
