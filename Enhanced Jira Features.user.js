@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.8.4
+// @version     2.9.0
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, and suggests similar existing defects on bug reports
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -19,6 +19,8 @@
 // @grant       GM_xmlhttpRequest
 // @connect     huggingface.co
 // @connect     cdn.jsdelivr.net
+// @connect     atlassian.net
+// @connect     atlassian.com
 // ==/UserScript==
 /* global $ */
 
@@ -886,6 +888,38 @@ function SwapUI() {
                 break;
         }
     });
+
+    // Live search box (Feature D): filter rows by text, composing with the type toggles above. A row is
+    // shown iff it matches the (case-insensitive) query AND its message-type isn't currently toggled off.
+    // ejfApplyLogFilter recomputes visibility from the toggle state (including the "Only Exceptions" combo,
+    // which also hides info rows) so search and the toggle buttons never fight. Wired only on the main log
+    // parser, the one layout that has the search input.
+    if ($('#ejf-log-search').length) {
+        var ejfApplyLogFilter = function () {
+            var q = ($('#ejf-log-search').val() || '').toLowerCase();
+            var off = {};
+            $('#gnav a.toggle').each(function () { off[$(this).attr('id')] = true; });
+            var onlyExc = off.notice && off.warning && off.error && !off.exception;   // the "Only Exceptions" state
+            $('#tableContent tbody tr').each(function () {
+                var cls = this.className || '';
+                var hiddenByToggle = onlyExc
+                    ? !/\bexception\b/.test(cls)
+                    : ((off.notice && /\bnotice\b/.test(cls)) ||
+                       (off.warning && /\bwarning\b/.test(cls)) ||
+                       (off.error && /\berror\b/.test(cls)) ||
+                       (off.exception && /\bexception\b/.test(cls)));
+                var matches = !q || (this.textContent || '').toLowerCase().indexOf(q) >= 0;
+                this.style.display = (!hiddenByToggle && matches) ? 'table-row' : 'none';
+            });
+        };
+        var ejfSearchTimer = null;
+        $('#ejf-log-search').on('input', function () {
+            if (ejfSearchTimer) { clearTimeout(ejfSearchTimer); }
+            ejfSearchTimer = setTimeout(ejfApplyLogFilter, 120);   // debounce for large logs
+        });
+        // Re-apply the text filter after any toggle / Only-Exceptions / Show-All click so the two compose.
+        $('#gpanel a').on('click', function () { setTimeout(ejfApplyLogFilter, 0); });
+    }
 };
 
 
@@ -1280,6 +1314,8 @@ function ParseLogs() {
             typeCell.innerHTML = table[i][2];
             messageCell = row.insertCell(++cellIndex);
             messageCell.innerHTML = table[i][3];
+            // (Known-exception highlighting is applied as a post-render pass in ParseLogs via
+            //  EJF_SD.logsig.applyToTable(), since the signature index is built async from IndexedDB.)
 
 
  /**
@@ -1311,6 +1347,12 @@ function ParseLogs() {
  */
     document.getElementById("loader").style.display = "none";
     document.getElementById("tableContent").style.display = "table";
+
+ /**
+ * Feature D: flag log lines that match a known exception signature mined from the defect DB, linking each
+ * back to its defect. Runs async (index is built from IndexedDB) and patches the rendered rows in place.
+ */
+    if (typeof EJF_SD !== 'undefined' && EJF_SD.logsig) { EJF_SD.logsig.applyToTable(); }
 };
 
 
@@ -1630,6 +1672,30 @@ var cssLogParser = `
     .borderbot {
         border-bottom: 2px solid #aaaaaa;
     }
+
+    #searchli {
+      float: left;
+      margin-left: 10px;
+    }
+
+    #ejf-log-search {
+      height: 26px;
+      padding: 0 8px;
+      border: 1px solid #555;
+      border-radius: 4px;
+      background: #1d2125;
+      color: #e6e6e6;
+      font-size: 12px;
+      outline: none;
+    }
+
+    #ejf-log-search:focus {
+      border-color: #4c9aff;
+    }
+
+    .sig-hit {
+      box-shadow: inset 4px 0 0 #ffb547 !important;
+    }
 `
 
 
@@ -1656,6 +1722,8 @@ var html = `
                <a href="#" id = "onlyexception" class="">Only Exceptions</a>
             <li id="button">
                <a href="#" id = "showAll">Show All</a>
+            <li id="searchli">
+               <input id="ejf-log-search" type="text" placeholder="Filter…" autocomplete="off">
          </ul>
       </nav>
    </header>
@@ -2072,7 +2140,7 @@ var pdmHtml = `
 var EJF_SD = {
     HOST: 'https://fenriscreations.atlassian.net',
     SCOPE: 'project in (EDR, EO)',                 // dataset definition (tweak here to change scope)
-    FIELDS: ['summary', 'description', 'status', 'resolution', 'components', 'updated', 'project'],
+    FIELDS: ['summary', 'description', 'status', 'resolution', 'resolutiondate', 'components', 'updated', 'project'],
     DB_NAME: 'EJF_SimilarDefects',
     DB_VERSION: 1,
     PAGE_SIZE: 100,
@@ -2082,6 +2150,394 @@ var EJF_SD = {
     TOP_N: 8,
     MODEL_VERSION: 'gte-small-v3'                   // embedding model tag; bump to force a full re-embed
                                                     // (v1 = NaN from fp16; v2 = fp32; v3 = boilerplate-stripped text)
+};
+
+
+/* ---- log signatures (Feature D): auto-mined exception fingerprints from defects ----
+ * EVE defect descriptions paste crash dumps. Matching on the one-line "Formatted exception info:" message
+ * alone is too weak: many UNRELATED defects share a generic message (e.g. "TypeNotFoundException: 'key not
+ * found'"), so a log line was being attributed to the wrong defect. What actually identifies a crash is its
+ * STACK, and EVE conveniently emits a deterministic "Stackhash: <n>" per stack. So we fingerprint each
+ * exception block by (1) its Stackhash - an exact fingerprint, identical across users/sessions for the same
+ * build - and (2) a normalized stack signature: the chain of file:function frames with line numbers dropped,
+ * so it still matches across client builds when the stackhash itself differs. We mine those per exception
+ * block from every defect, then in the log we group rows into exception blocks and match each block by
+ * Stackhash first, stack-signature second. The index rebuilds whenever the defect DB changes.
+ */
+EJF_SD.logsig = {
+    _index: null,         // { hashMap: { stackhash -> defect }, sigMap: { stackSig -> defect } }
+    _building: null,
+    _dirty: true,
+    MIN_FRAMES: 2,        // need at least this many stack frames to trust a stack signature (else too generic)
+
+    // Split a blob of text into individual EXCEPTION blocks. Stored descriptions have newlines collapsed to
+    // spaces, but "EXCEPTION #" / "EXCEPTION END" / "Stackhash:" all survive as substrings, so this works on
+    // both the (collapsed) defect description and a (re-joined) log block.
+    _splitBlocks: function (text) {
+        var blocks = [], re = /EXCEPTION #[\s\S]*?(?=EXCEPTION #|$)/gi, m;
+        while ((m = re.exec(text))) { blocks.push(m[0]); if (re.lastIndex === m.index) { re.lastIndex++; } }
+        return blocks.length ? blocks : [text || ''];
+    },
+
+    // Fingerprint one exception block -> { hash, sig, msg }. `hash` is the Stackhash literal (as a string) if
+    // present; `sig` is the lowercased "<message>|<frame>>...>frame>" built from the file:function chain (line
+    // numbers dropped for cross-build robustness), or null when there aren't enough frames to be distinctive;
+    // `msg` is the human "Formatted exception info" text (used only as a panel label).
+    _fingerprint: function (text) {
+        text = text || '';
+        var hash = null, hm = /Stackhash\s*:?\s*(-?\d+)/i.exec(text);
+        if (hm) { hash = hm[1]; }
+        var msg = '', mm = /Formatted exception info\s*:?\s*([\s\S]*?)(?:\bCommon path prefix\b|\bCaught at\b|\bThrown at\b|\bReported from\b|\bThread Locals\b|\bStackhash\b|\bEXCEPTION END\b|$)/i.exec(text);
+        if (mm) { msg = (mm[1] || '').replace(/\s+/g, ' ').trim(); }
+        var frames = [], fre = /([A-Za-z0-9_.\/\\-]+\.py)\((\d+)\)\s+([A-Za-z0-9_<>]+)/g, fm;
+        while ((fm = fre.exec(text))) {
+            frames.push(fm[1].replace(/^.*[\/\\]/, '') + ':' + fm[3]);   // basename:function (no line number)
+        }
+        var sig = (frames.length >= EJF_SD.logsig.MIN_FRAMES)
+            ? (msg + '|' + frames.join('>')).toLowerCase()
+            : null;
+        return { hash: hash, sig: sig, msg: msg };
+    },
+
+    // Build (and cache) the fingerprint index from every stored defect. Deduped by fingerprint (first defect
+    // exhibiting it wins). A defect can paste several exception dumps, so we fingerprint each block.
+    ensure: function () {
+        if (EJF_SD.logsig._index && !EJF_SD.logsig._dirty) { return Promise.resolve(EJF_SD.logsig._index); }
+        if (EJF_SD.logsig._building) { return EJF_SD.logsig._building; }
+        EJF_SD.logsig._building = EJF_SD.db.allDefects().then(function (recs) {
+            var hashMap = {}, sigMap = {}, nHash = 0, nSig = 0;
+            for (var i = 0; i < recs.length; i++) {
+                var desc = recs[i].description;
+                if (!desc || desc.indexOf('EXCEPTION #') === -1) { continue; }
+                var blocks = EJF_SD.logsig._splitBlocks(desc);
+                for (var b = 0; b < blocks.length; b++) {
+                    var fp = EJF_SD.logsig._fingerprint(blocks[b]);
+                    if (fp.hash && !hashMap[fp.hash]) { hashMap[fp.hash] = recs[i].key; nHash++; }
+                    if (fp.sig && !sigMap[fp.sig]) { sigMap[fp.sig] = recs[i].key; nSig++; }
+                }
+            }
+            EJF_SD.logsig._index = { hashMap: hashMap, sigMap: sigMap };
+            EJF_SD.logsig._dirty = false;
+            EJF_SD.logsig._building = null;
+            console.log('[EJF-SD] log signatures: ' + nHash + ' stackhashes + ' + nSig + ' stack signatures mined from ' + recs.length + ' defects');
+            return EJF_SD.logsig._index;
+        }).catch(function (e) { EJF_SD.logsig._building = null; throw e; });
+        return EJF_SD.logsig._building;
+    },
+
+    // After the main log parser renders, group rows into EXCEPTION blocks, fingerprint each, and match it to
+    // a defect (Stackhash first, stack-signature second). The matched defect is flagged on the block's first
+    // (EXCEPTION #) row - amber accent + tooltip + [EDR-x] badge - and counted for the panel. Async (the index
+    // is built from IndexedDB); safe to call right after ParseLogs - it patches the already-rendered rows.
+    applyToTable: function () {
+        return EJF_SD.logsig.ensure().then(function (idx) {
+            if (!idx) { return; }
+            var rows = document.querySelectorAll('#tableContent tbody tr');
+            var found = {};   // defect -> { defect, count, rows:[anchor tr,...], raw (label) }
+            function cellText(tr) { var c = tr.lastElementChild; return c ? (c.textContent || '') : ''; }
+            function tally(defect, tr, label) {
+                if (!found[defect]) { found[defect] = { defect: defect, count: 0, rows: [], raw: label || '' }; }
+                found[defect].count++;
+                found[defect].rows.push(tr);
+                if (!found[defect].raw && label) { found[defect].raw = label; }
+            }
+            function markAnchor(tr, defect) {
+                var cell = tr.lastElementChild;
+                tr.className += ' sig-hit';
+                if (cell) {
+                    cell.title = 'Known exception · ' + defect;
+                    cell.innerHTML = '<a href="/browse/' + defect + '" target="_blank" style="color:#4c9aff;font-weight:700;margin-right:6px;">[' + defect + ']</a>' + cell.innerHTML;
+                }
+            }
+            var i = 0;
+            while (i < rows.length) {
+                var tr = rows[i];
+                var marked = tr.getAttribute('data-ejf-sig');
+                if (marked) {                                     // already processed in a previous pass
+                    if (marked !== '0') { tally(marked, tr); }    // ...re-count anchors for the panel
+                    i++;
+                    continue;
+                }
+                if (cellText(tr).indexOf('EXCEPTION #') === -1) { tr.setAttribute('data-ejf-sig', '0'); i++; continue; }
+                // Gather the whole exception block: rows until EXCEPTION END (inclusive) or the next EXCEPTION #.
+                var blockRows = [tr], blockText = cellText(tr), j = i + 1;
+                for (; j < rows.length; j++) {
+                    var t2 = cellText(rows[j]);
+                    if (t2.indexOf('EXCEPTION #') !== -1) { break; }
+                    blockRows.push(rows[j]);
+                    blockText += '\n' + t2;
+                    if (t2.indexOf('EXCEPTION END') !== -1) { j++; break; }
+                }
+                var fp = EJF_SD.logsig._fingerprint(blockText);
+                var defect = (fp.hash && idx.hashMap[fp.hash]) || (fp.sig && idx.sigMap[fp.sig]) || null;
+                // Mark every block row as scanned; only the anchor (first row) carries the defect key.
+                for (var b = 0; b < blockRows.length; b++) {
+                    if (!blockRows[b].getAttribute('data-ejf-sig')) {
+                        blockRows[b].setAttribute('data-ejf-sig', (b === 0 && defect) ? defect : '0');
+                    }
+                }
+                if (defect) { markAnchor(tr, defect); tally(defect, tr, fp.msg); }
+                i = j;
+            }
+            EJF_SD.logsig.renderPanel(found);
+        }).catch(function (e) { console.log('[EJF-SD] log signature apply skipped:', e && e.message || e); });
+    },
+
+    // Match a RAW logs.txt (fetched straight from an EBR's attachments, WITHOUT opening it in the parser)
+    // against the mined fingerprints. The raw log is tab-separated, one record per line:
+    // Time<TAB>Facility<TAB>Type<TAB>Message. We MUST segment it the same way applyToTable segments the
+    // rendered rows, or the fingerprints won't match: (1) work on the MESSAGE column only - otherwise the
+    // timestamps/facilities and every interleaved non-exception log line pollute the stack-frame chain;
+    // (2) bound each exception block at EXCEPTION END (or the next EXCEPTION #) - otherwise one block would
+    // swallow the whole rest of the log (hundreds of unrelated `file.py(NN) func` lines) and the stack
+    // signature would never match the clean one in the index. Resolves to { defect -> { defect, count, msg } }.
+    matchText: function (text) {
+        return EJF_SD.logsig.ensure().then(function (idx) {
+            var found = {};
+            if (!idx || !text) { return found; }
+            // Pull the message column out of every record (everything after the 3rd tab); keep prefix-less
+            // continuation lines as-is. This mirrors what cellText() reads from each rendered row.
+            var lines = text.replace(/\r/g, '').split('\n'), messages = [];
+            for (var li = 0; li < lines.length; li++) {
+                var parts = lines[li].split('\t');
+                messages.push(parts.length >= 4 ? parts.slice(3).join('\t') : lines[li]);
+            }
+            function tallyBlock(blockText) {
+                var fp = EJF_SD.logsig._fingerprint(blockText);
+                var defect = (fp.hash && idx.hashMap[fp.hash]) || (fp.sig && idx.sigMap[fp.sig]) || null;
+                if (!defect) { return; }
+                if (!found[defect]) { found[defect] = { defect: defect, count: 0, msg: fp.msg || '' }; }
+                found[defect].count++;
+                if (!found[defect].msg && fp.msg) { found[defect].msg = fp.msg; }
+            }
+            // Group message lines into exception blocks exactly like applyToTable: EXCEPTION # starts a block,
+            // EXCEPTION END (inclusive) or the next EXCEPTION # ends it.
+            var i = 0;
+            while (i < messages.length) {
+                if (messages[i].indexOf('EXCEPTION #') === -1) { i++; continue; }
+                var blockText = messages[i], j = i + 1;
+                for (; j < messages.length; j++) {
+                    if (messages[j].indexOf('EXCEPTION #') !== -1) { break; }
+                    blockText += '\n' + messages[j];
+                    if (messages[j].indexOf('EXCEPTION END') !== -1) { j++; break; }
+                }
+                tallyBlock(blockText);
+                i = j;
+            }
+            return found;
+        });
+    },
+
+    /* ---- floating "Defects in log" panel ----
+     * Lists every defect whose known exception signature appears in the open log file, with an occurrence
+     * count. Clicking an entry scrolls the log to an occurrence (cycling through them on repeat clicks) and
+     * flashes the row. Mirrors the Similar Defects panel feel: draggable, with position + collapse state
+     * persisted in GM storage. The row highlight + [EDR-x] badge are kept so the scrolled-to row stands out.
+     */
+    POS_KEY: 'logMatchPanelPos',
+    COLLAPSE_KEY: 'logMatchPanelCollapsed',
+    _cssInjected: false,
+    _panelIdx: {},        // defect -> next occurrence index to scroll to (for cycling)
+
+    _injectCss: function () {
+        if (EJF_SD.logsig._cssInjected) { return; }
+        GM_addStyle('\
+#ejf-logmatch-panel { position: fixed; top: 70px; right: 18px; width: 300px; max-height: 70vh; z-index: 9000;\
+  background: #1D2125; color: #e6e6e6; border: 1px solid #3a434d; border-radius: 6px; box-shadow: 0 4px 18px rgba(0,0,0,.45);\
+  font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif; font-size: 12px; display: flex; flex-direction: column; overflow: hidden; }\
+#ejf-logmatch-head { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: #282d33; cursor: move; user-select: none; }\
+#ejf-logmatch-panel.ejf-logmatch-dragging { opacity: .92; }\
+#ejf-logmatch-title { font-weight: 700; flex: 1; }\
+#ejf-logmatch-collapse { cursor: pointer; padding: 0 4px; font-weight: 700; }\
+#ejf-logmatch-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; }\
+#ejf-logmatch-panel.collapsed #ejf-logmatch-list { display: none; }\
+.ejf-logmatch-item { padding: 7px 10px; border-bottom: 1px solid #2c333a; cursor: pointer; }\
+.ejf-logmatch-item:hover { background: #22272b; }\
+.ejf-logmatch-item a { color: #4c9aff; font-weight: 700; text-decoration: none; }\
+.ejf-logmatch-item a:hover { text-decoration: underline; }\
+.ejf-logmatch-count { float: right; background: #3a434d; color: #cfd6dd; border-radius: 8px; padding: 0 7px; font-size: 10px; font-weight: 700; }\
+.ejf-logmatch-sig { margin-top: 3px; color: #9aa6b2; font-family: "Courier New",monospace; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }\
+.ejf-logmatch-flash > td { animation: ejfLogFlash 1.5s ease-out; }\
+@keyframes ejfLogFlash { 0%, 25% { background-color: rgba(255,181,71,.6); } 100% { background-color: transparent; } }');
+        EJF_SD.logsig._cssInjected = true;
+    },
+
+    // Remove the panel once the log viewer is gone (closed / navigated away). Called from the global observer.
+    updateVisibility: function () {
+        var panel = document.getElementById('ejf-logmatch-panel');
+        if (panel && !document.getElementById('tableContent')) { panel.parentNode.removeChild(panel); }
+    },
+
+    renderPanel: function (found) {
+        var keys = Object.keys(found || {});
+        var existing = document.getElementById('ejf-logmatch-panel');
+        if (!keys.length) { if (existing) { existing.parentNode.removeChild(existing); } return; }
+        EJF_SD.logsig._injectCss();
+
+        // Most-frequent first, then by key for a stable order.
+        keys.sort(function (a, b) { return found[b].count - found[a].count || (a < b ? -1 : 1); });
+
+        var panel = existing;
+        if (!panel) {
+            panel = document.createElement('div');
+            panel.id = 'ejf-logmatch-panel';
+            document.body.appendChild(panel);
+        }
+        panel.innerHTML = '';
+        EJF_SD.logsig._panelIdx = {};
+
+        var collapsed = false;
+        try { if (typeof GM_getValue === 'function') { collapsed = !!GM_getValue(EJF_SD.logsig.COLLAPSE_KEY, false); } } catch (e) { collapsed = false; }
+        panel.className = collapsed ? 'collapsed' : '';
+
+        var head = document.createElement('div');
+        head.id = 'ejf-logmatch-head';
+        var title = document.createElement('span');
+        title.id = 'ejf-logmatch-title';
+        title.textContent = 'Defects in log · ' + keys.length;
+        head.appendChild(title);
+        var collapse = document.createElement('span');
+        collapse.id = 'ejf-logmatch-collapse';
+        collapse.title = 'Collapse / expand';
+        collapse.textContent = collapsed ? '+' : '–';
+        head.appendChild(collapse);
+        panel.appendChild(head);
+
+        var listEl = document.createElement('ul');
+        listEl.id = 'ejf-logmatch-list';
+        panel.appendChild(listEl);
+
+        keys.forEach(function (key) {
+            var entry = found[key];
+            var li = document.createElement('li');
+            li.className = 'ejf-logmatch-item';
+            li.title = 'Click to scroll to an occurrence of ' + key + (entry.rows.length > 1 ? ' (click again for the next)' : '');
+
+            var a = document.createElement('a');
+            a.href = '/browse/' + key;
+            a.target = '_blank';
+            a.textContent = key;
+            a.addEventListener('click', function (ev) { ev.stopPropagation(); });   // open the defect, don't scroll
+            li.appendChild(a);
+
+            var badge = document.createElement('span');
+            badge.className = 'ejf-logmatch-count';
+            badge.textContent = entry.count + '×';
+            li.appendChild(badge);
+
+            if (entry.raw) {
+                var sig = document.createElement('div');
+                sig.className = 'ejf-logmatch-sig';
+                sig.textContent = entry.raw;
+                li.appendChild(sig);
+            }
+
+            li.addEventListener('click', function () {
+                var rowsArr = entry.rows;
+                if (!rowsArr.length) { return; }
+                var i = EJF_SD.logsig._panelIdx[key] || 0;
+                if (i >= rowsArr.length) { i = 0; }              // wrap around
+                EJF_SD.logsig._panelIdx[key] = i + 1;
+                var target = rowsArr[i];
+                target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                target.classList.add('ejf-logmatch-flash');
+                setTimeout(function () { target.classList.remove('ejf-logmatch-flash'); }, 1500);
+            });
+
+            // Hover preview: show what the defect is about (same styled card as the Similar Defects panel).
+            li.addEventListener('mouseenter', function () { EJF_SD.logsig._showDefectTip(key, li); });
+            li.addEventListener('mouseleave', function () {
+                EJF_SD.logsig._hoverKey = null;
+                if (EJF_SD.ui && EJF_SD.ui._hideTip) { EJF_SD.ui._hideTip(); }
+            });
+
+            listEl.appendChild(li);
+        });
+
+        collapse.addEventListener('click', function (ev) {
+            ev.stopPropagation();
+            var isCollapsed = panel.classList.toggle('collapsed');
+            collapse.textContent = isCollapsed ? '+' : '–';
+            try { if (typeof GM_setValue === 'function') { GM_setValue(EJF_SD.logsig.COLLAPSE_KEY, isCollapsed); } } catch (e) { /* ignore */ }
+        });
+
+        EJF_SD.logsig._applyPos(panel);
+        EJF_SD.logsig._makeDraggable(panel, head, collapse);
+    },
+
+    // Hover preview for a panel entry: look up the defect in the local DB and show the SAME styled card the
+    // Similar Defects panel uses (key + summary + status/resolution + description), so you can tell what a
+    // logged defect is about without leaving the log. Cached per defect; guarded by _hoverKey so a slow DB
+    // read can't pop a tip after the mouse has already left the row.
+    _defCache: {},
+    _hoverKey: null,
+    _showDefectTip: function (key, anchor) {
+        if (!EJF_SD.ui || !EJF_SD.ui._showTip) { return; }
+        EJF_SD.logsig._hoverKey = key;
+        var show = function (rec) {
+            if (EJF_SD.logsig._hoverKey !== key) { return; }   // mouse already left before the read returned
+            rec = rec || { key: key };
+            var meta = rec.status || '';
+            if (rec.resolution) { meta += (meta ? ' · ' : '') + rec.resolution; }
+            EJF_SD.ui._showTip({ key: rec.key || key, summary: rec.summary, description: rec.description }, anchor, meta);
+        };
+        if (Object.prototype.hasOwnProperty.call(EJF_SD.logsig._defCache, key)) { show(EJF_SD.logsig._defCache[key]); return; }
+        EJF_SD.db.getDefect(key).then(function (rec) {
+            EJF_SD.logsig._defCache[key] = rec || null;
+            show(rec);
+        }, function () { show(null); });
+    },
+
+    // Restore a saved {left, top}, clamped on-screen (same approach as the Similar Defects panel).
+    _applyPos: function (panel) {
+        var pos = null;
+        try { if (typeof GM_getValue === 'function') { pos = GM_getValue(EJF_SD.logsig.POS_KEY, null); } } catch (e) { pos = null; }
+        if (!pos || typeof pos.left !== 'number' || typeof pos.top !== 'number') { return; }
+        var w = panel.offsetWidth || 300, h = panel.offsetHeight || 60;
+        var left = Math.min(Math.max(0, pos.left), Math.max(0, window.innerWidth - w));
+        var top = Math.min(Math.max(0, pos.top), Math.max(0, window.innerHeight - h));
+        panel.style.left = left + 'px';
+        panel.style.top = top + 'px';
+        panel.style.right = 'auto';
+        panel.style.bottom = 'auto';
+    },
+
+    // Drag by the header; persist the dropped position. The collapse control is excluded so it still toggles.
+    _makeDraggable: function (panel, head, collapse) {
+        var dragging = false, startX = 0, startY = 0, baseLeft = 0, baseTop = 0;
+        function onMove(e) {
+            if (!dragging) { return; }
+            var w = panel.offsetWidth, h = panel.offsetHeight;
+            var left = Math.min(Math.max(0, baseLeft + (e.clientX - startX)), Math.max(0, window.innerWidth - w));
+            var top = Math.min(Math.max(0, baseTop + (e.clientY - startY)), Math.max(0, window.innerHeight - h));
+            panel.style.left = left + 'px';
+            panel.style.top = top + 'px';
+            panel.style.right = 'auto';
+            panel.style.bottom = 'auto';
+            e.preventDefault();
+        }
+        function onUp() {
+            if (!dragging) { return; }
+            dragging = false;
+            panel.classList.remove('ejf-logmatch-dragging');
+            document.removeEventListener('mousemove', onMove, true);
+            document.removeEventListener('mouseup', onUp, true);
+            var rect = panel.getBoundingClientRect();
+            try { if (typeof GM_setValue === 'function') { GM_setValue(EJF_SD.logsig.POS_KEY, { left: Math.round(rect.left), top: Math.round(rect.top) }); } } catch (e) { /* ignore */ }
+        }
+        head.addEventListener('mousedown', function (e) {
+            if (e.which && e.which !== 1) { return; }            // left button only
+            if (collapse && e.target === collapse) { return; }   // let the collapse toggle work
+            var rect = panel.getBoundingClientRect();
+            baseLeft = rect.left; baseTop = rect.top;
+            startX = e.clientX; startY = e.clientY;
+            dragging = true;
+            panel.classList.add('ejf-logmatch-dragging');
+            document.addEventListener('mousemove', onMove, true);
+            document.addEventListener('mouseup', onUp, true);
+            e.preventDefault();
+        });
+    }
 };
 
 
@@ -2142,7 +2598,38 @@ EJF_SD.util = {
         return d.getFullYear() + '/' + p(d.getMonth() + 1) + '/' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
     },
 
-    delay: function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+    delay: function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); },
+
+    // True when a defect is effectively resolved/closed. We check BOTH the resolution field (set on any
+    // closed issue) and the status name, because the EVE instance uses custom statuses we can't enumerate.
+    isResolved: function (status, resolution) {
+        if (resolution) { return true; }
+        return /closed|done|resolved|rejected|cancel/i.test(status || '');
+    },
+
+    // Stale-match demotion factor. A defect that was FIXED long before this bug report was even filed is
+    // very unlikely to be the report's real duplicate, so we gently scale its score down with that gap.
+    // Returns { factor (0.5..1), ageDays }. Linear ramp: full weight until `grace` days, decaying to a
+    // 0.5 floor by `full` days. ageDays<=grace (or missing/invalid dates) -> factor 1 (no penalty).
+    staleFactor: function (brCreatedIso, resolutionDateIso) {
+        var GRACE = 30, FULL = 365, FLOOR = 0.5;
+        var created = new Date(brCreatedIso).getTime();
+        var fixed = new Date(resolutionDateIso).getTime();
+        if (isNaN(created) || isNaN(fixed)) { return { factor: 1, ageDays: 0 }; }
+        var ageDays = Math.round((created - fixed) / (1000 * 60 * 60 * 24));
+        if (ageDays <= GRACE) { return { factor: 1, ageDays: ageDays }; }
+        var f = 1 - (1 - FLOOR) * (ageDays - GRACE) / (FULL - GRACE);
+        if (f < FLOOR) { f = FLOOR; }
+        if (f > 1) { f = 1; }
+        return { factor: f, ageDays: ageDays };
+    },
+
+    // Human-friendly age like "8mo" / "2y" / "12d" for the stale-match note.
+    humanizeAge: function (days) {
+        if (days >= 365) { return Math.round(days / 365 * 10) / 10 + 'y'; }
+        if (days >= 60) { return Math.round(days / 30) + 'mo'; }
+        return days + 'd';
+    }
 };
 
 
@@ -2300,6 +2787,7 @@ EJF_SD.sync = {
             description: description,
             status: (f.status && f.status.name) || '',
             resolution: (f.resolution && f.resolution.name) || null,
+            resolutiondate: f.resolutiondate || null,   // when the defect was fixed/closed (for stale-match demotion)
             components: components,
             updated: f.updated || '',
             embedding: null,
@@ -2346,6 +2834,7 @@ EJF_SD.sync = {
                     pages++;
                     EJF_SD.rank._dirty = true;
                     EJF_SD.rank._dirtyVec = true;
+                    if (EJF_SD.logsig) { EJF_SD.logsig._dirty = true; }   // re-mine exception signatures on next log open
                     var nextToken = data.nextPageToken || null;
                     // Persist progress so a reload mid-sync resumes rather than restarting.
                     return EJF_SD.db.setMeta('resumeToken', (data.isLast || !nextToken) ? null : nextToken)
@@ -2504,7 +2993,7 @@ EJF_SD.rank = {
                     if (!seen[tk]) { df[tk] = (df[tk] || 0) + 1; seen[tk] = true; }
                 }
                 totalLen += toks.length;
-                docs.push({ key: rec.key, project: rec.project, summary: rec.summary, status: rec.status, resolution: rec.resolution, tf: tf, len: toks.length });
+                docs.push({ key: rec.key, project: rec.project, summary: rec.summary, status: rec.status, resolution: rec.resolution, resolutiondate: rec.resolutiondate, tf: tf, len: toks.length });
             }
             EJF_SD.rank._index = { N: docs.length, avgdl: docs.length ? (totalLen / docs.length) : 0, df: df, docs: docs };
             EJF_SD.rank._dirty = false;
@@ -2541,7 +3030,7 @@ EJF_SD.rank = {
                     var denom = tf + k1 * (1 - b + b * (doc.len / avgdl));
                     score += idf[terms[q]] * (tf * (k1 + 1)) / denom;
                 }
-                if (score > 0) { scored.push({ key: doc.key, project: doc.project, summary: doc.summary, status: doc.status, resolution: doc.resolution, score: score }); }
+                if (score > 0) { scored.push({ key: doc.key, project: doc.project, summary: doc.summary, status: doc.status, resolution: doc.resolution, resolutiondate: doc.resolutiondate, score: score }); }
             }
             scored.sort(function (a, c) { return c.score - a.score; });
             return scored.slice(0, limit || EJF_SD.TOP_N);
@@ -2564,6 +3053,8 @@ EJF_SD.embed = {
                                 // budget holds real content; raised back to 1500 (~380 tokens) since GPU
                                 // fp32/batch-32 handles it fast. (On the CPU fallback this is slower but the
                                 // single-item path + watchdog keep it safe.)
+    WARM_WAIT_MS: 4200,        // on first render, how long the panel waits for the model to finish loading
+                               // before falling back to instant keyword results (fast/no-op when cached)
     ready: false,              // model pipeline is loaded and usable
     unavailable: false,        // load failed irrecoverably -> stay on BM25
     backend: null,             // 'webgpu/fp16' etc (for diagnostics)
@@ -2808,7 +3299,7 @@ EJF_SD.rank._ensureVecIndex = function () {
         for (var i = 0; i < recs.length; i++) {
             var r = recs[i];
             if (r.embedding && r.embeddingModelVersion === EJF_SD.MODEL_VERSION) {
-                docs.push({ key: r.key, project: r.project, summary: r.summary, status: r.status, resolution: r.resolution, vec: r.embedding });
+                docs.push({ key: r.key, project: r.project, summary: r.summary, status: r.status, resolution: r.resolution, resolutiondate: r.resolutiondate, vec: r.embedding });
             }
         }
         EJF_SD.rank._vecIndex = docs;
@@ -2839,7 +3330,7 @@ EJF_SD.rank._semanticScored = function (qv, excludeKey) {
             if (!isFinite(sc)) { continue; }   // defensively drop any corrupt (NaN/Inf) vector
             scored.push({
                 key: docs[d].key, project: docs[d].project, summary: docs[d].summary,
-                status: docs[d].status, resolution: docs[d].resolution,
+                status: docs[d].status, resolution: docs[d].resolution, resolutiondate: docs[d].resolutiondate,
                 score: sc
             });
         }
@@ -2853,19 +3344,35 @@ EJF_SD.rank._semanticScored = function (qv, excludeKey) {
 // shared terms (item/module names, error strings) that embeddings smooth over are caught by BM25, while
 // paraphrases are caught by the embeddings, so the "obvious" duplicate surfaces far more reliably.
 // Returns { mode: 'Hybrid' | 'Keyword', results: [...] } with a display % already attached to each result.
-EJF_SD.rank.suggestBest = function (text, key) {
+EJF_SD.rank.suggestBest = function (text, key, brCreated) {
+    // Feature A: gently demote a Closed defect that was fixed long before this bug report was filed - it
+    // is very unlikely to be the report's real duplicate. Scales whatever score fields the result carries
+    // (score / rrf / pct) by the age factor and tags it so the panel can grey it and explain why.
+    function demote(r) {
+        if (!brCreated || !r.resolutiondate || !EJF_SD.util.isResolved(r.status, r.resolution)) { return; }
+        var sf = EJF_SD.util.staleFactor(brCreated, r.resolutiondate);
+        if (sf.factor >= 1) { return; }
+        if (typeof r.score === 'number') { r.score *= sf.factor; }
+        if (typeof r.rrf === 'number') { r.rrf *= sf.factor; }
+        if (typeof r.pct === 'number') { r.pct = Math.round(r.pct * sf.factor); }
+        r.stale = true;
+        r.staleNote = 'Closed · fixed ' + EJF_SD.util.humanizeAge(sf.ageDays) + ' before report';
+    }
     function keywordOnly() {
-        return EJF_SD.rank.suggest(text, key, EJF_SD.TOP_N).then(function (list) {
+        // Pull a wider candidate set so the demotion can re-order before we cut to TOP_N (a stale match
+        // shouldn't keep a slot a fresher one deserves).
+        return EJF_SD.rank.suggest(text, key, EJF_SD.rank.CAND).then(function (list) {
+            for (var d = 0; d < list.length; d++) { demote(list[d]); }
+            list.sort(function (a, c) { return c.score - a.score; });
+            list = list.slice(0, EJF_SD.TOP_N);
             var top = (list[0] && list[0].score) || 0;
             for (var i = 0; i < list.length; i++) { list[i].pct = top > 0 ? Math.round(list[i].score / top * 100) : 0; }
             return { mode: 'Keyword', results: list };
         });
     }
-    if (EJF_SD.embed.unavailable || !EJF_SD.embed.ready) {
-        EJF_SD.embed.prepare();   // warm up the model in the background; show keyword results meanwhile
-        return keywordOnly();
-    }
-    return EJF_SD.embed.embedOne(text).then(function (qv) {
+    // Build the HYBRID (semantic + keyword) result set. Called once the embedding model is ready.
+    function hybrid() {
+        return EJF_SD.embed.embedOne(text).then(function (qv) {
         return EJF_SD.rank._semanticScored(qv, key).then(function (sem) {
             if (!sem.length) { return keywordOnly(); }   // nothing embedded yet
             return EJF_SD.rank.suggest(text, key, EJF_SD.rank.CAND).then(function (bm) {
@@ -2880,25 +3387,202 @@ EJF_SD.rank.suggestBest = function (text, key) {
                     var hasCos = (cosByKey[k] !== undefined && isFinite(cosByKey[k]));
                     return {
                         key: k, project: m.project, summary: m.summary, status: m.status, resolution: m.resolution,
+                        resolutiondate: m.resolutiondate,
                         rrf: rrf[k], pct: hasCos ? Math.round(Math.max(0, Math.min(1, cosByKey[k])) * 100) : 0
                     };
                 });
+                for (var s = 0; s < out.length; s++) { demote(out[s]); }   // Feature A: age-demote stale closed matches
                 // RRF decides WHICH results make the cut (so strong keyword hits aren't lost even when their
                 // cosine is middling) - then present those top-N sorted by the displayed similarity % so the
-                // panel reads high-to-low, matching what the user sees.
+                // panel reads high-to-low, matching what the user sees. (Demotion above lowers both rrf and pct
+                // for stale matches, so they fall in the cut AND read lower.)
                 out.sort(function (a, c2) { return c2.rrf - a.rrf; });
                 var topN = out.slice(0, EJF_SD.TOP_N);
                 topN.sort(function (a, c2) { return c2.pct - a.pct; });
                 return { mode: 'Hybrid', results: topN };
             });
         });
-    }).catch(function () {
-        // A query-time embed failed (e.g. a WebGPU device loss while viewing a report). We do NOT auto-switch
-        // to CPU - that's the user's choice via the menu. Just drop the (possibly dead) pipeline so the next
-        // query rebuilds on the same backend, and show keyword results for now.
-        EJF_SD.embed._resetPipe();
-        return keywordOnly();
+        }).catch(function () {
+            // A query-time embed failed (e.g. a WebGPU device loss while viewing a report). We do NOT
+            // auto-switch to CPU - that's the user's choice via the menu. Just drop the (possibly dead)
+            // pipeline so the next query rebuilds on the same backend, and show keyword results for now.
+            EJF_SD.embed._resetPipe();
+            return keywordOnly();
+        });
+    }
+
+    // Model already loaded -> straight to Hybrid. Permanently unavailable -> Keyword only.
+    if (EJF_SD.embed.ready) { return hybrid(); }
+    if (EJF_SD.embed.unavailable) { return keywordOnly(); }
+
+    // Not ready yet: start the background warm-up + embed pass, then give the model a brief window to finish
+    // loading. If it loads in time (fast when the weights are cached), render Hybrid directly and skip the
+    // keyword->hybrid flicker; if it's slow (uncached / first download), show Keyword now and let prepare()'s
+    // re-render upgrade us once the model is ready.
+    EJF_SD.embed.prepare();
+    return new Promise(function (resolve) {
+        var settled = false;
+        var timer = setTimeout(function () {
+            if (settled) { return; }
+            settled = true;
+            resolve(keywordOnly());
+        }, EJF_SD.embed.WARM_WAIT_MS);
+        EJF_SD.embed.load().then(function () {
+            if (settled) { return; }
+            settled = true; clearTimeout(timer);
+            resolve(hybrid());
+        }, function () {
+            if (settled) { return; }
+            settled = true; clearTimeout(timer);
+            resolve(keywordOnly());
+        });
     });
+};
+
+
+/* ---- issue linking: "mark as duplicate" (Feature B) ---- */
+EJF_SD.link = {
+    _info: null,   // cached { name, ebrSide } - the link-type name + which side the EBR goes on
+
+    // Resolve the duplicate link type AND the side the bug report must sit on so the EBR reads "duplicates"
+    // (not "is duplicated by"). Jira links go outward->inward: the outward issue shows the type's `outward`
+    // text. So we find the type where "duplicates" is the outward text (EBR = outward) OR the inward text
+    // (then EBR = inward, so it still reads "duplicates"). The EVE instance uses custom link types and we
+    // can't assume the standard direction, so this is discovered at runtime, cached in memory + GM. (Cache
+    // key is versioned because an earlier build cached only the name and could link the wrong way round.)
+    dupInfo: function () {
+        if (EJF_SD.link._info) { return Promise.resolve(EJF_SD.link._info); }
+        var cached = (typeof GM_getValue === 'function') ? GM_getValue('sdDupLink_v2', null) : null;
+        if (cached && cached.name) { EJF_SD.link._info = cached; return Promise.resolve(cached); }
+        return new Promise(function (resolve) {
+            $.ajax({ url: EJF_SD.HOST + '/rest/api/3/issueLinkType', dataType: 'json' })
+                .done(function (d) {
+                    var types = (d && d.issueLinkTypes) || [];
+                    var info = null;
+                    for (var i = 0; i < types.length && !info; i++) {
+                        var t = types[i];
+                        if (/^duplicates$/i.test(t.outward || '')) { info = { name: t.name, ebrSide: 'outward' }; }
+                        else if (/^duplicates$/i.test(t.inward || '')) { info = { name: t.name, ebrSide: 'inward' }; }
+                    }
+                    if (!info) { info = { name: 'Duplicate', ebrSide: 'outward' }; }   // sensible default
+                    EJF_SD.link._info = info;
+                    try { if (typeof GM_setValue === 'function') { GM_setValue('sdDupLink_v2', info); } } catch (e) { /* ignore */ }
+                    resolve(info);
+                })
+                .fail(function () { resolve({ name: 'Duplicate', ebrSide: 'outward' }); });
+        });
+    },
+
+    // Link `ebrKey` as a duplicate of `otherKey`: the bug report should read "duplicates <defect>". We put
+    // the EBR on whichever side carries the "duplicates" phrasing (see dupInfo). We use a dedicated $.ajax
+    // (not sync._apiPost) because a successful POST /issueLink returns 201 with an EMPTY body, which a json
+    // dataType would mis-treat as a parse error. Resolves on any 2xx; rejects with the HTTP status
+    // (403 ~ missing link permission).
+    markDuplicate: function (ebrKey, otherKey) {
+        return EJF_SD.link.dupInfo().then(function (info) {
+            var body = { type: { name: info.name } };
+            // NOTE: on this instance the issue placed as `outwardIssue` ends up DISPLAYING the type's INWARD
+            // text (and vice-versa) - the opposite of the documented direction. So to make the EBR read
+            // "duplicates", we put the EBR on the side OPPOSITE its dupInfo `ebrSide`.
+            if (info.ebrSide === 'inward') {
+                body.outwardIssue = { key: ebrKey }; body.inwardIssue = { key: otherKey };
+            } else {
+                body.inwardIssue = { key: ebrKey }; body.outwardIssue = { key: otherKey };
+            }
+            return new Promise(function (resolve, reject) {
+                $.ajax({
+                    url: EJF_SD.HOST + '/rest/api/3/issueLink',
+                    type: 'POST',
+                    contentType: 'application/json',
+                    headers: { 'X-Atlassian-Token': 'no-check' },
+                    data: JSON.stringify(body)
+                }).done(function () { resolve(); })
+                  .fail(function (xhr) {
+                      // A successful POST /issueLink is 201 with an EMPTY body; jQuery then fires `fail` with
+                      // a "parsererror" even though the link was created. Treat any 2xx as success.
+                      if (xhr.status >= 200 && xhr.status < 300) { resolve(); return; }
+                      reject(new Error('HTTP ' + xhr.status + (xhr.status === 403 ? ' (no link permission?)' : '')));
+                  });
+            });
+        });
+    },
+
+    // Build the issuelinks "add" operation for a transition `update`, so the EBR (the implicit current
+    // issue being transitioned) reads "duplicates" the defect. On this instance the displayed text is the
+    // OPPOSITE side from where the OTHER issue is placed, so we put the defect on the SAME side that carries
+    // the "duplicates" phrasing (dupInfo `ebrSide`).
+    _dupAddOp: function (info, otherKey) {
+        var add = { type: { name: info.name } };
+        if (info.ebrSide === 'outward') { add.outwardIssue = { key: otherKey }; }
+        else { add.inwardIssue = { key: otherKey }; }
+        return { add: add };
+    },
+
+    // One-shot "mark as duplicate": move the EBR to `statusName` (e.g. "Attached"), set the Resolution, AND
+    // add the duplicate link to the defect - all in the SINGLE transition POST, because the Attached
+    // transition screen exposes both Resolution and Linked Issues fields. This avoids the separate
+    // /issueLink call (and its 201-empty-body quirk) and keeps everything in one place.
+    // Graceful fallbacks: if the transition screen has no Linked Issues field we transition, then create the
+    // link separately; if there's no such transition at all we just create the link. Resolves with
+    // { attached: bool, linked: bool }.
+    attachDuplicate: function (ebrKey, otherKey, statusName, preferredResolution) {
+        return EJF_SD.link.dupInfo().then(function (info) {
+            return new Promise(function (resolve, reject) {
+                $.ajax({ url: EJF_SD.HOST + '/rest/api/3/issue/' + ebrKey + '/transitions?expand=transitions.fields', dataType: 'json' })
+                    .done(function (d) {
+                        var trans = (d && d.transitions) || [];
+                        var want = (statusName || '').toLowerCase(), t = null;
+                        for (var i = 0; i < trans.length; i++) {
+                            var toName = (trans[i].to && trans[i].to.name || '').toLowerCase();
+                            var trName = (trans[i].name || '').toLowerCase();
+                            if (toName === want || trName === want) { t = trans[i]; break; }
+                        }
+                        // No such transition from the current state -> just create the link on its own.
+                        if (!t) {
+                            EJF_SD.link.markDuplicate(ebrKey, otherKey)
+                                .then(function () { resolve({ attached: false, linked: true }); }, reject);
+                            return;
+                        }
+                        var payload = { transition: { id: t.id } };
+                        // Resolution field on the screen: prefer the requested one (e.g. "Duplicate"), else
+                        // the first allowed value when it's required.
+                        var rf = t.fields && t.fields.resolution;
+                        if (rf) {
+                            var allowed = rf.allowedValues || [], chosen = null, pref = (preferredResolution || '').toLowerCase();
+                            for (var a = 0; a < allowed.length; a++) {
+                                if (pref && (allowed[a].name || '').toLowerCase() === pref) { chosen = allowed[a]; break; }
+                            }
+                            if (!chosen && rf.required && allowed.length) { chosen = allowed[0]; }
+                            if (chosen) { payload.fields = { resolution: { id: chosen.id } }; }
+                        }
+                        // Linked Issues field on the screen: add the duplicate link inline (single call).
+                        var hasLinkField = !!(t.fields && t.fields.issuelinks);
+                        if (hasLinkField) { payload.update = { issuelinks: [ EJF_SD.link._dupAddOp(info, otherKey) ] }; }
+
+                        function done2xx() {
+                            if (hasLinkField) { resolve({ attached: true, linked: true }); return; }
+                            // Screen didn't carry the link field -> transition done, now link separately.
+                            EJF_SD.link.markDuplicate(ebrKey, otherKey)
+                                .then(function () { resolve({ attached: true, linked: true }); },
+                                      function () { resolve({ attached: true, linked: false }); });
+                        }
+                        $.ajax({
+                            url: EJF_SD.HOST + '/rest/api/3/issue/' + ebrKey + '/transitions',
+                            type: 'POST',
+                            contentType: 'application/json',
+                            headers: { 'X-Atlassian-Token': 'no-check' },
+                            data: JSON.stringify(payload)
+                        }).done(done2xx)
+                          .fail(function (xhr) {
+                              // A successful transition is 204 (empty body) -> jQuery "parsererror"; treat 2xx as success.
+                              if (xhr.status >= 200 && xhr.status < 300) { done2xx(); return; }
+                              reject(new Error('transition HTTP ' + xhr.status));
+                          });
+                    })
+                    .fail(function (xhr) { reject(new Error('transitions HTTP ' + xhr.status)); });
+            });
+        });
+    }
 };
 
 
@@ -2923,11 +3607,42 @@ EJF_SD.ui = {
 #ejf-sd-list a:hover { text-decoration: underline; }\
 .ejf-sd-proj { font-size: 10px; background: #3a434d; padding: 0 5px; border-radius: 7px; margin-left: 6px; }\
 .ejf-sd-score { float: right; color: #7a8694; font-size: 10px; }\
+.ejf-sd-link { float: right; margin-right: 8px; font-size: 10px; color: #9fb4cc; cursor: pointer; user-select: none; }\
+.ejf-sd-link:hover { color: #4c9aff; text-decoration: underline; }\
+.ejf-sd-link.ejf-sd-linking { color: #7a8694; cursor: default; text-decoration: none; }\
+.ejf-sd-link.ejf-sd-linked { color: #4caf7d; cursor: default; text-decoration: none; }\
+.ejf-sd-list li.ejf-sd-stale { opacity: .6; }\
 .ejf-sd-sum { margin-top: 2px; color: #e6e6e6; }\
 .ejf-sd-meta { margin-top: 2px; color: #7a8694; font-size: 10px; }\
-#ejf-sd-panel.collapsed #ejf-sd-status, #ejf-sd-panel.collapsed #ejf-sd-list { display: none; }\
+#ejf-sd-loglink { display: none; padding: 6px 10px; border-bottom: 1px solid #2c333a; background: #20262b; }\
+#ejf-sd-loglink.has-hits { display: block; }\
+#ejf-sd-loglink .ejf-sd-loglink-head { font-weight: 700; color: #ffb547; font-size: 11px; margin-bottom: 4px; }\
+#ejf-sd-loglink ul { list-style: none; margin: 0; padding: 0; }\
+#ejf-sd-loglink li { padding: 3px 0; cursor: default; }\
+#ejf-sd-loglink a { color: #4c9aff; font-weight: 700; text-decoration: none; }\
+#ejf-sd-loglink a:hover { text-decoration: underline; }\
+#ejf-sd-loglink .count { color: #cfd6dd; background: #3a434d; border-radius: 8px; padding: 0 7px; font-size: 10px; font-weight: 700; margin-left: 6px; }\
+#ejf-sd-panel.collapsed #ejf-sd-status, #ejf-sd-panel.collapsed #ejf-sd-loglink, #ejf-sd-panel.collapsed #ejf-sd-list { display: none; }\
 #ejf-sd-toast { position: fixed; right: 18px; bottom: 18px; z-index: 9001; background: #333; color: #eee; padding: 8px 14px;\
-  border-radius: 6px; box-shadow: 0 4px 18px rgba(0,0,0,.45); font-family: -apple-system,Arial,sans-serif; font-size: 12px; max-width: 320px; }',
+  border-radius: 6px; box-shadow: 0 4px 18px rgba(0,0,0,.45); font-family: -apple-system,Arial,sans-serif; font-size: 12px; max-width: 320px; }\
+#ejf-sd-tip { position: fixed; z-index: 9002; display: none; width: 420px; max-height: 60vh; overflow-y: auto;\
+  background: #14181b; color: #e6e6e6; border: 1px solid #3a434d; border-radius: 6px; box-shadow: 0 6px 24px rgba(0,0,0,.55);\
+  padding: 10px 12px; font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif; font-size: 12px; line-height: 1.45; pointer-events: none; }\
+#ejf-sd-tip .ejf-sd-tip-title { font-weight: 700; color: #fff; margin-bottom: 4px; }\
+#ejf-sd-tip .ejf-sd-tip-meta { color: #9fb4cc; font-size: 10px; margin-bottom: 6px; }\
+#ejf-sd-tip .ejf-sd-tip-desc { color: #cfd6dd; white-space: pre-wrap; word-break: break-word; }\
+#ejf-sd-tip .ejf-sd-tip-dim { color: #7a8694; font-style: italic; }\
+#ejf-sd-tip .ejf-sd-tip-html { white-space: normal; }\
+#ejf-sd-tip .ejf-sd-tip-html p { margin: 0 0 8px; }\
+#ejf-sd-tip .ejf-sd-tip-html p:last-child { margin-bottom: 0; }\
+#ejf-sd-tip .ejf-sd-tip-html ul, #ejf-sd-tip .ejf-sd-tip-html ol { margin: 4px 0; padding-left: 18px; }\
+#ejf-sd-tip .ejf-sd-tip-html h1, #ejf-sd-tip .ejf-sd-tip-html h2, #ejf-sd-tip .ejf-sd-tip-html h3, #ejf-sd-tip .ejf-sd-tip-html h4 { font-size: 12px; font-weight: 700; color: #fff; margin: 8px 0 4px; }\
+#ejf-sd-tip .ejf-sd-tip-html pre { white-space: pre-wrap; word-break: break-word; background: #0f1316; border: 1px solid #2c333a; border-radius: 4px; padding: 6px 8px; margin: 6px 0; font-family: "Courier New",monospace; font-size: 11px; }\
+#ejf-sd-tip .ejf-sd-tip-html code { font-family: "Courier New",monospace; }\
+#ejf-sd-tip .ejf-sd-tip-html img { max-width: 100%; height: auto; }\
+#ejf-sd-tip .ejf-sd-tip-html a { color: #4c9aff; }\
+#ejf-sd-tip .ejf-sd-tip-html table { border-collapse: collapse; margin: 6px 0; }\
+#ejf-sd-tip .ejf-sd-tip-html th, #ejf-sd-tip .ejf-sd-tip-html td { border: 1px solid #2c333a; padding: 2px 6px; }',
 
     injectCss: function () {
         if (!EJF_SD.ui._cssInjected) { GM_addStyle(EJF_SD.ui.css); EJF_SD.ui._cssInjected = true; }
@@ -2944,6 +3659,108 @@ EJF_SD.ui = {
     },
 
     setStatus: function (msg) { $('#ejf-sd-status').text(msg); },
+
+    // Soft-refresh the open issue after a "Mark dup": patch the status lozenge text in place instead of a
+    // full page reload (Jira's SPA exposes no clean "refetch this issue" hook). Mirrors how the GM / Close
+    // buttons update fields in the DOM. Returns true if it found and updated the status; false otherwise so
+    // the caller can fall back to a full reload. (The new duplicate link is created server-side and shows in
+    // the Linked Issues section on the next natural refresh.)
+    softRefreshStatus: function (statusName) {
+        if (!statusName) { return false; }
+        var $wrap = $("div[data-testid='issue.views.issue-base.foundation.status.status-field-wrapper']");
+        var $btn = $wrap.find('button').first();
+        if (!$btn.length) { return false; }
+        // The lozenge renders the status as a leaf text node inside the trigger button; replace it.
+        var $leaf = $btn.find('*').filter(function () { return this.children.length === 0 && $.trim(this.textContent).length; }).first();
+        if ($leaf.length) { $leaf.text(statusName); } else { $btn.text(statusName); }
+        return true;
+    },
+
+    // Feature C: a styled hover card for a suggestion. Shows the key + summary, status/resolution/stale note,
+    // and the full description (which includes the reproduction steps), positioned beside the hovered row and
+    // clamped to the viewport. Richer + wider than a native title tooltip, and scrollable for long text.
+    // Place the (already-populated) tip beside the anchor row: prefer the left of the panel, flip to the
+    // right if there isn't room, and clamp vertically so it never spills off-screen. Re-run after the
+    // formatted description loads, since the height changes.
+    _positionTip: function ($tip, anchor) {
+        $tip.css({ display: 'block', visibility: 'hidden' });
+        var el = $tip[0], rect = anchor.getBoundingClientRect();
+        var tipW = el.offsetWidth, tipH = el.offsetHeight;
+        var left = rect.left - tipW - 10;
+        if (left < 6) { left = rect.right + 10; }
+        if (left + tipW > window.innerWidth - 6) { left = Math.max(6, window.innerWidth - tipW - 6); }
+        var top = rect.top;
+        if (top + tipH > window.innerHeight - 6) { top = window.innerHeight - tipH - 6; }
+        if (top < 6) { top = 6; }
+        $tip.css({ left: left + 'px', top: top + 'px', visibility: 'visible' });
+    },
+
+    // Fetch (and cache) the issue's description as Jira-RENDERED HTML, so the hover card keeps the original
+    // formatting (paragraphs, lists, code blocks) instead of the flattened single-line text we store for
+    // ranking. Same-origin GET with the session cookie. Resolves to an HTML string ('' if none); a network
+    // failure resolves '' WITHOUT caching so the next hover retries.
+    _renderedCache: {},
+    _getRendered: function (key) {
+        if (Object.prototype.hasOwnProperty.call(EJF_SD.ui._renderedCache, key)) {
+            return Promise.resolve(EJF_SD.ui._renderedCache[key]);
+        }
+        return new Promise(function (resolve) {
+            $.ajax({ url: EJF_SD.HOST + '/rest/api/2/issue/' + key + '?fields=description&expand=renderedFields', dataType: 'json' })
+                .done(function (d) {
+                    var html = (d && d.renderedFields && d.renderedFields.description) || '';
+                    EJF_SD.ui._renderedCache[key] = html;
+                    resolve(html);
+                })
+                .fail(function () { resolve(''); });
+        });
+    },
+
+    // Feature C: a styled hover card for a suggestion. Shows the key + summary + status/resolution/stale note,
+    // and the defect description WITH its original formatting (fetched as rendered HTML from Jira). The
+    // flattened stored text is shown instantly as a placeholder, then upgraded to the formatted version when
+    // the fetch returns. _tipKey guards the async swap so a slow fetch can't replace a tip we've moved off of.
+    _tipKey: null,
+    _showTip: function (r, anchor, meta) {
+        EJF_SD.ui.injectCss();
+        EJF_SD.ui._tipKey = r.key;
+        var $tip = $('#ejf-sd-tip');
+        if (!$tip.length) { $tip = $('<div id="ejf-sd-tip"></div>').appendTo(document.body); }
+        $tip.empty();
+        $('<div class="ejf-sd-tip-title"></div>').text(r.key + ' — ' + (r.summary || '')).appendTo($tip);
+        if (meta) { $('<div class="ejf-sd-tip-meta"></div>').text(meta).appendTo($tip); }
+        var $desc = $('<div class="ejf-sd-tip-desc"></div>').appendTo($tip);
+
+        function paintHtml($el, htmlStr) {
+            // Jira's own rendered HTML; strip any <script>/<style> defensively before injecting.
+            var clean = String(htmlStr).replace(/<script[\s\S]*?<\/script>/gi, '').replace(/<style[\s\S]*?<\/style>/gi, '');
+            $el.removeClass('ejf-sd-tip-dim').addClass('ejf-sd-tip-html').html(clean);
+        }
+
+        var cached = EJF_SD.ui._renderedCache[r.key];
+        if (typeof cached === 'string') {
+            if (cached) { paintHtml($desc, cached); }
+            else { $desc.addClass('ejf-sd-tip-dim').text('(no description)'); }
+            EJF_SD.ui._positionTip($tip, anchor);
+            return;
+        }
+
+        // Placeholder: the flattened stored text, shown immediately so there's no hover lag.
+        var flat = (r.description || '').replace(/\s+/g, ' ').trim();
+        if (flat) { $desc.text(flat); } else { $desc.addClass('ejf-sd-tip-dim').text('Loading…'); }
+        EJF_SD.ui._positionTip($tip, anchor);
+
+        EJF_SD.ui._getRendered(r.key).then(function (htmlStr) {
+            if (EJF_SD.ui._tipKey !== r.key) { return; }   // mouse moved to another row already
+            var $live = $('#ejf-sd-tip');
+            var $d = $live.find('.ejf-sd-tip-desc');
+            if (!$d.length) { return; }
+            if (htmlStr) { paintHtml($d, htmlStr); }
+            else if (!flat) { $d.addClass('ejf-sd-tip-dim').text('(no description)'); }
+            EJF_SD.ui._positionTip($live, anchor);
+        });
+    },
+
+    _hideTip: function () { EJF_SD.ui._tipKey = null; $('#ejf-sd-tip').css('display', 'none'); },
 
     POS_KEY: 'sdPanelPos',         // GM flag holding the user's chosen panel position { left, top }
     COLLAPSE_KEY: 'sdPanelCollapsed',  // GM flag holding whether the panel is minimized (collapsed)
@@ -3034,6 +3851,7 @@ EJF_SD.ui = {
             '  <div id="ejf-sd-head"><span id="ejf-sd-title">Similar defects</span>' +
             '    <span id="ejf-sd-mode">Keyword</span><span id="ejf-sd-collapse" title="Collapse / expand">–</span></div>' +
             '  <div id="ejf-sd-status"></div>' +
+            '  <div id="ejf-sd-loglink"></div>' +
             '  <ul id="ejf-sd-list"></ul>' +
             '</div>'
         );
@@ -3053,14 +3871,64 @@ EJF_SD.ui = {
         EJF_SD.ui.updateVisibility();     // stay hidden if an attachment viewer is already open
     },
 
+    // Feature B: build a "Mark dup" control that links the open EBR as a duplicate of `defectKey` and moves
+    // it to Attached (status + resolution + link in one transition). Shared by the suggestions list AND the
+    // "Known defects in attached log" section so both behave identically.
+    _markDupButton: function (defectKey) {
+        var $dup = $('<span class="ejf-sd-link"></span>')
+            .text('Mark dup')
+            .attr('title', 'Link this bug report as a duplicate of ' + defectKey);
+        $dup.on('click', function (ev) {
+            ev.preventDefault();
+            ev.stopPropagation();
+            var $btn = $(this);
+            if ($btn.hasClass('ejf-sd-linked') || $btn.hasClass('ejf-sd-linking')) { return; }
+            var ebr = EJF_SD.ui.currentKey;
+            if (!ebr) { return; }
+            if (!confirm('Link ' + ebr + ' as a duplicate of ' + defectKey + ' and set it to Attached?')) { return; }
+            $btn.addClass('ejf-sd-linking').text('…');
+            // Single call: the Attached transition sets the status, resolution AND the duplicate link at once.
+            EJF_SD.link.attachDuplicate(ebr, defectKey, 'Attached', 'Duplicate').then(function (res) {
+                EJF_SD.ui._hideTip();
+                $btn.removeClass('ejf-sd-linking').addClass('ejf-sd-linked').text(res.attached ? '✓ attached' : '✓ linked');
+                var msg = res.attached
+                    ? ('Linked ' + ebr + ' as a duplicate of ' + defectKey + ' and set it to Attached.')
+                    : ('Linked ' + ebr + ' as a duplicate of ' + defectKey + ' (could not set Attached).');
+                if (!res.linked) { msg = 'Set ' + ebr + ' to Attached, but the duplicate link failed.'; }
+                // Patch the status lozenge in place rather than reloading the whole page. If we can't find it,
+                // fall back to a full reload so the change is still reflected. (The new link appears in the
+                // Linked Issues section on the next natural refresh.)
+                var patched = res.attached ? EJF_SD.ui.softRefreshStatus('Attached') : false;
+                if (res.attached && !patched) {
+                    EJF_SD.ui.toast(msg + ' Reloading…');
+                    setTimeout(function () { window.location.reload(false); }, 1200);
+                } else {
+                    EJF_SD.ui.toast(msg);
+                }
+            }, function (e) {
+                $btn.removeClass('ejf-sd-linking').text('Mark dup');
+                EJF_SD.ui.toast('Could not link: ' + (e && e.message || e));
+            });
+        });
+        return $dup;
+    },
+
     _item: function (r) {
         var pct = (typeof r.pct === 'number') ? r.pct : 0; // display % is computed per-mode in render()
         var meta = r.status || '';
         if (r.resolution) { meta += (meta ? ' · ' : '') + r.resolution; }
+        if (r.staleNote) { meta += (meta ? ' · ' : '') + r.staleNote; }   // Feature A: explain the demotion
         var $li = $('<li></li>');
+        if (r.stale) { $li.addClass('ejf-sd-stale'); }                    // Feature A: grey out stale-closed matches
+        // Feature C: hover preview - a styled card (built in _showTip) showing the summary, full description
+        // (incl. reproduction steps) and status, so the triager can judge a match without navigating.
+        $li.on('mouseenter', function () { EJF_SD.ui._showTip(r, this, meta); });
+        $li.on('mouseleave', function () { EJF_SD.ui._hideTip(); });
         $('<a></a>').attr('href', '/browse/' + r.key).attr('target', '_self').text(r.key).appendTo($li);
         $('<span class="ejf-sd-proj"></span>').text(r.project || '').appendTo($li);
         $('<span class="ejf-sd-score"></span>').text(pct + '%').appendTo($li);
+        // Feature B: one-click "mark this bug report as a duplicate of that defect" (links the open EBR to r.key).
+        EJF_SD.ui._markDupButton(r.key).appendTo($li);
         $('<div class="ejf-sd-sum"></div>').text(r.summary || '').appendTo($li);
         if (meta) { $('<div class="ejf-sd-meta"></div>').text(meta).appendTo($li); }
         return $li;
@@ -3086,8 +3954,127 @@ EJF_SD.ui = {
         });
     },
 
+    // Fetch (and cache per key) the open bug report's creation date, used by the stale-match demotion to
+    // compare against a candidate defect's fix date. Resolves to an ISO string, or null if unavailable.
+    _createdCache: {},
+    _getCreated: function (key) {
+        if (Object.prototype.hasOwnProperty.call(EJF_SD.ui._createdCache, key)) {
+            return Promise.resolve(EJF_SD.ui._createdCache[key]);
+        }
+        return new Promise(function (resolve) {
+            $.ajax({ url: EJF_SD.HOST + '/rest/api/2/issue/' + key + '?fields=created', dataType: 'json' })
+                .done(function (d) {
+                    var created = (d && d.fields && d.fields.created) || null;
+                    EJF_SD.ui._createdCache[key] = created;
+                    resolve(created);
+                })
+                .fail(function () { EJF_SD.ui._createdCache[key] = null; resolve(null); });
+        });
+    },
+
+    // Scan THIS bug report's attached log file(s) for known defect signatures, without the user opening the
+    // log. Lists the issue's attachments, fetches each log*.txt as text, and runs the same stack-fingerprint
+    // matching. Resolves to { defect -> { defect, count, msg } }, cached per key. Fetching attachment content
+    // goes through Jira's media redirect, which may be CORS-blocked in some setups - any failure just yields
+    // no hits (the section stays hidden), never an error.
+    // Fetch an attachment's text. Prefer GM_xmlhttpRequest, which bypasses the CORS block a same-origin XHR
+    // hits when Jira's attachment-content endpoint 30x-redirects to its media host. Falls back to $.ajax if
+    // GM_xmlhttpRequest isn't granted. Always resolves to a string ('' on any failure) so a hung/blocked
+    // fetch can never stall the scan.
+    _fetchText: function (url) {
+        return new Promise(function (resolve) {
+            if (typeof GM_xmlhttpRequest === 'function') {
+                try {
+                    GM_xmlhttpRequest({
+                        method: 'GET',
+                        url: url,
+                        onload: function (resp) { resolve((resp && resp.responseText) || ''); },
+                        onerror: function () { resolve(''); },
+                        ontimeout: function () { resolve(''); }
+                    });
+                    return;
+                } catch (e) { /* fall through to $.ajax */ }
+            }
+            $.ajax({ url: url, dataType: 'text' })
+                .done(function (t) { resolve(t || ''); })
+                .fail(function () { resolve(''); });
+        });
+    },
+
+    _logScanCache: {},
+    scanIssueLog: function (key) {
+        if (Object.prototype.hasOwnProperty.call(EJF_SD.ui._logScanCache, key)) {
+            return Promise.resolve(EJF_SD.ui._logScanCache[key]);
+        }
+        return new Promise(function (resolve) {
+            $.ajax({ url: EJF_SD.HOST + '/rest/api/3/issue/' + key + '?fields=attachment', dataType: 'json' })
+                .done(function (d) {
+                    var atts = (d && d.fields && d.fields.attachment) || [];
+                    var logs = [];
+                    for (var i = 0; i < atts.length; i++) {
+                        var fn = atts[i].filename || '';
+                        if (/\.txt$/i.test(fn) && /log/i.test(fn) && atts[i].content) { logs.push(atts[i]); }
+                    }
+                    if (!logs.length) { EJF_SD.ui._logScanCache[key] = {}; resolve({}); return; }
+                    console.log('[EJF-SD] log scan ' + key + ': ' + logs.length + ' log attachment(s)');
+                    var merged = {}, pending = logs.length;
+                    function mergeFound(found) {
+                        Object.keys(found || {}).forEach(function (k) {
+                            if (!merged[k]) { merged[k] = { defect: k, count: 0, msg: found[k].msg }; }
+                            merged[k].count += found[k].count;
+                            if (!merged[k].msg && found[k].msg) { merged[k].msg = found[k].msg; }
+                        });
+                        if (--pending === 0) {
+                            console.log('[EJF-SD] log scan ' + key + ': ' + Object.keys(merged).length + ' known defect(s) matched');
+                            EJF_SD.ui._logScanCache[key] = merged;
+                            resolve(merged);
+                        }
+                    }
+                    logs.forEach(function (att) {
+                        EJF_SD.ui._fetchText(att.content).then(function (txt) {
+                            if (!txt) { mergeFound({}); return; }
+                            EJF_SD.logsig.matchText(txt).then(mergeFound, function () { mergeFound({}); });
+                        }, function () { mergeFound({}); });
+                    });
+                })
+                .fail(function () { EJF_SD.ui._logScanCache[key] = {}; resolve({}); });
+        });
+    },
+
+    // Populate the "Known defects in attached log" section of the panel (hidden unless there are hits). Each
+    // entry links to the defect and reuses the same hover-preview card as the suggestions.
+    renderLogLink: function (key) {
+        var $box = $('#ejf-sd-loglink');
+        if (!$box.length) { return; }
+        $box.removeClass('has-hits').empty();
+        EJF_SD.db.countDefects().then(function (n) {
+            if (!n) { return; }   // no local data to match against yet
+            EJF_SD.ui.scanIssueLog(key).then(function (found) {
+                if (EJF_SD.ui.currentKey !== key) { return; }   // navigated to another issue meanwhile
+                var keys = Object.keys(found || {});
+                if (!keys.length) { return; }
+                keys.sort(function (a, b) { return found[b].count - found[a].count || (a < b ? -1 : 1); });
+                var $b = $('#ejf-sd-loglink');
+                $b.empty();
+                $('<div class="ejf-sd-loglink-head"></div>').text('⚠ Known defects in attached log (' + keys.length + ')').appendTo($b);
+                var $ul = $('<ul></ul>').appendTo($b);
+                keys.forEach(function (k) {
+                    var $li = $('<li></li>');
+                    $('<a></a>').attr('href', '/browse/' + k).attr('target', '_blank').text(k).appendTo($li);
+                    EJF_SD.ui._markDupButton(k).appendTo($li);   // same one-click "Mark dup" as the suggestions
+                    $('<span class="count"></span>').text(found[k].count + '×').appendTo($li);
+                    $li.on('mouseenter', function () { EJF_SD.logsig._showDefectTip(k, this); });
+                    $li.on('mouseleave', function () { EJF_SD.logsig._hoverKey = null; if (EJF_SD.ui._hideTip) { EJF_SD.ui._hideTip(); } });
+                    $ul.append($li);
+                });
+                $b.addClass('has-hits');
+            });
+        });
+    },
+
     render: function (key) {
         EJF_SD.ui._ensurePanel();
+        EJF_SD.ui.renderLogLink(key);   // scan the attached log for known defects (no need to open it)
         $('#ejf-sd-list').empty();
         EJF_SD.ui.setStatus('Finding similar defects…');
         EJF_SD.ui.getIssueText(key).then(function (text) {
@@ -3097,13 +4084,25 @@ EJF_SD.ui = {
                     return;
                 }
                 if (!text) { EJF_SD.ui.setStatus('Could not read this issue’s text.'); return; }
-                return EJF_SD.rank.suggestBest(text, key).then(function (out) {
+                return EJF_SD.ui._getCreated(key).then(function (brCreated) {
+                return EJF_SD.rank.suggestBest(text, key, brCreated).then(function (out) {
                     var results = out.results || [];
                     $('#ejf-sd-mode').text(out.mode);   // 'Hybrid' or 'Keyword'
                     if (!results.length) { EJF_SD.ui.setStatus('No similar defects found (' + n + ' indexed).'); return; }
                     EJF_SD.ui.setStatus(results.length + ' suggestions · ' + out.mode + ' · ' + n + ' indexed');
-                    var $list = $('#ejf-sd-list');
-                    for (var i = 0; i < results.length; i++) { $list.append(EJF_SD.ui._item(results[i])); }
+                    // Feature C: enrich the displayed results with each defect's full description (which
+                    // includes the reproduction steps) for the hover tooltip. Only a handful of indexed-DB
+                    // reads (just the shown results), so it's cheap.
+                    return Promise.all(results.map(function (r) {
+                        return EJF_SD.db.getDefect(r.key).then(function (rec) {
+                            if (rec) { r.description = rec.description; }
+                            return r;
+                        }, function () { return r; });
+                    })).then(function () {
+                        var $list = $('#ejf-sd-list');
+                        for (var i = 0; i < results.length; i++) { $list.append(EJF_SD.ui._item(results[i])); }
+                    });
+                });
                 });
             });
         }).catch(function (e) { EJF_SD.ui.setStatus('Error: ' + (e && e.message || e)); });
@@ -3199,6 +4198,7 @@ EJF_SD.sched = {
             scheduled = false;
             try { EJF_SD.ui.ensure(); } catch (e) { /* swallow */ }
             try { EJF_SD.ui.updateVisibility(); } catch (e2) { /* swallow */ }   // hide while an attachment viewer is open
+            try { EJF_SD.logsig.updateVisibility(); } catch (e3) { /* swallow */ }   // drop the "Defects in log" panel once the log viewer closes
         }, 300);
     });
     observer.observe(document.body, { childList: true, subtree: true });
