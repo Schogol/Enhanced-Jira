@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.10.1
+// @version     2.11.0
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -28,7 +28,7 @@
 
 
 // Creating various variables which we use later on
-var rows, oc, lc, pdm, pdmdata, driverAge = "unknown", menu_parser, menu_scrollbar, menu_dropdowns, menu_buttons, menu_darkmode, menu_similarDefects, menu_sdSync, menu_sdRebuild, menu_sdBackend, menu_sdSyncEbr;
+var rows, oc, lc, pdm, pdmdata, driverAge = "unknown", menu_settings, menu_parser, menu_scrollbar, menu_dropdowns, menu_buttons, menu_similarDefects, menu_sdSync, menu_sdRebuild, menu_sdBackend, menu_sdSyncEbr;
 
 
 // Current Date
@@ -124,93 +124,12 @@ if (savedVariables[2][1]) {
 };
 
 
-// Add menu command that will allow to toggle On/Off the Log Parser.
-if (savedVariables[1][1]) {
-    menu_parser = GM_registerMenuCommand ("Disable Log Parser", toggleParser);
-}
-else {
-    menu_parser = GM_registerMenuCommand ("Enable Log Parser", toggleParser);
-}
-
-
-
-// Add menu command that will allow to toggle On/Off the custom scrollbar.
-if (savedVariables[2][1]) {
-    menu_scrollbar = GM_registerMenuCommand ("Disable Custom Scrollbar", toggleScrollbar);
-}
-else {
-    menu_scrollbar = GM_registerMenuCommand ("Enable Custom Scrollbar", toggleScrollbar);
-}
-
-
-
-// Add menu command that will allow to toggle On/Off the dropdown lists on Linked Issues.
-if (savedVariables[3][1]) {
-    menu_dropdowns = GM_registerMenuCommand ("Disable Linked Issue Dropdowns", toggleDropdown);
-}
-else {
-    menu_dropdowns = GM_registerMenuCommand ("Enable Linked Issue Dropdowns", toggleDropdown);
-}
-
-
-
-// Add menu command that will allow to toggle On/Off the extra buttons on bug reports.
-if (savedVariables[4][1]) {
-    menu_buttons = GM_registerMenuCommand ("Disable Extra Buttons", toggleButtons);
-}
-else {
-    menu_buttons = GM_registerMenuCommand ("Enable Extra Buttons", toggleButtons);
-}
-
-
-
-// Add menu command that will allow to toggle On/Off the "Similar Defects" suggestions on bug reports.
-if (savedVariables[5][1]) {
-    menu_similarDefects = GM_registerMenuCommand ("Disable Similar Defects (Beta)", toggleSimilarDefects);
-}
-else {
-    menu_similarDefects = GM_registerMenuCommand ("Enable Similar Defects (Beta)", toggleSimilarDefects);
-}
-
-// Action commands for the Similar Defects local database. Shown only while the feature is enabled, and
-// managed by refreshMenu (registerSimilarDefectActions) so they survive the disable/re-enable cycle - if
-// they were registered only once here they would be dropped when refreshMenu rebuilds the menu. The
-// callbacks reference EJF_SD lazily, so it is fine that the namespace is defined later in the file.
-registerSimilarDefectActions();
-
-
-
-// Add menu command that will allow to toggle On/Off darkmode.
-if ($('html[data-color-mode="dark"]')[0]) {
-    menu_darkmode = GM_registerMenuCommand ("Disable Dark Mode", toggleDarkmode);
-}
-else {
-    menu_darkmode = GM_registerMenuCommand ("Enable Dark Mode", toggleDarkmode);
-};
-
-
-
-// (Re)register the Similar Defects action commands ("Sync defects now" / "Rebuild defect database").
-// Idempotent: it clears any existing ones first, then adds them only while the feature is enabled. Called
-// from the initial menu setup and from refreshMenu, so the commands correctly come back after a re-enable.
-function registerSimilarDefectActions() {
-    if (menu_sdSync) { GM_unregisterMenuCommand(menu_sdSync); menu_sdSync = null; }
-    if (menu_sdRebuild) { GM_unregisterMenuCommand(menu_sdRebuild); menu_sdRebuild = null; }
-    if (menu_sdBackend) { GM_unregisterMenuCommand(menu_sdBackend); menu_sdBackend = null; }
-    if (menu_sdSyncEbr) { GM_unregisterMenuCommand(menu_sdSyncEbr); menu_sdSyncEbr = null; }
-    if (savedVariables[5][1]) {
-        menu_sdSync = GM_registerMenuCommand ("Sync defects now", function () { EJF_SD.sync.syncNow(); });
-        menu_sdSyncEbr = GM_registerMenuCommand ("Sync bug reports now", function () { EJF_SD.sync.syncEbrNow(); });
-        menu_sdRebuild = GM_registerMenuCommand ("Rebuild defect database", function () { EJF_SD.sync.rebuild(); });
-        // Label reflects what the toggle will switch TO. GPU is the default (sdTryWebgpu defaults to true) and
-        // is "on" unless the user opted out OR the sticky "GPU unstable" lock got set after a device loss.
-        var gpuOn = (typeof GM_getValue !== 'function') || (GM_getValue('sdTryWebgpu', true) && !GM_getValue('sdForceCpu', false));
-        menu_sdBackend = GM_registerMenuCommand(
-            gpuOn ? "Embedding backend: switch to CPU (stable)" : "Embedding backend: switch to GPU (faster, experimental)",
-            toggleEmbedBackend
-        );
-    }
-}
+// Single Tampermonkey menu entry. All feature toggles and Triage Assistant actions (sync / rebuild /
+// embedding backend) live in an in-page settings overlay (EJF_SD.menu) instead of a long flat list of GM
+// menu commands. The callback references EJF_SD lazily, so it's fine that the namespace is defined later.
+menu_settings = GM_registerMenuCommand("⚙ Enhanced Jira – Settings…", function () {
+    if (typeof EJF_SD !== 'undefined' && EJF_SD.menu) { EJF_SD.menu.open(); }
+});
 
 
 // Switch the embedding backend between GPU (WebGPU - fast but has been unstable on some GPUs/drivers) and
@@ -232,59 +151,11 @@ function toggleEmbedBackend() {
 }
 
 
-// Function which refreshes the Tampermonkey menu
+// The toggle functions call this after flipping a setting. The menu is now a single in-page overlay, so
+// there's nothing to re-register with GM_registerMenuCommand - we just re-render the overlay (if it's open)
+// so its switches / sections reflect the new state immediately.
 function refreshMenu() {
-    GM_unregisterMenuCommand(menu_parser);
-    GM_unregisterMenuCommand(menu_scrollbar);
-    GM_unregisterMenuCommand(menu_dropdowns);
-    GM_unregisterMenuCommand(menu_buttons);
-    GM_unregisterMenuCommand(menu_similarDefects);
-    GM_unregisterMenuCommand(menu_darkmode);
-
-    if (savedVariables[1][1]) {
-        menu_parser = GM_registerMenuCommand ("Disable Log Parser", toggleParser);
-    }
-    else {
-        menu_parser = GM_registerMenuCommand ("Enable Log Parser", toggleParser);
-    }
-
-    if (savedVariables[2][1]) {
-        menu_scrollbar = GM_registerMenuCommand ("Disable Custom Scrollbar", toggleScrollbar);
-    }
-    else {
-        menu_scrollbar = GM_registerMenuCommand ("Enable Custom Scrollbar", toggleScrollbar);
-    }
-
-    if (savedVariables[3][1]) {
-        menu_dropdowns = GM_registerMenuCommand ("Disable Linked Issue Dropdowns", toggleDropdown);
-    }
-    else {
-        menu_dropdowns = GM_registerMenuCommand ("Enable Linked Issue Dropdowns", toggleDropdown);
-    }
-
-    if (savedVariables[4][1]) {
-        menu_buttons = GM_registerMenuCommand ("Disable Extra Buttons", toggleButtons);
-    }
-    else {
-        menu_buttons = GM_registerMenuCommand ("Enable Extra Buttons", toggleButtons);
-    }
-
-    if (savedVariables[5][1]) {
-        menu_similarDefects = GM_registerMenuCommand ("Disable Similar Defects (Beta)", toggleSimilarDefects);
-    }
-    else {
-        menu_similarDefects = GM_registerMenuCommand ("Enable Similar Defects (Beta)", toggleSimilarDefects);
-    }
-
-    // Re-add (or remove) the Sync / Rebuild action commands to match the toggle state.
-    registerSimilarDefectActions();
-
-    if ($('html[data-color-mode="dark"]')[0]) {
-        menu_darkmode = GM_registerMenuCommand ("Disable Dark Mode", toggleDarkmode);
-    }
-    else {
-        menu_darkmode = GM_registerMenuCommand ("Enable Dark Mode", toggleDarkmode);
-    }
+    if (typeof EJF_SD !== 'undefined' && EJF_SD.menu && EJF_SD.menu.isOpen()) { EJF_SD.menu.render(); }
 }
 
 
@@ -337,6 +208,7 @@ function toggleSimilarDefects() {
     GM_setValue (savedVariables[5][0], savedVariables[5][1]);
     if (!savedVariables[5][1]) {
         $('#ejf-sd-panel').remove();
+        $('#ejf-side-group').remove();
         if (typeof EJF_SD !== 'undefined') { EJF_SD.ui.currentKey = null; }
     } else if (typeof EJF_SD !== 'undefined') {
         EJF_SD.ui.ensure();
@@ -344,33 +216,6 @@ function toggleSimilarDefects() {
     refreshMenu();
 };
 
-
-// Function which toggles darkmode on / off by sending the nescessary PUT command to the atlassian server to change the dark mode setting. It then reloads the page
-function toggleDarkmode() {
-    if ($('html[data-color-mode="dark"]')[0]) {
-        $('input[type=checkbox]').prop('checked', false);
-        $.ajax({
-            url: 'https://fenriscreations.atlassian.net/rest/api/3/mypreferences?key=jira.user.theme.preference',
-            type: 'PUT',
-            contentType: 'application/json',
-            charset: 'utf-8',
-            Accept: 'application/json,text/javascript,*/*',
-            data: '{"value":"light"}',
-        })
-    } else {
-        $('input[type=checkbox]').prop('checked', true);
-        $.ajax({
-            url: 'https://fenriscreations.atlassian.net/rest/api/3/mypreferences?key=jira.user.theme.preference',
-            type: 'PUT',
-            contentType: 'application/json',
-            charset: 'utf-8',
-            Accept: 'application/json,text/javascript,*/*',
-            data: '{"value":"dark"}',
-        })
-    }
-    refreshMenu();
-    window.location.reload(false)
-};
 
 // waitForKeyElements waits until the it finds the "Give Feedback" element of the page and then removes it because we dont want that to take up space.
 var feedbackItem = 'button[data-testid="issue-navigator.common.ui.feedback.feedback-button"]';
@@ -1915,111 +1760,6 @@ var lcHtml = `
 `;
 
 
-// HTML for the darkMode Switch
-var darkModeSwitch = `
-    <span>
-      <input type="checkbox" class="checkbox" id="checkbox">
-      <label for="checkbox" class="checkbox-label">
-        <svg viewBox="0 -150 1000 800">
-  <path d="M223.5 32C100 32 0 132.3 0 256S100 480 223.5 480c60.6 0 115.5-24.2 155.8-63.4c5-4.9 6.3-12.5 3.1-18.7s-10.1-9.7-17-8.5c-9.8 1.7-19.8 2.6-30.1 2.6c-96.9 0-175.5-78.8-175.5-176c0-65.8 36-123.1 89.3-153.3c6.1-3.5 9.2-10.5 7.7-17.3s-7.3-11.9-14.3-12.5c-6.3-.5-12.6-.8-19-.8z" style="fill: rgb(241, 196, 15);"></path>
-</svg>
-<svg viewBox="-350 -150 1000 800">
-  <path d="M361.5 1.2c5 2.1 8.6 6.6 9.6 11.9L391 121l107.9 19.8c5.3 1 9.8 4.6 11.9 9.6s1.5 10.7-1.6 15.2L446.9 256l62.3 90.3c3.1 4.5 3.7 10.2 1.6 15.2s-6.6 8.6-11.9 9.6L391 391 371.1 498.9c-1 5.3-4.6 9.8-9.6 11.9s-10.7 1.5-15.2-1.6L256 446.9l-90.3 62.3c-4.5 3.1-10.2 3.7-15.2 1.6s-8.6-6.6-9.6-11.9L121 391 13.1 371.1c-5.3-1-9.8-4.6-11.9-9.6s-1.5-10.7 1.6-15.2L65.1 256 2.8 165.7c-3.1-4.5-3.7-10.2-1.6-15.2s6.6-8.6 11.9-9.6L121 121 140.9 13.1c1-5.3 4.6-9.8 9.6-11.9s10.7-1.5 15.2 1.6L256 65.1 346.3 2.8c4.5-3.1 10.2-3.7 15.2-1.6zM160 256a96 96 0 1 1 192 0 96 96 0 1 1 -192 0zm224 0a128 128 0 1 0 -256 0 128 128 0 1 0 256 0z" style="fill: rgb(243, 156, 18);"></path>
-</svg>
-        <span class="ball"></span>
-      </label>
-    </span>
-    `
-
-// CSS for the darkMode Switch
-var darkModeSwitchCss = `
-    .checkbox {
-      opacity: 0;
-      position: absolute;
-    }
-
-    .checkbox-label {
-      box-sizing: border-box;
-      background-color: #323232;
-      width: 50px;
-      height: 26px;
-      border-radius: 50px;
-      position: relative;
-      padding: 5px;
-      cursor: pointer;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-
-    .fa-moon {
-      color: #f1c40f;
-    }
-
-    .fa-sun {
-      color: #f39c12;
-    }
-
-    .checkbox-label .ball {
-      background-color: #fff;
-      width: 22px;
-      height: 22px;
-      position: absolute;
-      left: 2px;
-      top: 2px;
-      border-radius: 50%;
-      transition: transform 0.2s linear;
-    }
-
-    .checkbox:checked + .checkbox-label .ball {
-      transform: translateX(24px);
-    }
-`
-
-
-// We wait until the searchbar is loaded before running the function addDarkmodeToggle
-var searchbar = 'input[data-test-id="search-dialog-input"';
-waitForKeyElements(searchbar, addDarkmodeToggle);
-
-
-// This adds the CSS and Button (An input checkbox box) to the right of the search box. If the darkmode is enabled then we check the checkbox
-function addDarkmodeToggle() {
-  GM_addStyle(darkModeSwitchCss);
-
-  const target = $('[data-test-id="ak-spotlight-target-global-create-spotlight"]');
-
-  if (
-    target.length &&
-    ($('html[data-color-mode="dark"]').length || $('html[data-color-mode="light"]').length)
-  ) {
-    const button = target.find('button[data-testid="atlassian-navigation--create-button"]');
-    const buttonContainer = button.parent();
-
-    if (buttonContainer.length && $('#darkModeToggle').length === 0) {
-      // Set the parent container to flex to align items horizontally
-      buttonContainer.parent().css({
-        display: 'flex',
-        'align-items': 'center'
-      });
-
-      // Create toggle wrapper with margin-left and flex alignment
-      const toggleWrapper = $('<div id="darkModeToggle" style="margin-left: 12px; display: flex; align-items: center;"></div>')
-        .html(darkModeSwitch);
-
-      // Insert the toggle right after the button container
-      buttonContainer.after(toggleWrapper);
-
-      // Set initial checkbox state based on current color mode
-      if ($('html[data-color-mode="dark"]').length) {
-        $('#checkbox').prop('checked', true);
-      }
-
-      // Attach click event for toggling dark mode
-      $('#checkbox').on('click', toggleDarkmode);
-    }
-  }
-}
-
 // Rough minimum requirements for EVE
 var minRequirements = {
     OS: {
@@ -2793,6 +2533,16 @@ EJF_SD.db = {
         });
     },
 
+    // Clear ONLY the stored open bug reports (EBR), preserving the defect records. The mirror of
+    // clearDefects, used by the "Rebuild BR DB" action.
+    clearEbr: function () {
+        return EJF_SD.db.allDefects().then(function (recs) {
+            var keys = [];
+            for (var i = 0; i < recs.length; i++) { if (recs[i].project === 'EBR') { keys.push(recs[i].key); } }
+            return EJF_SD.db.deleteDefects(keys);
+        });
+    },
+
     // Delete records by key (used by the EBR incremental sync to drop reports that have since closed).
     deleteDefects: function (keys) {
         return EJF_SD.db.open().then(function (db) {
@@ -3026,7 +2776,7 @@ EJF_SD.sync = {
                 EJF_SD.ui.toast('Defect sync complete – ' + total + ' defects in local DB.');
                 EJF_SD.ui.setStatus(total + ' defects in database');
                 EJF_SD.sched.markSynced();   // a manual sync also resets the auto-sync 30-min clock
-                if (EJF_SD.ui.currentKey && /^EBR-/.test(EJF_SD.ui.currentKey)) { EJF_SD.ui.render(EJF_SD.ui.currentKey); }   // defect data only affects the EBR (similar defects) view
+                if (EJF_SD.ui.currentKey && /^EBR-/.test(EJF_SD.ui.currentKey)) { EJF_SD.ui.scheduleRender(); }   // defect data only affects the EBR (similar defects) view
                 EJF_SD.embed.prepare(true);   // embed new/changed defects in the background (no-op if model unavailable)
                 return res;
             });
@@ -3054,7 +2804,7 @@ EJF_SD.sync = {
                     EJF_SD.sync.running = false;
                     EJF_SD.ui.toast('Rebuild complete – ' + (total - ebr) + ' defects.');   // EBRs are preserved, exclude them from the count
                     EJF_SD.sched.markSynced();   // a rebuild also resets the auto-sync 30-min clock
-                    if (EJF_SD.ui.currentKey && /^EBR-/.test(EJF_SD.ui.currentKey)) { EJF_SD.ui.render(EJF_SD.ui.currentKey); }   // defect data only affects the EBR (similar defects) view
+                    if (EJF_SD.ui.currentKey && /^EBR-/.test(EJF_SD.ui.currentKey)) { EJF_SD.ui.scheduleRender(); }   // defect data only affects the EBR (similar defects) view
                     EJF_SD.embed.prepare(true);   // re-embed everything in the background
                   });
                 });
@@ -3063,6 +2813,35 @@ EJF_SD.sync = {
                 EJF_SD.sync.running = false;
                 EJF_SD.ui.setStatus('Rebuild error: ' + (e && e.message || e));
                 alert('Rebuild failed: ' + (e && e.message || e));
+            });
+    },
+
+    // Wipe ONLY the stored open bug reports and rebuild that dataset from scratch (defects are preserved).
+    // The mirror of rebuild() for the EBR side: clear EBR records + their cursors, then a full EBR build.
+    // Useful when the open-report set has drifted (closures missed between incremental syncs) and you want
+    // a clean re-fetch, since "Sync bug reports now" only ever does an incremental catch-up once populated.
+    rebuildEbr: function () {
+        if (EJF_SD.sync.running) { EJF_SD.ui.toast('A sync is already running…'); return Promise.resolve(); }
+        if (!confirm('Rebuild the local bug report database from scratch? This re-fetches every open EBR.')) { return Promise.resolve(); }
+        EJF_SD.sync.running = true;
+        EJF_SD.ui.toast('Rebuilding bug report database…');
+        return EJF_SD.db.clearEbr()
+            .then(function () { return EJF_SD.db.setMeta('resumeTokenEbr', null); })
+            .then(function () { return EJF_SD.db.setMeta('lastSyncHighWaterEbr', ''); })
+            .then(function () { EJF_SD.rank._dirtyEbr = true; EJF_SD.rank._dirtyEbrVec = true; return EJF_SD.sync.fullSyncEbr(); })
+            .then(function () {
+                return EJF_SD.db.countEbr().then(function (total) {
+                    EJF_SD.sync.running = false;
+                    EJF_SD.ui.toast('Rebuild complete – ' + total + ' open bug reports.');
+                    EJF_SD.sched.markSynced();   // a rebuild also resets the auto-sync 30-min clock
+                    if (EJF_SD.ui.currentKey && /^EDR-/.test(EJF_SD.ui.currentKey)) { EJF_SD.ui.scheduleRender(); }   // bug-report data only affects the EDR (matching reports) view
+                    EJF_SD.embed.prepare(true);   // re-embed the bug reports in the background
+                });
+            })
+            .catch(function (e) {
+                EJF_SD.sync.running = false;
+                EJF_SD.ui.setStatus('Bug report rebuild error: ' + (e && e.message || e));
+                alert('Bug report rebuild failed: ' + (e && e.message || e));
             });
     },
 
@@ -3106,7 +2885,7 @@ EJF_SD.sync = {
                 EJF_SD.rank._dirtyEbrVec = true;
                 EJF_SD.ui.toast('Bug report sync complete – ' + total + ' open reports in local DB.');
                 EJF_SD.sched.markSynced();   // a manual sync also resets the auto-sync 30-min clock
-                if (EJF_SD.ui.currentKey && /^EDR-/.test(EJF_SD.ui.currentKey)) { EJF_SD.ui.renderReports(EJF_SD.ui.currentKey); }
+                if (EJF_SD.ui.currentKey && /^EDR-/.test(EJF_SD.ui.currentKey)) { EJF_SD.ui.scheduleRender(); }
                 EJF_SD.embed.prepare(true);   // embed the new/changed bug reports in the background (for hybrid)
             });
         }).catch(function (e) {
@@ -3140,8 +2919,8 @@ EJF_SD.sync = {
             return EJF_SD.db.setMeta('lastAutoSyncAt', new Date().toISOString()).then(function () {
                 EJF_SD.sched.markSynced();   // start the 30-min clock so reloads don't re-fetch
                 if (defectStored > 0 || ebrChanged) { EJF_SD.embed.prepare(true); }   // embed any new/changed defects AND bug reports
-                if (defectStored > 0 && EJF_SD.ui.currentKey && /^EBR-/.test(EJF_SD.ui.currentKey)) { EJF_SD.ui.render(EJF_SD.ui.currentKey); }
-                if (ebrChanged && EJF_SD.ui.currentKey && /^EDR-/.test(EJF_SD.ui.currentKey)) { EJF_SD.ui.renderReports(EJF_SD.ui.currentKey); }
+                if (defectStored > 0 && EJF_SD.ui.currentKey && /^EBR-/.test(EJF_SD.ui.currentKey)) { EJF_SD.ui.scheduleRender(); }
+                if (ebrChanged && EJF_SD.ui.currentKey && /^EDR-/.test(EJF_SD.ui.currentKey)) { EJF_SD.ui.scheduleRender(); }
             });
         }).catch(function (e) {
             EJF_SD.sync.running = false;
@@ -3545,9 +3324,9 @@ EJF_SD.embed = {
                 EJF_SD.embed._prepared = true;
                 EJF_SD.rank._dirtyVec = true;
                 EJF_SD.rank._dirtyEbrVec = true;
-                // Refresh whichever view is open: EBR -> similar defects, EDR -> matching bug reports.
-                if (EJF_SD.ui.currentKey && /^EBR-/.test(EJF_SD.ui.currentKey)) { EJF_SD.ui.render(EJF_SD.ui.currentKey); }
-                else if (EJF_SD.ui.currentKey && /^EDR-/.test(EJF_SD.ui.currentKey)) { EJF_SD.ui.renderReports(EJF_SD.ui.currentKey); }
+                // Refresh whichever view is open (coalesced, so a sync + this embed-pass completion collapse
+                // into a single list rebuild instead of thrashing): EBR -> similar defects, EDR -> reports.
+                EJF_SD.ui.scheduleRender();
             });
         }).then(function () {
             EJF_SD.embed._preparing = null;
@@ -4013,6 +3792,7 @@ EJF_SD.ui = {
 #ejf-sd-tip .ejf-sd-tip-meta { color: #9fb4cc; font-size: 10px; margin-bottom: 6px; }\
 #ejf-sd-tip .ejf-sd-tip-desc { color: #cfd6dd; white-space: pre-wrap; word-break: break-word; }\
 #ejf-sd-tip .ejf-sd-tip-dim { color: #7a8694; font-style: italic; }\
+#ejf-sd-tip .ejf-sd-tip-media { color: #9fb4cc; font-style: italic; padding: 6px 0; }\
 #ejf-sd-tip .ejf-sd-tip-html { white-space: normal; }\
 #ejf-sd-tip .ejf-sd-tip-html p { margin: 0 0 8px; }\
 #ejf-sd-tip .ejf-sd-tip-html p:last-child { margin-bottom: 0; }\
@@ -4023,7 +3803,45 @@ EJF_SD.ui = {
 #ejf-sd-tip .ejf-sd-tip-html img { max-width: 100%; height: auto; }\
 #ejf-sd-tip .ejf-sd-tip-html a { color: #4c9aff; }\
 #ejf-sd-tip .ejf-sd-tip-html table { border-collapse: collapse; margin: 6px 0; }\
-#ejf-sd-tip .ejf-sd-tip-html th, #ejf-sd-tip .ejf-sd-tip-html td { border: 1px solid #2c333a; padding: 2px 6px; }',
+#ejf-sd-tip .ejf-sd-tip-html th, #ejf-sd-tip .ejf-sd-tip-html td { border: 1px solid #2c333a; padding: 2px 6px; }\
+/* ---- integrated "Triage Assistant" context group (sidebar mode) ---- */\
+/* Styled with Atlassian design tokens so it blends into the native panel in both light + dark themes. */\
+/* Native-clone path (default): the cloned Details group already supplies the card / header / title font, so\
+   we only need to hide its body and rotate its chevron on collapse. */\
+#ejf-side-group.collapsed [data-ejf-body] { display: none !important; }\
+/* We clone a real context group (Development / More fields) for exact chrome, then swap the chevron path in\
+   JS - down caret when open, right caret when collapsed - matching how Jira itself toggles it (no CSS rotate).\
+   The cloned group ships without a full card border, so we draw our own complete bordered card and drop the\
+   inner wrapper partial border so we do not double up. */\
+#ejf-side-group.ejf-ta-native { margin: 8px 0; border: 1px solid var(--ds-border, #091e4224); border-radius: 8px; box-sizing: border-box; overflow: hidden; }\
+#ejf-side-group.ejf-ta-native > div { border: none; }\
+/* Manual fallback path: drawn by hand to mimic the native group when the clone template is unavailable. */\
+#ejf-side-group.ejf-ta-manual { margin: 8px 0; padding: 0 16px 4px; border: 1px solid var(--ds-border, #091e4224); border-radius: 8px; }\
+#ejf-side-group.ejf-ta-manual.collapsed { padding-bottom: 0; }\
+#ejf-side-header { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; padding: 14px 0; }\
+#ejf-side-header .ejf-side-chevron { display: inline-flex; color: var(--ds-icon-subtle, #626f86); }\
+#ejf-side-header .ejf-side-chevron svg { width: 16px; height: 16px; }\
+#ejf-side-header .ejf-side-htitle { flex: 1; font-weight: 600; font-size: 16px; line-height: 1; color: var(--ds-text, #172b4d); }\
+#ejf-side-group .ejf-side-body { padding-bottom: 8px; padding-right: 14px; }\
+.ejf-side-subhead { display: flex; align-items: center; gap: 8px; margin: 2px 0 4px; }\
+.ejf-side-subhead #ejf-sd-title { flex: 1; font-weight: 600; font-size: 12px; color: var(--ds-text-subtle, #44546f); }\
+#ejf-side-group #ejf-sd-mode { font-size: 10px; background: var(--ds-background-neutral, #091e420f); color: var(--ds-text-subtle, #44546f); padding: 1px 6px; border-radius: 8px; }\
+#ejf-side-group #ejf-sd-status { padding: 4px 0; border-bottom: none; color: var(--ds-text-subtlest, #626f86); }\
+#ejf-side-group #ejf-sd-loglink { display: none; padding: 6px 0; border-bottom: 1px solid var(--ds-border, #091e4224); background: transparent; }\
+#ejf-side-group #ejf-sd-loglink.has-hits { display: block; }\
+#ejf-side-group #ejf-sd-loglink .ejf-sd-loglink-head { color: var(--ds-text-warning, #974f0c); }\
+/* Responsive 2-up grid: two columns once the context column is wide enough (each cell >= 280px),\
+   automatically collapsing to one column when narrow. align-items:start so each row sizes to its own\
+   items (no stretching short cards to a tall neighbour). */\
+#ejf-side-group #ejf-sd-list { overflow: visible; display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); column-gap: 18px; align-items: start; }\
+#ejf-side-group #ejf-sd-list li { padding: 7px 0; border-bottom: 1px solid var(--ds-border, #091e4224); }\
+/* With a grid the simple :last-child no-border rule is wrong (only kills one of the bottom row); leave\
+   borders on every item - a faint divider under each card reads fine in either column count. */\
+#ejf-side-group #ejf-sd-list a, #ejf-side-group .ejf-sd-link { color: var(--ds-link, #0c66e4); }\
+#ejf-side-group .ejf-sd-sum { color: var(--ds-text, #172b4d); }\
+#ejf-side-group .ejf-sd-meta, #ejf-side-group .ejf-sd-score { color: var(--ds-text-subtlest, #626f86); }\
+#ejf-side-group .ejf-sd-proj { background: var(--ds-background-neutral, #091e420f); color: var(--ds-text-subtle, #44546f); }\
+#ejf-side-group .ejf-sd-link.ejf-sd-linked { color: var(--ds-text-success, #216e4e); }',
 
     injectCss: function () {
         if (!EJF_SD.ui._cssInjected) { GM_addStyle(EJF_SD.ui.css); EJF_SD.ui._cssInjected = true; }
@@ -4107,6 +3925,7 @@ EJF_SD.ui = {
         var $tip = $('#ejf-sd-tip');
         if (!$tip.length) { $tip = $('<div id="ejf-sd-tip"></div>').appendTo(document.body); }
         $tip.empty();
+        EJF_SD.ui._watchMedia($tip[0]);   // arm the media killer for this tip (catches Jira's async hydration)
         $('<div class="ejf-sd-tip-title"></div>').text(r.key + ' — ' + (r.summary || '')).appendTo($tip);
         if (meta) { $('<div class="ejf-sd-tip-meta"></div>').text(meta).appendTo($tip); }
         var $desc = $('<div class="ejf-sd-tip-desc"></div>').appendTo($tip);
@@ -4114,7 +3933,18 @@ EJF_SD.ui = {
         function paintHtml($el, htmlStr) {
             // Jira's own rendered HTML; strip any <script>/<style> defensively before injecting.
             var clean = String(htmlStr).replace(/<script[\s\S]*?<\/script>/gi, '').replace(/<style[\s\S]*?<\/style>/gi, '');
+            // Strip embedded media AT THE STRING LEVEL so the resource never enters the DOM / starts loading.
+            // Jira server-renders an attached video as a legacy <object type="video/mp4">…<embed></object>
+            // (confirmed from renderedFields), which the browser autoplays. Replace those whole blocks - plus
+            // any <video>/<audio>/<iframe> - with a static placeholder before injecting. (_killMedia below is
+            // the belt-and-suspenders DOM pass for any other media shape, e.g. SDK-hydrated data-media nodes.)
+            var MEDIA_PH = '<div class="ejf-sd-tip-media">▶ media — open the issue to view</div>';
+            clean = clean
+                .replace(/<object\b[\s\S]*?<\/object>/gi, MEDIA_PH)
+                .replace(/<(video|audio|iframe)\b[\s\S]*?<\/\1>/gi, MEDIA_PH)
+                .replace(/<(?:video|audio|iframe|embed|source)\b[^>]*\/?>/gi, '');   // stray self-closing/void media tags
             $el.removeClass('ejf-sd-tip-dim').addClass('ejf-sd-tip-html').html(clean);
+            EJF_SD.ui._killMedia($tip[0]);   // belt-and-suspenders DOM pass (covers SDK-hydrated media, etc.)
         }
 
         var cached = EJF_SD.ui._renderedCache[r.key];
@@ -4141,7 +3971,65 @@ EJF_SD.ui = {
         });
     },
 
-    _hideTip: function () { EJF_SD.ui._tipKey = null; $('#ejf-sd-tip').css('display', 'none'); },
+    _hideTip: function () {
+        EJF_SD.ui._tipKey = null;
+        if (EJF_SD.ui._tipMediaObs) { try { EJF_SD.ui._tipMediaObs.disconnect(); } catch (e) { /* ignore */ } EJF_SD.ui._tipMediaObs = null; }
+        $('#ejf-sd-tip').css('display', 'none');
+    },
+
+    // Strip any playing / hydratable media from the hover card, replacing each with a static placeholder.
+    // Covers actual players (<video>/<audio>/<iframe>) AND Atlassian's media PLACEHOLDER nodes (data-media-*
+    // / data-node-type="media"): the page's media SDK observes document.body and hydrates those placeholders
+    // into autoplaying players AFTER we inject - so removing the placeholder is what actually stops it. The
+    // tooltip is pointer-events:none, so an interactive player there is useless anyway. Returns nothing.
+    _killMedia: function (root) {
+        if (!root) { return; }
+        // Recognize a media element broadly. The exact selector kept missing it: Jira wraps an embedded
+        // video in nodes like data-node-type="mediaSingle" / data-testid="media-card-view", and the live
+        // <video> the SDK hydrates can sit inside a wrapper carrying none of one fixed attribute. So match by
+        // tag, by ANY data-media* attribute, by a data-node-type containing "media", or by a "media" class.
+        function isMedia(el) {
+            if (!el || el.nodeType !== 1 || el === root) { return false; }
+            var tag = (el.tagName || '').toLowerCase();
+            if (tag === 'video' || tag === 'audio' || tag === 'iframe' || tag === 'object' || tag === 'embed') { return true; }
+            var cls = (typeof el.className === 'string') ? el.className : '';
+            if (/ejf-sd-tip-media/.test(cls)) { return false; }   // our own placeholder - never re-process
+            if (/\bmedia/i.test(cls)) { return true; }
+            var nt = el.getAttribute && el.getAttribute('data-node-type');
+            if (nt && /media/i.test(nt)) { return true; }
+            var at = el.attributes;
+            if (at) { for (var k = 0; k < at.length; k++) { if (/^data-media/i.test(at[k].name)) { return true; } } }
+            return false;
+        }
+        var all = root.querySelectorAll('*'), targets = [], i;
+        for (i = 0; i < all.length; i++) { if (isMedia(all[i])) { targets.push(all[i]); } }
+        for (i = 0; i < targets.length; i++) {
+            var el = targets[i];
+            if (!root.contains(el)) { continue; }   // already removed along with an ancestor media node
+            // Replace the OUTERMOST media wrapper (not an inner <video>) so the SDK has no placeholder left
+            // to re-hydrate into a new player.
+            var top = el, p = el.parentNode;
+            while (p && p !== root && isMedia(p)) { top = p; p = p.parentNode; }
+            try { if (top.pause) { top.pause(); } } catch (e) { /* ignore */ }
+            var ph = document.createElement('div');
+            ph.className = 'ejf-sd-tip-media';
+            ph.textContent = '▶ media — open the issue to view';
+            if (top.parentNode) { top.parentNode.replaceChild(ph, top); }
+        }
+    },
+
+    // Arm a short-lived MutationObserver on the tip so media the page's SDK injects LATER (async hydration)
+    // is also stripped. Our placeholder divs don't match _killMedia's selector, so this can't loop. Auto-
+    // disconnects after a few seconds (hydration is near-instant) and on _hideTip.
+    _tipMediaObs: null,
+    _watchMedia: function (root) {
+        if (EJF_SD.ui._tipMediaObs) { try { EJF_SD.ui._tipMediaObs.disconnect(); } catch (e) { /* ignore */ } EJF_SD.ui._tipMediaObs = null; }
+        if (!root || typeof MutationObserver !== 'function') { return; }
+        var obs = new MutationObserver(function () { EJF_SD.ui._killMedia(root); });
+        try { obs.observe(root, { childList: true, subtree: true }); } catch (e) { return; }
+        EJF_SD.ui._tipMediaObs = obs;
+        setTimeout(function () { if (EJF_SD.ui._tipMediaObs === obs) { obs.disconnect(); EJF_SD.ui._tipMediaObs = null; } }, 5000);
+    },
 
     POS_KEY: 'sdPanelPos',         // GM flag holding the user's chosen panel position { left, top }
     COLLAPSE_KEY: 'sdPanelCollapsed',  // GM flag holding whether the panel is minimized (collapsed)
@@ -4273,8 +4161,65 @@ EJF_SD.ui = {
         });
     },
 
+    // Panel style: 'sidebar' (default - integrated into Jira's context column, between Details and
+    // Development) or 'floating' (the original draggable box on document.body). Persisted in GM 'sdPanelStyle'.
+    mode: function () {
+        try {
+            if (typeof GM_getValue === 'function') {
+                return (GM_getValue('sdPanelStyle', 'sidebar') === 'floating') ? 'floating' : 'sidebar';
+            }
+        } catch (e) { /* ignore */ }
+        return 'sidebar';
+    },
+
+    // Flip the panel style and re-mount in the new location (no reload). Called from the settings overlay.
+    toggleStyle: function () {
+        var next = (EJF_SD.ui.mode() === 'sidebar') ? 'floating' : 'sidebar';
+        try { if (typeof GM_setValue === 'function') { GM_setValue('sdPanelStyle', next); } } catch (e) { /* ignore */ }
+        $('#ejf-sd-panel').remove();
+        $('#ejf-side-group').remove();
+        if (EJF_SD.ui.currentKey && /^EBR-/.test(EJF_SD.ui.currentKey)) { EJF_SD.ui.render(EJF_SD.ui.currentKey); }
+        else if (EJF_SD.ui.currentKey && /^EDR-/.test(EJF_SD.ui.currentKey)) { EJF_SD.ui.renderReports(EJF_SD.ui.currentKey); }
+        refreshMenu();
+    },
+
+    // True once the panel chrome (specifically its shared inner list) is mounted in EITHER location. Used by
+    // ensure() to decide whether a (re)render is needed - in sidebar mode Jira's React re-renders can wipe
+    // our injected section, and this flips back to false so the observer re-mounts + repopulates it.
+    _chromePresent: function () { return !!document.getElementById('ejf-sd-list'); },
+
+    // SVG chevron matching Jira's native context-group caret (points down when expanded; CSS rotates it -90°
+    // when collapsed). Same path Jira uses for its Details / Development group headers.
+    _chevronSvg: '<svg fill="none" viewBox="-8 -8 32 32" width="16" height="16" role="presentation"><path fill="currentColor" d="m14.53 6.03-6 6a.75.75 0 0 1-1.004.052l-.056-.052-6-6 1.06-1.06L8 10.44l5.47-5.47z"></path></svg>',
+
+    // The two chevron path shapes Jira uses (it swaps the path rather than rotating): down caret when the
+    // group is open, right caret when collapsed.
+    _CHEV_DOWN: 'm14.53 6.03-6 6a.75.75 0 0 1-1.004.052l-.056-.052-6-6 1.06-1.06L8 10.44l5.47-5.47z',
+    _CHEV_RIGHT: 'm6.03 1.47 6 6a.75.75 0 0 1 .052 1.004l-.052.056-6 6-1.06-1.06L10.44 8 4.97 2.53z',
+
+    // Point the group's chevron the right way (open = down, collapsed = right). Works for both the cloned
+    // native chevron and the hand-built one (both carry [data-ejf-chevron]).
+    _setChevron: function (group, collapsed) {
+        var p = group && group.querySelector('[data-ejf-chevron] path');
+        if (p) { p.setAttribute('d', collapsed ? EJF_SD.ui._CHEV_RIGHT : EJF_SD.ui._CHEV_DOWN); }
+    },
+
+    // Ensure the panel chrome (shared inner ids: #ejf-sd-title, #ejf-sd-mode, #ejf-sd-status, #ejf-sd-loglink,
+    // #ejf-sd-list) exists in the active location. Sidebar by default; falls back to the floating box if the
+    // Jira context column / Details anchor isn't in the DOM (yet).
     _ensurePanel: function () {
         EJF_SD.ui.injectCss();
+        if (EJF_SD.ui.mode() === 'sidebar' && EJF_SD.ui._ensureSidebar()) {
+            if ($('#ejf-sd-panel').length) { $('#ejf-sd-panel').remove(); }   // drop a lingering floating box
+            return;
+        }
+        if ($('#ejf-side-group').length) { $('#ejf-side-group').remove(); }   // floating mode / no sidebar anchor
+        EJF_SD.ui._ensureFloating();
+    },
+
+    // The original floating, draggable panel on document.body (now opt-in / the fallback when the sidebar
+    // anchor is missing). Lives outside Jira's React tree, so it survives re-renders without re-mounting.
+    _ensureFloating: function () {
         if ($('#ejf-sd-panel').length) { return; }
         var $p = $(
             '<div id="ejf-sd-panel">' +
@@ -4300,6 +4245,195 @@ EJF_SD.ui = {
         EJF_SD.ui._applyPos($p);          // restore the user's saved position (if any)
         EJF_SD.ui._makeDraggable($p);     // wire up header dragging
         EJF_SD.ui.updateVisibility();     // stay hidden if an attachment viewer is already open
+    },
+
+    // Mount (or verify) the integrated "Triage Assistant" group in Jira's context column, immediately after
+    // the Details group (so it sits between Details and Development). Returns true once the chrome (with the
+    // shared inner ids) is present, false if the Details anchor isn't in the DOM yet (caller then falls back
+    // to the floating box). Cheap fast-path when already mounted, since the observer calls this often.
+    SIDE_COLLAPSE_KEY: 'sdSideCollapsed',
+
+    // The inner body of the group (subhead + the shared chrome ids), shared by the clone and manual builders.
+    _sidebarBodyHtml: function () {
+        return '<div class="ejf-side-subhead"><span id="ejf-sd-title">Similar defects</span><span id="ejf-sd-mode">Keyword</span></div>' +
+               '<div id="ejf-sd-status"></div>' +
+               '<div id="ejf-sd-loglink"></div>' +
+               '<ul id="ejf-sd-list"></ul>';
+    },
+
+    // Strip identifying attributes from a cloned subtree so it can't shadow Jira's own (or our) data-testid /
+    // data-vc / id lookups. Class names + inline styles (which carry all the visual styling) are kept.
+    _stripAttrs: function (root) {
+        var nodes = root.querySelectorAll('*'), i;
+        for (i = 0; i < nodes.length; i++) {
+            nodes[i].removeAttribute('data-testid');
+            nodes[i].removeAttribute('data-vc');
+            nodes[i].removeAttribute('data-component-selector');
+            if (nodes[i].id) { nodes[i].removeAttribute('id'); }
+        }
+        root.removeAttribute('data-testid');
+        root.removeAttribute('data-vc');
+        root.removeAttribute('data-component-selector');
+    },
+
+    _ensureSidebar: function () {
+        if (document.getElementById('ejf-side-group') && document.getElementById('ejf-sd-list')) { return true; }
+        // The Details slot is our anchor (data-vc is stable; the atomic class names are not). Fall back to the
+        // details-group container if the slot wrapper isn't present.
+        var anchor = document.querySelector('[data-vc="issue-view-context-items-details-panel-slot"]')
+            || document.querySelector('[data-vc="issue-view-context-group-details-group"]');
+        if (!anchor || !anchor.parentNode) { return false; }
+
+        // Drop a stale wrapper React may have left behind (body wiped but shell kept) before re-mounting.
+        var old = document.getElementById('ejf-side-group');
+        if (old && old.parentNode) { old.parentNode.removeChild(old); }
+
+        var collapsed = false;
+        try { if (typeof GM_getValue === 'function') { collapsed = !!GM_getValue(EJF_SD.ui.SIDE_COLLAPSE_KEY, false); } } catch (e) { collapsed = false; }
+
+        var group = null, headerClickTarget = null;
+
+        // Preferred: CLONE a real context group so the card chrome / header / chevron / title font match Jira
+        // exactly. Prefer a NON-Details group (Development / More fields) - its header padding + chevron
+        // position are what the user wants to match; the Details group is the always-open "primary" group with
+        // slightly different header padding. We clone the group's inner wrapper (it stays in the DOM even when
+        // collapsed - the body content just sits in a hidden div), gut the body, drop our content in, strip the
+        // clone's identifying attributes, point the chevron the right way, and re-wire the collapse toggle (the
+        // clone is static DOM with no React handlers). Marked with [data-ejf-body] / [data-ejf-chevron].
+        var tmpl = null;
+        var inners = document.querySelectorAll('[data-vc^="issue-view-context-group-"][data-vc$="-inner"]');
+        for (var ti = 0; ti < inners.length; ti++) {
+            if (!/details/i.test(inners[ti].getAttribute('data-vc') || '')) { tmpl = inners[ti]; break; }
+        }
+        if (!tmpl) {
+            // No other group present (rare) -> fall back to the Details group's inner, then its container.
+            tmpl = document.querySelector('[data-vc="issue-view-context-group-details-group-inner"]')
+                || document.querySelector('[data-vc="issue-view-context-group-details-group"]');
+        }
+        if (tmpl) {
+            try {
+                var clone = tmpl.cloneNode(true);
+                var titleEl = clone.querySelector('[data-testid$="collapsible-group-factory.title"]') || clone.querySelector('h2');
+                var bodyEl = clone.querySelector('[data-vc$="-body"]');
+                var chevronEl = clone.querySelector('[data-vc="issue-view-group-chevron"]');
+                var btnEl = clone.querySelector('[role="button"]');
+                if (titleEl && bodyEl && bodyEl.parentNode) {
+                    EJF_SD.ui._stripAttrs(clone);                 // (keeps element refs above valid)
+                    if (chevronEl) { chevronEl.setAttribute('data-ejf-chevron', '1'); }
+                    titleEl.textContent = 'Triage Assistant';
+                    // We cloned a COLLAPSED group, whose body wrapper carries Jira's collapse machinery (a
+                    // `hidden` attribute, a nested `<div hidden>`, and/or inline height:0 / overflow on
+                    // wrappers) that survives the clone and keeps content invisible even when expanded.
+                    // Rather than try to undo all of that, throw the cloned body wrapper away entirely and
+                    // drop in a clean, baggage-free body element in its place. Our own `.collapsed` class is
+                    // then the only thing that hides/shows it.
+                    var freshBody = document.createElement('div');
+                    freshBody.setAttribute('data-ejf-body', '1');
+                    freshBody.className = 'ejf-side-body';
+                    freshBody.innerHTML = EJF_SD.ui._sidebarBodyHtml();
+                    var bodyParent = bodyEl.parentNode;
+                    bodyParent.replaceChild(freshBody, bodyEl);
+                    // The cloned group was COLLAPSED, so its body is suppressed by the wrapper's collapse
+                    // state. Jira drives that with an `[open]` ATTRIBUTE, not inline styles: the rule
+                    // `._1jl4glyw:not([open]) > div { display: none }` hides the body whenever the wrapper
+                    // lacks `open`. (It may also leave a `hidden` attribute / inline height:0 from the
+                    // animation.) The header sits outside that wrapper so it still shows. Walk from the body's
+                    // wrapper up to the group root and force every wrapper OPEN + clear any leftover collapse
+                    // styling, so our own `.collapsed` class is the only thing that hides/shows the content.
+                    for (var node = freshBody.parentNode; node && node !== clone; node = node.parentNode) {
+                        node.setAttribute('open', '');
+                        node.removeAttribute('hidden');
+                        if (node.style && node.style.setProperty) {
+                            // Use !important: the collapse clip / spacing / transform can come from the
+                            // wrapper's CLASS (the `_1jl4glyw` height-animation), not just an inline style, so a
+                            // plain reset loses to it and the body gets clipped to a sliver (the "gap at the
+                            // top" with content squished). Forcing natural height + visible overflow + zero
+                            // spacing/transform here makes our `.collapsed` class the only thing that hides it.
+                            node.style.setProperty('height', 'auto', 'important');
+                            node.style.setProperty('max-height', 'none', 'important');
+                            node.style.setProperty('min-height', '0', 'important');
+                            node.style.setProperty('overflow', 'visible', 'important');
+                            node.style.setProperty('opacity', '1', 'important');
+                            node.style.setProperty('visibility', 'visible', 'important');
+                            node.style.setProperty('transform', 'none', 'important');
+                            node.style.setProperty('transition', 'none', 'important');
+                            // Neutralize positioning: a cloned wrapper can carry position+top (e.g. a
+                            // <section> with `top: 49px`) that offsets the whole body down and shows as the
+                            // intermittent "gap at the top". Force it back to static flow.
+                            node.style.setProperty('position', 'static', 'important');
+                            node.style.setProperty('top', 'auto', 'important');
+                            // Zero the wrapper's own spacing (the clone ROOT keeps the card's outer padding;
+                            // freshBody keeps its own) so the body sits flush under the header.
+                            node.style.setProperty('padding', '0', 'important');
+                            node.style.setProperty('margin', '0', 'important');
+                        }
+                    }
+                    if (clone.setAttribute) { clone.setAttribute('open', ''); }   // in case the clone root itself is the [open] toggle
+                    // Normalize the HEADER's spacing too. The intermittent "gap at the top" came from cloning
+                    // whichever non-Details group happened to be first in the DOM that reload (Development /
+                    // More fields / Releases…): each ships a slightly different header top-padding, and the
+                    // body-wrapper reset above never touched the header. Pin the header wrapper (the clone-root
+                    // child that holds the title) to a fixed vertical padding, and zero the clone root's own
+                    // top padding, so the top spacing is identical regardless of which group was cloned.
+                    var headerWrap = titleEl;
+                    while (headerWrap && headerWrap.parentNode && headerWrap.parentNode !== clone) { headerWrap = headerWrap.parentNode; }
+                    if (headerWrap && headerWrap !== clone && headerWrap.style && headerWrap.style.setProperty) {
+                        headerWrap.style.setProperty('padding', '0 0 8px', 'important');
+                        headerWrap.style.setProperty('margin', '0', 'important');
+                    }
+                    if (clone.style && clone.style.setProperty) { clone.style.setProperty('padding-top', '0', 'important'); }
+                    // The actual culprit behind the intermittent top gap: a cloned <section> carries an inline
+                    // `top: 49px` (a positioned offset that survives the clone). Sweep EVERY section in the
+                    // clone - not just the body-wrapper chain - back to static flow so nothing is pushed down.
+                    var ejfSecs = clone.querySelectorAll('section');
+                    for (var ejfSi = 0; ejfSi < ejfSecs.length; ejfSi++) {
+                        var sec = ejfSecs[ejfSi];
+                        if (sec.style && sec.style.setProperty) {
+                            sec.style.setProperty('position', 'static', 'important');
+                            sec.style.setProperty('top', 'auto', 'important');
+                        }
+                    }
+                    clone.id = 'ejf-side-group';
+                    clone.classList.add('ejf-ta-native');
+                    headerClickTarget = btnEl || clone;
+                    group = clone;
+                }
+            } catch (e) { group = null; }
+        }
+
+        // Fallback: hand-built group (used only if the native template wasn't found / clone failed).
+        if (!group) {
+            var $g = $(
+                '<div id="ejf-side-group" class="ejf-ta-manual">' +
+                '  <div id="ejf-side-header" role="button" tabindex="0" aria-expanded="true">' +
+                '    <span class="ejf-side-chevron" data-ejf-chevron="1">' + EJF_SD.ui._chevronSvg + '</span>' +
+                '    <span class="ejf-side-htitle">Triage Assistant</span>' +
+                '  </div>' +
+                '  <div class="ejf-side-body" data-ejf-body="1">' + EJF_SD.ui._sidebarBodyHtml() + '</div>' +
+                '</div>'
+            );
+            group = $g[0];
+            headerClickTarget = group.querySelector('#ejf-side-header');
+        }
+
+        if (collapsed) { group.classList.add('collapsed'); }
+        EJF_SD.ui._setChevron(group, collapsed);   // point the chevron the right way for the initial state
+
+        // Collapse toggle (shared by both paths): reflect on the root class + aria-expanded + chevron, persist.
+        if (headerClickTarget) {
+            headerClickTarget.style.cursor = 'pointer';
+            headerClickTarget.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+            headerClickTarget.addEventListener('click', function () {
+                var isColl = group.classList.toggle('collapsed');
+                EJF_SD.ui._setChevron(group, isColl);
+                try { headerClickTarget.setAttribute('aria-expanded', isColl ? 'false' : 'true'); } catch (e) { /* ignore */ }
+                try { if (typeof GM_setValue === 'function') { GM_setValue(EJF_SD.ui.SIDE_COLLAPSE_KEY, isColl); } } catch (e2) { /* ignore */ }
+            });
+        }
+
+        if (anchor.nextSibling) { anchor.parentNode.insertBefore(group, anchor.nextSibling); }
+        else { anchor.parentNode.appendChild(group); }
+        return true;
     },
 
     // Feature B: build a "Mark dup" control that links the open EBR as a duplicate of `defectKey` and moves
@@ -4520,6 +4654,25 @@ EJF_SD.ui = {
         });
     },
 
+    // Coalesce re-render requests. A single sync drives several "refresh the list" triggers in quick
+    // succession - the sync's own completion, then embed.prepare()'s completion after the embed pass, and
+    // (for autoSync) both the defect and EBR legs - and each render() empties + refills #ejf-sd-list, so the
+    // list visibly rebuilds several times. Route those background triggers through here so a burst collapses
+    // into ONE render of whichever view is currently open. (User-initiated renders - navigation, panel-style
+    // toggle - still call render()/renderReports() directly for instant feedback.)
+    _renderTimer: null,
+    scheduleRender: function () {
+        if (!EJF_SD.ui.currentKey) { return; }
+        if (EJF_SD.ui._renderTimer) { clearTimeout(EJF_SD.ui._renderTimer); }
+        EJF_SD.ui._renderTimer = setTimeout(function () {
+            EJF_SD.ui._renderTimer = null;
+            var k = EJF_SD.ui.currentKey;
+            if (!k) { return; }
+            if (/^EBR-/.test(k)) { EJF_SD.ui.render(k); }
+            else if (/^EDR-/.test(k)) { EJF_SD.ui.renderReports(k); }
+        }, 600);
+    },
+
     render: function (key) {
         EJF_SD.ui._ensurePanel();
         $('#ejf-sd-title').text('Similar defects');   // reset title (the panel is shared with the EDR reports view)
@@ -4549,6 +4702,7 @@ EJF_SD.ui = {
                         }, function () { return r; });
                     })).then(function () {
                         var $list = $('#ejf-sd-list');
+                        $list.empty();   // clear atomically right before filling: a concurrent re-render (e.g. after an auto-sync) also emptied at its top, but both appended later - emptying here keeps each render self-contained and avoids doubled rows
                         for (var i = 0; i < results.length; i++) { $list.append(EJF_SD.ui._item(results[i])); }
                         EJF_SD.ui._fitVertical();   // list height changed - re-check it still fits / drops up
                     });
@@ -4586,6 +4740,7 @@ EJF_SD.ui = {
                         }, function () { return r; });
                     })).then(function () {
                         var $list = $('#ejf-sd-list');
+                        $list.empty();   // clear atomically right before filling (see render() - avoids doubled rows from a concurrent re-render)
                         for (var i = 0; i < results.length; i++) { $list.append(EJF_SD.ui._reportItem(results[i])); }
                         EJF_SD.ui._fitVertical();   // list height changed - re-check it still fits / drops up
                     });
@@ -4622,18 +4777,161 @@ EJF_SD.ui = {
         var key = $.trim($bc.first().text());
         var isEbr = /^EBR-/.test(key), isEdr = /^EDR-/.test(key);
         if (!isEbr && !isEdr) {
-            // neither a bug report nor a defect - remove any stale panel
+            // neither a bug report nor a defect - remove any stale panel (either style)
             if ($('#ejf-sd-panel').length) { $('#ejf-sd-panel').remove(); }
+            if ($('#ejf-side-group').length) { $('#ejf-side-group').remove(); }
             EJF_SD.ui.currentKey = null;
             return;
         }
-        if ($('#ejf-sd-panel').length && EJF_SD.ui.currentKey === key) { return; }
+        // Skip only when the chrome is mounted AND it's the same issue. In sidebar mode a Jira re-render can
+        // wipe our injected section; _chromePresent() then reports false and we re-mount + repopulate here.
+        if (EJF_SD.ui._chromePresent() && EJF_SD.ui.currentKey === key) { return; }
         EJF_SD.ui.currentKey = key;
         if (isEbr) {
             EJF_SD.ui.render(key);              // bug report -> similar defects
         } else {
             EJF_SD.ui.renderReports(key);       // defect -> matching open bug reports
             EJF_SD.ui._maybeSyncForDefect(key); // ...and index this EDR if we don't have it yet
+        }
+    }
+};
+
+
+/* ---- consolidated in-page settings menu ---- */
+// One Tampermonkey command ("⚙ Enhanced Jira – Settings…") opens this modal overlay, which replaces the
+// long flat list of GM menu commands. It groups the feature on/off switches and, when the Triage Assistant
+// is enabled, its actions (sync defects / sync bug reports / rebuild) + the embedding-backend switch +
+// a live count of what's indexed. The existing toggle* functions still do the actual work; they call
+// refreshMenu() which re-renders this overlay so it reflects the new state without closing.
+EJF_SD.menu = {
+    _cssInjected: false,
+    css: '\
+#ejf-menu-overlay { position: fixed; inset: 0; z-index: 10000; background: rgba(0,0,0,.5); display: flex;\
+  align-items: center; justify-content: center; font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif; }\
+#ejf-menu { width: 360px; max-height: 82vh; overflow-y: auto; background: #1D2125; color: #e6e6e6;\
+  border: 1px solid #3a434d; border-radius: 8px; box-shadow: 0 8px 30px rgba(0,0,0,.55); font-size: 13px; }\
+#ejf-menu .ejf-menu-head { display: flex; align-items: center; gap: 8px; padding: 12px 14px; background: #282d33; border-radius: 8px 8px 0 0; position: sticky; top: 0; }\
+#ejf-menu .ejf-menu-head h2 { margin: 0; font-size: 14px; font-weight: 700; flex: 1; }\
+#ejf-menu .ejf-menu-x { cursor: pointer; font-weight: 700; font-size: 18px; line-height: 1; padding: 0 4px; color: #9aa6b2; }\
+#ejf-menu .ejf-menu-x:hover { color: #fff; }\
+#ejf-menu .ejf-menu-sect { padding: 4px 14px 12px; }\
+#ejf-menu .ejf-menu-sect h3 { margin: 12px 0 4px; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: #7a8694; }\
+#ejf-menu .ejf-menu-row { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid #2c333a; }\
+#ejf-menu .ejf-menu-row:last-child { border-bottom: none; }\
+#ejf-menu .ejf-menu-row .lbl { flex: 1; }\
+#ejf-menu .ejf-menu-row .sub { display: block; color: #7a8694; font-size: 11px; margin-top: 2px; }\
+#ejf-menu .ejf-sw { width: 38px; height: 20px; border-radius: 12px; background: #3a434d; position: relative; cursor: pointer; flex: 0 0 auto; transition: background .15s; }\
+#ejf-menu .ejf-sw.on { background: #4caf7d; }\
+#ejf-menu .ejf-sw .knob { position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff; transition: left .15s; }\
+#ejf-menu .ejf-sw.on .knob { left: 20px; }\
+#ejf-menu .ejf-menu-actions { display: flex; flex-wrap: wrap; gap: 8px; padding: 6px 0 2px; }\
+#ejf-menu .ejf-btn { background: #2c333a; color: #e6e6e6; border: 1px solid #3a434d; border-radius: 5px; padding: 6px 10px; cursor: pointer; font-size: 12px; }\
+#ejf-menu .ejf-btn:hover { background: #343c44; border-color: #4c9aff; }\
+#ejf-menu .ejf-menu-status { color: #9aa6b2; font-size: 11px; padding: 8px 0 0; }',
+
+    _injectCss: function () {
+        if (!EJF_SD.menu._cssInjected) { GM_addStyle(EJF_SD.menu.css); EJF_SD.menu._cssInjected = true; }
+    },
+
+    isOpen: function () { return !!document.getElementById('ejf-menu-overlay'); },
+
+    close: function () {
+        var o = document.getElementById('ejf-menu-overlay');
+        if (o && o.parentNode) { o.parentNode.removeChild(o); }
+        if (EJF_SD.menu._esc) { document.removeEventListener('keydown', EJF_SD.menu._esc); EJF_SD.menu._esc = null; }
+    },
+
+    // Open (toggle): a second click of the menu command closes it again.
+    open: function () {
+        if (EJF_SD.menu.isOpen()) { EJF_SD.menu.close(); return; }
+        EJF_SD.menu._injectCss();
+        var $overlay = $('<div id="ejf-menu-overlay"></div>');
+        $overlay.on('click', function (e) { if (e.target === this) { EJF_SD.menu.close(); } });   // backdrop click
+        $('<div id="ejf-menu"></div>').appendTo($overlay);
+        $overlay.appendTo(document.body);
+        EJF_SD.menu._esc = function (e) { if (e.key === 'Escape') { EJF_SD.menu.close(); } };
+        document.addEventListener('keydown', EJF_SD.menu._esc);
+        EJF_SD.menu.render();
+    },
+
+    // A label + on/off switch row. `fn` is the existing toggle* function (which flips + persists the setting
+    // and calls refreshMenu() -> render(), so the switch updates itself).
+    _toggleRow: function (label, isOn, fn) {
+        var $row = $('<div class="ejf-menu-row"></div>');
+        $('<span class="lbl"></span>').text(label).appendTo($row);
+        var $sw = $('<div class="ejf-sw"><span class="knob"></span></div>');
+        if (isOn) { $sw.addClass('on'); }
+        $sw.on('click', function () { try { fn(); } catch (e) { /* swallow */ } });
+        $row.append($sw);
+        return $row;
+    },
+
+    render: function () {
+        var $p = $('#ejf-menu');
+        if (!$p.length) { return; }
+        $p.empty();
+
+        var $head = $('<div class="ejf-menu-head"><h2>Enhanced Jira</h2></div>');
+        $('<span class="ejf-menu-x" title="Close (Esc)">×</span>').on('click', EJF_SD.menu.close).appendTo($head);
+        $p.append($head);
+
+        // ---- Features ----
+        var $feat = $('<div class="ejf-menu-sect"></div>');
+        $('<h3>Features</h3>').appendTo($feat);
+        $feat.append(EJF_SD.menu._toggleRow('Log Parser', !!savedVariables[1][1], toggleParser));
+        $feat.append(EJF_SD.menu._toggleRow('Custom Scrollbar', !!savedVariables[2][1], toggleScrollbar));
+        $feat.append(EJF_SD.menu._toggleRow('Linked Issue Dropdowns', !!savedVariables[3][1], toggleDropdown));
+        $feat.append(EJF_SD.menu._toggleRow('Extra Buttons', !!savedVariables[4][1], toggleButtons));
+        $feat.append(EJF_SD.menu._toggleRow('Triage Assistant (Beta)', !!savedVariables[5][1], toggleSimilarDefects));
+        $p.append($feat);
+
+        // ---- Triage Assistant (only when enabled) ----
+        if (savedVariables[5][1]) {
+            var $ta = $('<div class="ejf-menu-sect"></div>');
+            $('<h3>Triage Assistant</h3>').appendTo($ta);
+
+            var $actions = $('<div class="ejf-menu-actions"></div>');
+            $('<button class="ejf-btn">Sync defects now</button>')
+                .on('click', function () { EJF_SD.menu.close(); EJF_SD.sync.syncNow(); }).appendTo($actions);
+            $('<button class="ejf-btn">Sync bug reports now</button>')
+                .on('click', function () { EJF_SD.menu.close(); EJF_SD.sync.syncEbrNow(); }).appendTo($actions);
+            $('<button class="ejf-btn">Rebuild defect DB</button>')
+                .on('click', function () { EJF_SD.menu.close(); EJF_SD.sync.rebuild(); }).appendTo($actions);
+            $('<button class="ejf-btn">Rebuild BR DB</button>')
+                .on('click', function () { EJF_SD.menu.close(); EJF_SD.sync.rebuildEbr(); }).appendTo($actions);
+            $ta.append($actions);
+
+            // Panel style (integrated sidebar vs floating box). EJF_SD.ui.toggleStyle() re-mounts in place.
+            var sidebarOn = (typeof EJF_SD !== 'undefined' && EJF_SD.ui.mode() === 'sidebar');
+            var $styleRow = $('<div class="ejf-menu-row"></div>');
+            $('<span class="lbl">Panel style</span>')
+                .append($('<span class="sub"></span>').text('Currently: ' + (sidebarOn ? 'Sidebar (integrated)' : 'Floating (draggable box)')))
+                .appendTo($styleRow);
+            $('<button class="ejf-btn"></button>').text(sidebarOn ? 'Switch to floating' : 'Switch to sidebar')
+                .on('click', function () { EJF_SD.menu.close(); EJF_SD.ui.toggleStyle(); }).appendTo($styleRow);
+            $ta.append($styleRow);
+
+            // Embedding backend (GPU vs CPU). Same flags toggleEmbedBackend() reads/writes; it reloads.
+            var gpuOn = (typeof GM_getValue !== 'function') || (GM_getValue('sdTryWebgpu', true) && !GM_getValue('sdForceCpu', false));
+            var $row = $('<div class="ejf-menu-row"></div>');
+            $('<span class="lbl">Embedding backend</span>')
+                .append($('<span class="sub"></span>').text('Currently: ' + (gpuOn ? 'GPU (faster, experimental)' : 'CPU (stable)')))
+                .appendTo($row);
+            $('<button class="ejf-btn"></button>').text(gpuOn ? 'Switch to CPU' : 'Switch to GPU')
+                .on('click', function () { toggleEmbedBackend(); }).appendTo($row);
+            $ta.append($row);
+
+            // Live "what's indexed" status (defects + open reports), filled in async.
+            var $status = $('<div class="ejf-menu-status">Loading database status…</div>').appendTo($ta);
+            EJF_SD.db.countDefectsOnly().then(function (d) {
+                return EJF_SD.db.countEbr().then(function (e) {
+                    if (document.getElementById('ejf-menu')) {
+                        $status.text(d + ' defects · ' + e + ' open bug reports indexed locally');
+                    }
+                });
+            }, function () { $status.text(''); });
+
+            $p.append($ta);
         }
     }
 };
