@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.12.0
+// @version     2.12.1
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -2770,7 +2770,7 @@ EJF_SD.sync = {
                     EJF_SD.sync.running = false;
                     EJF_SD.ui.toast('Rebuild complete – ' + total + ' open bug reports.');
                     EJF_SD.sched.markSynced();   // a rebuild also resets the auto-sync 30-min clock
-                    if (EJF_SD.ui.currentKey && /^EDR-/.test(EJF_SD.ui.currentKey)) { EJF_SD.ui.scheduleRender(); }   // bug-report data only affects the EDR (matching reports) view
+                    if (EJF_SD.ui.currentKey && EJF_SD.ui._isDefectKey(EJF_SD.ui.currentKey)) { EJF_SD.ui.scheduleRender(); }   // bug-report data only affects the EDR/EO (matching reports) view
                     EJF_SD.embed.prepare(true);   // re-embed the bug reports in the background
                 });
             })
@@ -2821,7 +2821,7 @@ EJF_SD.sync = {
                 EJF_SD.rank._dirtyEbrVec = true;
                 EJF_SD.ui.toast('Bug report sync complete – ' + total + ' open reports in local DB.');
                 EJF_SD.sched.markSynced();   // a manual sync also resets the auto-sync 30-min clock
-                if (EJF_SD.ui.currentKey && /^EDR-/.test(EJF_SD.ui.currentKey)) { EJF_SD.ui.scheduleRender(); }
+                if (EJF_SD.ui.currentKey && EJF_SD.ui._isDefectKey(EJF_SD.ui.currentKey)) { EJF_SD.ui.scheduleRender(); }
                 EJF_SD.embed.prepare(true);   // embed the new/changed bug reports in the background (for hybrid)
             });
         }).catch(function (e) {
@@ -2856,7 +2856,7 @@ EJF_SD.sync = {
                 EJF_SD.sched.markSynced();   // start the 30-min clock so reloads don't re-fetch
                 if (defectStored > 0 || ebrChanged) { EJF_SD.embed.prepare(true); }   // embed any new/changed defects AND bug reports
                 if (defectStored > 0 && EJF_SD.ui.currentKey && /^EBR-/.test(EJF_SD.ui.currentKey)) { EJF_SD.ui.scheduleRender(); }
-                if (ebrChanged && EJF_SD.ui.currentKey && /^EDR-/.test(EJF_SD.ui.currentKey)) { EJF_SD.ui.scheduleRender(); }
+                if (ebrChanged && EJF_SD.ui.currentKey && EJF_SD.ui._isDefectKey(EJF_SD.ui.currentKey)) { EJF_SD.ui.scheduleRender(); }
             });
         }).catch(function (e) {
             EJF_SD.sync.running = false;
@@ -4115,7 +4115,7 @@ EJF_SD.ui = {
         $('#ejf-sd-panel').remove();
         $('#ejf-side-group').remove();
         if (EJF_SD.ui.currentKey && /^EBR-/.test(EJF_SD.ui.currentKey)) { EJF_SD.ui.render(EJF_SD.ui.currentKey); }
-        else if (EJF_SD.ui.currentKey && /^EDR-/.test(EJF_SD.ui.currentKey)) { EJF_SD.ui.renderReports(EJF_SD.ui.currentKey); }
+        else if (EJF_SD.ui.currentKey && EJF_SD.ui._isDefectKey(EJF_SD.ui.currentKey)) { EJF_SD.ui.renderReports(EJF_SD.ui.currentKey); }
         refreshMenu();
     },
 
@@ -4605,7 +4605,7 @@ EJF_SD.ui = {
             var k = EJF_SD.ui.currentKey;
             if (!k) { return; }
             if (/^EBR-/.test(k)) { EJF_SD.ui.render(k); }
-            else if (/^EDR-/.test(k)) { EJF_SD.ui.renderReports(k); }
+            else if (EJF_SD.ui._isDefectKey(k)) { EJF_SD.ui.renderReports(k); }
         }, 600);
     },
 
@@ -4698,22 +4698,27 @@ EJF_SD.ui = {
             return EJF_SD.db.getDefect(key).then(function (rec) {
                 if (rec) { return; }   // already indexed - nothing to do
                 EJF_SD.ui._autoSyncedKeys[key] = true;   // don't retrigger for this key this session
-                console.log('[EJF-SD] EDR ' + key + ' not in local DB - triggering catch-up sync');
-                EJF_SD.sync.autoSync();   // quiet incremental catch-up (fetches the new EDR; embeds + refreshes)
+                console.log('[EJF-SD] ' + key + ' not in local DB - triggering catch-up sync');
+                EJF_SD.sync.autoSync();   // quiet incremental catch-up (fetches the new defect/EO issue; embeds + refreshes)
             });
         });
     },
 
-    // Show/refresh the panel on EBR bug reports (similar defects) AND on EDR defects (matching reports);
+    // Keys that get the "Matching bug reports" (reverse) view: defects (EDR) AND EVE Online (EO) issues.
+    // Both projects are in the synced defect scope (EJF_SD.SCOPE = "project in (EDR, EO)"), so the local
+    // DB already holds them and renderReports works for either.
+    _isDefectKey: function (key) { return /^(EDR|EO)-/.test(key || ''); },
+
+    // Show/refresh the panel on EBR bug reports (similar defects) AND on EDR/EO issues (matching reports);
     // re-query when the issue key changes. Any other issue type removes the panel.
     ensure: function () {
         if (!savedVariables[5][1]) { return; }
         var $bc = $('a[data-testid="issue.views.issue-base.foundation.breadcrumbs.current-issue.item"]');
         if (!$bc.length) { return; }
         var key = $.trim($bc.first().text());
-        var isEbr = /^EBR-/.test(key), isEdr = /^EDR-/.test(key);
-        if (!isEbr && !isEdr) {
-            // neither a bug report nor a defect - remove any stale panel (either style)
+        var isEbr = /^EBR-/.test(key), isDefect = EJF_SD.ui._isDefectKey(key);
+        if (!isEbr && !isDefect) {
+            // neither a bug report nor a defect/EO issue - remove any stale panel (either style)
             if ($('#ejf-sd-panel').length) { $('#ejf-sd-panel').remove(); }
             if ($('#ejf-side-group').length) { $('#ejf-side-group').remove(); }
             EJF_SD.ui.currentKey = null;
@@ -4726,8 +4731,8 @@ EJF_SD.ui = {
         if (isEbr) {
             EJF_SD.ui.render(key);              // bug report -> similar defects
         } else {
-            EJF_SD.ui.renderReports(key);       // defect -> matching open bug reports
-            EJF_SD.ui._maybeSyncForDefect(key); // ...and index this EDR if we don't have it yet
+            EJF_SD.ui.renderReports(key);       // defect / EO issue -> matching open bug reports
+            EJF_SD.ui._maybeSyncForDefect(key); // ...and index this issue if we don't have it yet
         }
     }
 };
