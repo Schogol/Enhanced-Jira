@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.10.0
+// @version     2.10.1
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -3117,17 +3117,17 @@ EJF_SD.sync = {
         });
     },
 
-    // Quiet background catch-up used by the auto-sync scheduler. DEFECTS: incremental only - never the big
-    // initial build (that stays a deliberate manual action, so we skip an empty defect DB). OPEN BUG REPORTS
-    // (EBRs): AUTO-INITIALIZE on the first run (build the open-report set when none exists yet), then
-    // incremental. No start/finish toasts; re-embeds / refreshes the open panel only on actual changes.
+    // Quiet background catch-up used by the auto-sync scheduler. BOTH datasets AUTO-INITIALIZE on the first
+    // run (full build when the DB is empty) and then run incremental catch-ups: DEFECTS (EDR/EO) and OPEN
+    // BUG REPORTS (EBRs). No start/finish toasts; re-embeds / refreshes the open panel only on actual changes.
     autoSync: function () {
         if (EJF_SD.sync.running) { return Promise.resolve(); }
         EJF_SD.sync.running = true;
         var defectStored = 0, ebrChanged = false;
         return EJF_SD.db.countDefectsOnly().then(function (n) {
-            if (!n) { return; }   // don't auto-trigger the initial defect full sync (stays manual)
-            return EJF_SD.sync.incrementalSync().then(function (res) { defectStored = (res && res.stored) || 0; });
+            // Auto-initialize the defect DB on the first run (full build), then incremental catch-up.
+            var run = (n === 0) ? EJF_SD.sync.fullSync() : EJF_SD.sync.incrementalSync();
+            return run.then(function (res) { defectStored = (res && res.stored) || 0; });
         }).then(function () {
             return EJF_SD.db.countEbr().then(function (m) {
                 // First run with no reports yet -> initialize the open-report DB once; otherwise catch up.
@@ -4596,14 +4596,14 @@ EJF_SD.ui = {
 
     // When we land on an EDR that isn't in the local DB yet (e.g. a freshly created / just-converted defect),
     // kick off a quiet catch-up sync so it gets indexed. Guarded per key (once per session) and skipped while
-    // a sync is already running or when the defect DB is empty (the initial build stays a deliberate manual
-    // action). The catch-up is incremental, so it cheaply fetches the new EDR via the updated-since cursor.
+    // a sync is already running or when the defect DB is empty (an empty DB is handled by the scheduler's
+    // auto-initial build instead). The catch-up is incremental, so it cheaply fetches the new EDR.
     _autoSyncedKeys: {},
     _maybeSyncForDefect: function (key) {
         if (EJF_SD.ui._autoSyncedKeys[key]) { return; }
         if (EJF_SD.sync.running) { return; }
         EJF_SD.db.countDefectsOnly().then(function (n) {
-            if (!n) { return; }   // no defect DB yet - don't auto-trigger the initial build
+            if (!n) { return; }   // empty defect DB - the scheduler's auto-initial build covers this
             return EJF_SD.db.getDefect(key).then(function (rec) {
                 if (rec) { return; }   // already indexed - nothing to do
                 EJF_SD.ui._autoSyncedKeys[key] = true;   // don't retrigger for this key this session
@@ -4655,12 +4655,15 @@ EJF_SD.ui = {
 
 
 /* ---- background auto-sync scheduler (Phase 3) ---- */
-// Periodically runs a quiet incremental sync so the local DB stays fresh without the user clicking
-// "Sync defects now". A best-effort cross-tab lease (GM storage) keeps multiple open Jira tabs from all
-// syncing at once; the in-tab `running` flag prevents overlap within a tab. The big initial build stays
-// manual - autoSync no-ops on an empty DB.
+// Keeps the local DB fresh without the user clicking "Sync defects now": auto-initializes both datasets on
+// first run and then runs incremental catch-ups roughly every INTERVAL_MS. A best-effort cross-tab lease
+// (GM storage) keeps multiple open Jira tabs from all syncing at once; the in-tab `running` flag prevents
+// overlap within a tab. We POLL on a short timer (POLL_MS) and let the persisted recentlySynced() gate
+// decide when INTERVAL_MS has actually elapsed - polling far more often than the gate avoids the phase
+// collision you'd get if the timer period equalled the gate window (which skipped every other run).
 EJF_SD.sched = {
-    INTERVAL_MS: 30 * 60 * 1000,   // run a catch-up roughly every 30 minutes
+    INTERVAL_MS: 30 * 60 * 1000,   // minimum gap between catch-up syncs (the "freshness window")
+    POLL_MS: 0.5 * 60 * 1000,      // how often we CHECK whether INTERVAL_MS has elapsed (≪ INTERVAL_MS)
     STARTUP_DELAY_MS: 20 * 1000,   // wait a bit after load so we don't compete with first paint / initial render
     LEASE_TTL_MS: 5 * 60 * 1000,   // a lease older than this is treated as abandoned (tab closed mid-sync)
     LEASE_KEY: 'sdSyncLease',
@@ -4709,9 +4712,11 @@ EJF_SD.sched = {
         if (EJF_SD.sched._timer) { return; }
         setTimeout(function () {
             try { EJF_SD.sched.tick(); } catch (e) { /* swallow */ }
+            // Poll every POLL_MS (≪ INTERVAL_MS). tick() itself only acts once recentlySynced() reports that
+            // INTERVAL_MS has elapsed, so this reliably fires ~every 30 min instead of skipping windows.
             EJF_SD.sched._timer = setInterval(function () {
                 try { EJF_SD.sched.tick(); } catch (e) { /* swallow */ }
-            }, EJF_SD.sched.INTERVAL_MS);
+            }, EJF_SD.sched.POLL_MS);
         }, EJF_SD.sched.STARTUP_DELAY_MS);
     }
 };
