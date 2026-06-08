@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.9.3
+// @version     2.10.0
 // @author      ISD BH Schogol, ISD Tulwar
-// @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, and suggests similar existing defects on bug reports
+// @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
 // @downloadURL https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
 // @match       https://fenriscreations.atlassian.net/jira*
@@ -28,7 +28,7 @@
 
 
 // Creating various variables which we use later on
-var rows, oc, lc, pdm, pdmdata, driverAge = "unknown", menu_parser, menu_scrollbar, menu_dropdowns, menu_buttons, menu_darkmode, menu_similarDefects, menu_sdSync, menu_sdRebuild, menu_sdBackend;
+var rows, oc, lc, pdm, pdmdata, driverAge = "unknown", menu_parser, menu_scrollbar, menu_dropdowns, menu_buttons, menu_darkmode, menu_similarDefects, menu_sdSync, menu_sdRebuild, menu_sdBackend, menu_sdSyncEbr;
 
 
 // Current Date
@@ -197,8 +197,10 @@ function registerSimilarDefectActions() {
     if (menu_sdSync) { GM_unregisterMenuCommand(menu_sdSync); menu_sdSync = null; }
     if (menu_sdRebuild) { GM_unregisterMenuCommand(menu_sdRebuild); menu_sdRebuild = null; }
     if (menu_sdBackend) { GM_unregisterMenuCommand(menu_sdBackend); menu_sdBackend = null; }
+    if (menu_sdSyncEbr) { GM_unregisterMenuCommand(menu_sdSyncEbr); menu_sdSyncEbr = null; }
     if (savedVariables[5][1]) {
         menu_sdSync = GM_registerMenuCommand ("Sync defects now", function () { EJF_SD.sync.syncNow(); });
+        menu_sdSyncEbr = GM_registerMenuCommand ("Sync bug reports now", function () { EJF_SD.sync.syncEbrNow(); });
         menu_sdRebuild = GM_registerMenuCommand ("Rebuild defect database", function () { EJF_SD.sync.rebuild(); });
         // Label reflects what the toggle will switch TO. GPU is the default (sdTryWebgpu defaults to true) and
         // is "on" unless the user opted out OR the sticky "GPU unstable" lock got set after a device loss.
@@ -2170,6 +2172,7 @@ var pdmHtml = `
 var EJF_SD = {
     HOST: 'https://fenriscreations.atlassian.net',
     SCOPE: 'project in (EDR, EO)',                 // dataset definition (tweak here to change scope)
+    EBR_SCOPE: 'project = EBR AND statusCategory != Done',  // open bug reports, for the EDR "matching reports" view
     FIELDS: ['summary', 'description', 'status', 'resolution', 'resolutiondate', 'components', 'updated', 'project'],
     DB_NAME: 'EJF_SimilarDefects',
     DB_VERSION: 1,
@@ -2237,6 +2240,7 @@ EJF_SD.logsig = {
         EJF_SD.logsig._building = EJF_SD.db.allDefects().then(function (recs) {
             var hashMap = {}, sigMap = {}, nHash = 0, nSig = 0;
             for (var i = 0; i < recs.length; i++) {
+                if (recs[i].project === 'EBR') { continue; }   // mine crash signatures from DEFECTS only, not bug reports
                 var desc = recs[i].description;
                 if (!desc || desc.indexOf('EXCEPTION #') === -1) { continue; }
                 var blocks = EJF_SD.logsig._splitBlocks(desc);
@@ -2779,13 +2783,49 @@ EJF_SD.db = {
         });
     },
 
+    // Clear the DEFECT records (EDR/EO) only, preserving any stored open bug reports (EBR). Used by the
+    // "Rebuild defect database" action, which must not wipe the separately-synced bug-report dataset.
     clearDefects: function () {
+        return EJF_SD.db.allDefects().then(function (recs) {
+            var keys = [];
+            for (var i = 0; i < recs.length; i++) { if (recs[i].project !== 'EBR') { keys.push(recs[i].key); } }
+            return EJF_SD.db.deleteDefects(keys);
+        });
+    },
+
+    // Delete records by key (used by the EBR incremental sync to drop reports that have since closed).
+    deleteDefects: function (keys) {
+        return EJF_SD.db.open().then(function (db) {
+            return new Promise(function (resolve, reject) {
+                if (!keys || !keys.length) { resolve(0); return; }
+                var tx = db.transaction('defects', 'readwrite');
+                var store = tx.objectStore('defects');
+                for (var i = 0; i < keys.length; i++) { store.delete(keys[i]); }
+                tx.oncomplete = function () { resolve(keys.length); };
+                tx.onerror = function (e) { reject(e.target.error); };
+            });
+        });
+    },
+
+    // Count stored records whose project key === project (e.g. 'EBR'), via the by_project index.
+    countByProject: function (project) {
         return EJF_SD.db.open().then(function () {
             return new Promise(function (resolve, reject) {
-                var r = EJF_SD.db._store('defects', 'readwrite').clear();
-                r.onsuccess = function () { resolve(); };
+                var r = EJF_SD.db._store('defects', 'readonly').index('by_project').count(IDBKeyRange.only(project));
+                r.onsuccess = function () { resolve(r.result || 0); };
                 r.onerror = function (e) { reject(e.target.error); };
             });
+        });
+    },
+
+    countEbr: function () { return EJF_SD.db.countByProject('EBR'); },
+
+    // Number of DEFECT records (everything that isn't a bug report). Used by the defect-population checks
+    // (sync decisions, "no data yet" messages) so the shared store's EBRs don't make the defect side think
+    // it already has data.
+    countDefectsOnly: function () {
+        return EJF_SD.db.countDefects().then(function (total) {
+            return EJF_SD.db.countEbr().then(function (ebr) { return total - ebr; });
         });
     },
 
@@ -2871,12 +2911,20 @@ EJF_SD.sync = {
     },
 
     // Page through /search/jql for a given jql, storing each page. Resumable via meta.resumeToken.
-    // opts: { startToken, startHighWater }
+    // opts: { startToken, startHighWater, metaPrefix, pruneResolved, isEbr }
+    //  - metaPrefix:   suffix for the resume/high-water meta keys so independent datasets (defects vs EBRs)
+    //                  keep separate cursors (e.g. 'Ebr' -> resumeTokenEbr / lastSyncHighWaterEbr).
+    //  - pruneResolved: DELETE records that come back resolved/closed instead of storing them (used by the
+    //                  EBR incremental sync, whose JQL has no open-filter, so reports that have since closed
+    //                  are dropped from the open-report set).
+    //  - isEbr:        mark the EBR keyword index dirty (not the defect indexes / log-signature index).
     _run: function (jql, opts) {
         opts = opts || {};
         var token = opts.startToken || null;
         var pages = 0, stored = 0;
         var maxUpdated = opts.startHighWater || '';
+        var resumeKey = 'resumeToken' + (opts.metaPrefix || '');
+        var hwKey = 'lastSyncHighWater' + (opts.metaPrefix || '');
 
         function nextPage() {
             var body = { jql: jql, fields: EJF_SD.FIELDS, maxResults: EJF_SD.PAGE_SIZE };
@@ -2902,17 +2950,31 @@ EJF_SD.sync = {
                         return rec;
                     });
                 })).then(function (merged) {
+                    // pruneResolved: split into keep (still open) vs drop (now resolved -> delete from store).
+                    if (opts.pruneResolved) {
+                        var keep = [], drop = [];
+                        for (var k = 0; k < merged.length; k++) {
+                            if (EJF_SD.util.isResolved(merged[k].status, merged[k].resolution)) { drop.push(merged[k].key); }
+                            else { keep.push(merged[k]); }
+                        }
+                        return EJF_SD.db.deleteDefects(drop).then(function () { return EJF_SD.db.bulkPut(keep); });
+                    }
                     return EJF_SD.db.bulkPut(merged);
                 }).then(function () {
                     stored += recs.length;
                     pages++;
-                    EJF_SD.rank._dirty = true;
-                    EJF_SD.rank._dirtyVec = true;
-                    if (EJF_SD.logsig) { EJF_SD.logsig._dirty = true; }   // re-mine exception signatures on next log open
+                    if (opts.isEbr) {
+                        EJF_SD.rank._dirtyEbr = true;      // EBR keyword index depends on EBR records
+                        EJF_SD.rank._dirtyEbrVec = true;   // ...and the EBR vector index (new/removed reports)
+                    } else {
+                        EJF_SD.rank._dirty = true;
+                        EJF_SD.rank._dirtyVec = true;
+                        if (EJF_SD.logsig) { EJF_SD.logsig._dirty = true; }   // re-mine exception signatures on next log open
+                    }
                     var nextToken = data.nextPageToken || null;
                     // Persist progress so a reload mid-sync resumes rather than restarting.
-                    return EJF_SD.db.setMeta('resumeToken', (data.isLast || !nextToken) ? null : nextToken)
-                        .then(function () { return EJF_SD.db.setMeta('lastSyncHighWater', maxUpdated); })
+                    return EJF_SD.db.setMeta(resumeKey, (data.isLast || !nextToken) ? null : nextToken)
+                        .then(function () { return EJF_SD.db.setMeta(hwKey, maxUpdated); })
                         .then(function () {
                             EJF_SD.ui.setStatus('Syncing… ' + stored + ' issues fetched');
                             if (data.isLast || !nextToken) { return { stored: stored, highWater: maxUpdated }; }
@@ -2956,15 +3018,15 @@ EJF_SD.sync = {
         EJF_SD.sync.running = true;
         EJF_SD.ui.toast('Starting defect sync…');
         EJF_SD.ui.setStatus('Starting sync…');
-        return EJF_SD.db.countDefects().then(function (n) {
+        return EJF_SD.db.countDefectsOnly().then(function (n) {
             return n === 0 ? EJF_SD.sync.fullSync() : EJF_SD.sync.incrementalSync();
         }).then(function (res) {
-            return EJF_SD.db.countDefects().then(function (total) {
+            return EJF_SD.db.countDefectsOnly().then(function (total) {
                 EJF_SD.sync.running = false;
                 EJF_SD.ui.toast('Defect sync complete – ' + total + ' defects in local DB.');
                 EJF_SD.ui.setStatus(total + ' defects in database');
                 EJF_SD.sched.markSynced();   // a manual sync also resets the auto-sync 30-min clock
-                if (EJF_SD.ui.currentKey) { EJF_SD.ui.render(EJF_SD.ui.currentKey); }
+                if (EJF_SD.ui.currentKey && /^EBR-/.test(EJF_SD.ui.currentKey)) { EJF_SD.ui.render(EJF_SD.ui.currentKey); }   // defect data only affects the EBR (similar defects) view
                 EJF_SD.embed.prepare(true);   // embed new/changed defects in the background (no-op if model unavailable)
                 return res;
             });
@@ -2987,12 +3049,14 @@ EJF_SD.sync = {
             .then(function () { return EJF_SD.db.setMeta('lastSyncHighWater', ''); })
             .then(function () { EJF_SD.rank._dirty = true; return EJF_SD.sync.fullSync(); })
             .then(function () {
-                return EJF_SD.db.countDefects().then(function (total) {
+                return EJF_SD.db.countByProject('EBR').then(function (ebr) {
+                  return EJF_SD.db.countDefects().then(function (total) {
                     EJF_SD.sync.running = false;
-                    EJF_SD.ui.toast('Rebuild complete – ' + total + ' defects.');
+                    EJF_SD.ui.toast('Rebuild complete – ' + (total - ebr) + ' defects.');   // EBRs are preserved, exclude them from the count
                     EJF_SD.sched.markSynced();   // a rebuild also resets the auto-sync 30-min clock
-                    if (EJF_SD.ui.currentKey) { EJF_SD.ui.render(EJF_SD.ui.currentKey); }
+                    if (EJF_SD.ui.currentKey && /^EBR-/.test(EJF_SD.ui.currentKey)) { EJF_SD.ui.render(EJF_SD.ui.currentKey); }   // defect data only affects the EBR (similar defects) view
                     EJF_SD.embed.prepare(true);   // re-embed everything in the background
+                  });
                 });
             })
             .catch(function (e) {
@@ -3002,26 +3066,82 @@ EJF_SD.sync = {
             });
     },
 
-    // Quiet background catch-up used by the auto-sync scheduler: incremental only (never the big initial
-    // build - that stays a deliberate manual action, so we skip an empty DB), no start/finish toasts, and it
-    // re-embeds + refreshes the open panel only when it actually fetched changed issues.
+    // ---- open bug reports (EBR) sync, for the EDR "matching reports" view ----
+    // Same paging engine as the defects, but its own meta cursors (resumeTokenEbr / lastSyncHighWaterEbr)
+    // and the EBR keyword index as the dirty target. The FULL build uses the open-only scope; the
+    // INCREMENTAL pass drops the open-filter and prunes (deletes) reports that have since closed.
+    fullSyncEbr: function () {
+        return EJF_SD.db.getMeta('resumeTokenEbr').then(function (rt) {
+            return EJF_SD.db.getMeta('lastSyncHighWaterEbr').then(function (hw) {
+                var jql = EJF_SD.EBR_SCOPE + ' ORDER BY updated ASC';
+                return EJF_SD.sync._run(jql, { startToken: rt || null, startHighWater: hw || '', metaPrefix: 'Ebr', isEbr: true });
+            });
+        });
+    },
+
+    incrementalSyncEbr: function () {
+        return EJF_SD.db.getMeta('lastSyncHighWaterEbr').then(function (hw) {
+            if (!hw) { return EJF_SD.sync.fullSyncEbr(); }
+            var since = EJF_SD.util.toJqlTime(hw);
+            if (!since) { return EJF_SD.sync.fullSyncEbr(); }
+            // No open-filter here on purpose: we want updated-but-now-closed reports back so pruneResolved
+            // can delete them from the open-report set.
+            var jql = 'project = EBR AND updated >= "' + since + '" ORDER BY updated ASC';
+            return EJF_SD.sync._run(jql, { startHighWater: hw, metaPrefix: 'Ebr', pruneResolved: true, isEbr: true });
+        });
+    },
+
+    // Menu entry point for the bug-report dataset: full build if empty, otherwise an incremental catch-up.
+    syncEbrNow: function () {
+        if (EJF_SD.sync.running) { EJF_SD.ui.toast('A sync is already running…'); return Promise.resolve(); }
+        EJF_SD.sync.running = true;
+        EJF_SD.ui.toast('Starting bug report sync…');
+        EJF_SD.ui.setStatus('Starting bug report sync…');
+        return EJF_SD.db.countEbr().then(function (n) {
+            return n === 0 ? EJF_SD.sync.fullSyncEbr() : EJF_SD.sync.incrementalSyncEbr();
+        }).then(function () {
+            return EJF_SD.db.countEbr().then(function (total) {
+                EJF_SD.sync.running = false;
+                EJF_SD.rank._dirtyEbr = true;
+                EJF_SD.rank._dirtyEbrVec = true;
+                EJF_SD.ui.toast('Bug report sync complete – ' + total + ' open reports in local DB.');
+                EJF_SD.sched.markSynced();   // a manual sync also resets the auto-sync 30-min clock
+                if (EJF_SD.ui.currentKey && /^EDR-/.test(EJF_SD.ui.currentKey)) { EJF_SD.ui.renderReports(EJF_SD.ui.currentKey); }
+                EJF_SD.embed.prepare(true);   // embed the new/changed bug reports in the background (for hybrid)
+            });
+        }).catch(function (e) {
+            EJF_SD.sync.running = false;
+            EJF_SD.db.setMeta('lastError', String(e && e.message || e));
+            EJF_SD.ui.setStatus('Bug report sync error: ' + (e && e.message || e));
+            alert('Bug report sync failed: ' + (e && e.message || e) + '\nReport issues to Schogol :).');
+        });
+    },
+
+    // Quiet background catch-up used by the auto-sync scheduler. DEFECTS: incremental only - never the big
+    // initial build (that stays a deliberate manual action, so we skip an empty defect DB). OPEN BUG REPORTS
+    // (EBRs): AUTO-INITIALIZE on the first run (build the open-report set when none exists yet), then
+    // incremental. No start/finish toasts; re-embeds / refreshes the open panel only on actual changes.
     autoSync: function () {
         if (EJF_SD.sync.running) { return Promise.resolve(); }
         EJF_SD.sync.running = true;
-        return EJF_SD.db.countDefects().then(function (n) {
-            if (!n) { EJF_SD.sync.running = false; return; }   // don't auto-trigger the initial full sync
-            return EJF_SD.sync.incrementalSync().then(function (res) {
-                EJF_SD.sync.running = false;
-                var stored = (res && res.stored) || 0;
-                console.log('[EJF-SD] auto-sync done (' + stored + ' fetched)');
-                return EJF_SD.db.setMeta('lastAutoSyncAt', new Date().toISOString()).then(function () {
-                    EJF_SD.sched.markSynced();   // start the 30-min clock so reloads don't re-fetch
-                    if (stored > 0) {
-                        EJF_SD.embed.prepare(true);   // embed any new/changed defects
-                        if (EJF_SD.ui.currentKey) { EJF_SD.ui.render(EJF_SD.ui.currentKey); }
-                    }
-                    return res;
-                });
+        var defectStored = 0, ebrChanged = false;
+        return EJF_SD.db.countDefectsOnly().then(function (n) {
+            if (!n) { return; }   // don't auto-trigger the initial defect full sync (stays manual)
+            return EJF_SD.sync.incrementalSync().then(function (res) { defectStored = (res && res.stored) || 0; });
+        }).then(function () {
+            return EJF_SD.db.countEbr().then(function (m) {
+                // First run with no reports yet -> initialize the open-report DB once; otherwise catch up.
+                var run = (m === 0) ? EJF_SD.sync.fullSyncEbr() : EJF_SD.sync.incrementalSyncEbr();
+                return run.then(function (res) { if (m === 0 || (res && res.stored)) { ebrChanged = true; } });
+            });
+        }).then(function () {
+            EJF_SD.sync.running = false;
+            console.log('[EJF-SD] auto-sync done (defects ' + defectStored + ' fetched; EBRs ' + (ebrChanged ? 'updated' : 'unchanged') + ')');
+            return EJF_SD.db.setMeta('lastAutoSyncAt', new Date().toISOString()).then(function () {
+                EJF_SD.sched.markSynced();   // start the 30-min clock so reloads don't re-fetch
+                if (defectStored > 0 || ebrChanged) { EJF_SD.embed.prepare(true); }   // embed any new/changed defects AND bug reports
+                if (defectStored > 0 && EJF_SD.ui.currentKey && /^EBR-/.test(EJF_SD.ui.currentKey)) { EJF_SD.ui.render(EJF_SD.ui.currentKey); }
+                if (ebrChanged && EJF_SD.ui.currentKey && /^EDR-/.test(EJF_SD.ui.currentKey)) { EJF_SD.ui.renderReports(EJF_SD.ui.currentKey); }
             });
         }).catch(function (e) {
             EJF_SD.sync.running = false;
@@ -3037,6 +3157,9 @@ EJF_SD.rank = {
     _index: null,       // { N, avgdl, df:{}, docs:[{key,project,summary,status,tf:{},len}] }
     _dirty: true,       // set true whenever sync writes; triggers a rebuild on next query
     _building: null,
+    _ebrIndex: null,    // same shape, built over OPEN EBRs only (for the EDR "matching reports" view)
+    _dirtyEbr: true,    // set true whenever the EBR sync writes; triggers an EBR index rebuild on next query
+    _buildingEbr: null,
     K1: 1.5,
     B: 0.75,
     STOP: (function () {
@@ -3062,6 +3185,7 @@ EJF_SD.rank = {
             var df = {}, docs = [], totalLen = 0;
             for (var i = 0; i < records.length; i++) {
                 var rec = records[i];
+                if (rec.project === 'EBR') { continue; }   // bug reports live in the same store but are ranked separately
                 var toks = EJF_SD.rank._tokenize(EJF_SD.util.cleanForCompare(rec.summary, rec.description));
                 var tf = {}, seen = {};
                 for (var j = 0; j < toks.length; j++) {
@@ -3111,6 +3235,73 @@ EJF_SD.rank = {
             }
             scored.sort(function (a, c) { return c.score - a.score; });
             return scored.slice(0, limit || EJF_SD.TOP_N);
+        });
+    },
+
+    // Build (and cache) a BM25 index over the OPEN bug reports (project EBR) stored in the same DB. Same
+    // shape and tokenizer as the defect index; closed reports are skipped defensively (the EBR sync prunes
+    // them, but a stale record could linger between syncs).
+    _ensureEbrIndex: function () {
+        if (EJF_SD.rank._ebrIndex && !EJF_SD.rank._dirtyEbr) { return Promise.resolve(EJF_SD.rank._ebrIndex); }
+        if (EJF_SD.rank._buildingEbr) { return EJF_SD.rank._buildingEbr; }
+        EJF_SD.rank._buildingEbr = EJF_SD.db.allDefects().then(function (records) {
+            var df = {}, docs = [], totalLen = 0;
+            for (var i = 0; i < records.length; i++) {
+                var rec = records[i];
+                if (rec.project !== 'EBR') { continue; }
+                if (EJF_SD.util.isResolved(rec.status, rec.resolution)) { continue; }   // open reports only
+                var toks = EJF_SD.rank._tokenize(EJF_SD.util.cleanForCompare(rec.summary, rec.description));
+                var tf = {}, seen = {};
+                for (var j = 0; j < toks.length; j++) {
+                    var tk = toks[j];
+                    tf[tk] = (tf[tk] || 0) + 1;
+                    if (!seen[tk]) { df[tk] = (df[tk] || 0) + 1; seen[tk] = true; }
+                }
+                totalLen += toks.length;
+                docs.push({ key: rec.key, project: rec.project, summary: rec.summary, status: rec.status, resolution: rec.resolution, resolutiondate: rec.resolutiondate, tf: tf, len: toks.length });
+            }
+            EJF_SD.rank._ebrIndex = { N: docs.length, avgdl: docs.length ? (totalLen / docs.length) : 0, df: df, docs: docs };
+            EJF_SD.rank._dirtyEbr = false;
+            EJF_SD.rank._buildingEbr = null;
+            return EJF_SD.rank._ebrIndex;
+        }).catch(function (e) { EJF_SD.rank._buildingEbr = null; throw e; });
+        return EJF_SD.rank._buildingEbr;
+    },
+
+    // Rank OPEN bug reports against the query text (a defect's text). Returns up to `limit` scored results,
+    // each with a display `pct` relative to the top score. Mirrors `suggest` but over the EBR index.
+    suggestEbr: function (text, excludeKey, limit) {
+        return EJF_SD.rank._ensureEbrIndex().then(function (idx) {
+            if (!idx || !idx.N) { return []; }
+            var qTokens = EJF_SD.rank._tokenize(text);
+            var qSet = {};
+            for (var i = 0; i < qTokens.length; i++) { qSet[qTokens[i]] = true; }
+            var terms = Object.keys(qSet);
+            if (!terms.length) { return []; }
+            var k1 = EJF_SD.rank.K1, b = EJF_SD.rank.B, avgdl = idx.avgdl || 1;
+            var idf = {};
+            for (var t = 0; t < terms.length; t++) {
+                var n = idx.df[terms[t]] || 0;
+                idf[terms[t]] = Math.log(1 + (idx.N - n + 0.5) / (n + 0.5));
+            }
+            var scored = [];
+            for (var d = 0; d < idx.docs.length; d++) {
+                var doc = idx.docs[d];
+                if (excludeKey && doc.key === excludeKey) { continue; }
+                var score = 0;
+                for (var q = 0; q < terms.length; q++) {
+                    var tf = doc.tf[terms[q]];
+                    if (!tf) { continue; }
+                    var denom = tf + k1 * (1 - b + b * (doc.len / avgdl));
+                    score += idf[terms[q]] * (tf * (k1 + 1)) / denom;
+                }
+                if (score > 0) { scored.push({ key: doc.key, project: doc.project, summary: doc.summary, status: doc.status, resolution: doc.resolution, resolutiondate: doc.resolutiondate, score: score }); }
+            }
+            scored.sort(function (a, c) { return c.score - a.score; });
+            scored = scored.slice(0, limit || EJF_SD.TOP_N);
+            var top = (scored[0] && scored[0].score) || 0;
+            for (var p = 0; p < scored.length; p++) { scored[p].pct = top > 0 ? Math.round(scored[p].score / top * 100) : 0; }
+            return scored;
         });
     }
 };
@@ -3272,16 +3463,19 @@ EJF_SD.embed = {
         }).then(function (recs) {
             var todo = [], curVer = 0;
             for (var i = 0; i < recs.length; i++) {
+                // Embed BOTH defects and open bug reports (EBRs): hybrid ranking is used on both the EBR
+                // (similar defects) and EDR (matching reports) views. Skip closed EBRs - they're not ranked.
+                if (recs[i].project === 'EBR' && EJF_SD.util.isResolved(recs[i].status, recs[i].resolution)) { continue; }
                 if (recs[i].embedding && recs[i].embeddingModelVersion === EJF_SD.MODEL_VERSION) { curVer++; }
                 else { todo.push(recs[i]); }
             }
             console.log('[EJF-SD] embed pass: ' + todo.length + ' to embed, ' + curVer + ' already at ' +
                 EJF_SD.MODEL_VERSION + ' (of ' + recs.length + ' total, backend ' + EJF_SD.embed.backend + ')');
             if (!todo.length) { EJF_SD.ui.setStatus('Embeddings up to date (' + curVer + ')'); return; }
-            EJF_SD.ui.toast('Embedding ' + todo.length + ' defects locally…');
+            EJF_SD.ui.toast('Embedding ' + todo.length + ' issues locally…');
             var idx = 0, gpuRetries = 0;
             function nextBatch() {
-                if (idx >= todo.length) { console.log('[EJF-SD] embed pass complete (' + todo.length + ' embedded)'); EJF_SD.rank._dirtyVec = true; return Promise.resolve(); }
+                if (idx >= todo.length) { console.log('[EJF-SD] embed pass complete (' + todo.length + ' embedded)'); EJF_SD.rank._dirtyVec = true; EJF_SD.rank._dirtyEbrVec = true; return Promise.resolve(); }
                 var size = EJF_SD.embed.BATCH;
                 var slice = todo.slice(idx, idx + size);
                 var texts = slice.map(function (r) { return EJF_SD.util.cleanForCompare(r.summary, r.description); });
@@ -3311,6 +3505,7 @@ EJF_SD.embed = {
                     return EJF_SD.db.bulkPut(slice).then(function () {
                         idx += slice.length;   // advance by what we actually embedded
                         EJF_SD.rank._dirtyVec = true;
+                        EJF_SD.rank._dirtyEbrVec = true;
                         // Log throughput periodically so we can see the real CPU speed (first item always logs).
                         if (idx <= slice.length || idx % 50 === 0) {
                             console.log('[EJF-SD] embedded ' + idx + '/' + todo.length + ' (' + size + ' in ' + dt + 'ms, ' + EJF_SD.embed.backend + ')');
@@ -3345,11 +3540,14 @@ EJF_SD.embed = {
         if (EJF_SD.embed._preparing) { return EJF_SD.embed._preparing; }
         if (EJF_SD.embed._prepared && !force) { return Promise.resolve(); }
         EJF_SD.embed._preparing = EJF_SD.db.countDefects().then(function (n) {
-            if (!n) { return; }   // nothing synced yet - don't download a model for an empty DB
+            if (!n) { return; }   // nothing synced yet (no defects AND no bug reports) - don't download a model
             return EJF_SD.embed.embedPass().then(function () {
                 EJF_SD.embed._prepared = true;
                 EJF_SD.rank._dirtyVec = true;
-                if (EJF_SD.ui.currentKey) { EJF_SD.ui.render(EJF_SD.ui.currentKey); }
+                EJF_SD.rank._dirtyEbrVec = true;
+                // Refresh whichever view is open: EBR -> similar defects, EDR -> matching bug reports.
+                if (EJF_SD.ui.currentKey && /^EBR-/.test(EJF_SD.ui.currentKey)) { EJF_SD.ui.render(EJF_SD.ui.currentKey); }
+                else if (EJF_SD.ui.currentKey && /^EDR-/.test(EJF_SD.ui.currentKey)) { EJF_SD.ui.renderReports(EJF_SD.ui.currentKey); }
             });
         }).then(function () {
             EJF_SD.embed._preparing = null;
@@ -3375,6 +3573,7 @@ EJF_SD.rank._ensureVecIndex = function () {
         var docs = [];
         for (var i = 0; i < recs.length; i++) {
             var r = recs[i];
+            if (r.project === 'EBR') { continue; }   // bug reports are keyword-ranked only, not part of the defect vector index
             if (r.embedding && r.embeddingModelVersion === EJF_SD.MODEL_VERSION) {
                 docs.push({ key: r.key, project: r.project, summary: r.summary, status: r.status, resolution: r.resolution, resolutiondate: r.resolutiondate, vec: r.embedding });
             }
@@ -3410,6 +3609,49 @@ EJF_SD.rank._semanticScored = function (qv, excludeKey) {
                 status: docs[d].status, resolution: docs[d].resolution, resolutiondate: docs[d].resolutiondate,
                 score: sc
             });
+        }
+        scored.sort(function (a, c) { return c.score - a.score; });
+        return scored;
+    });
+};
+
+/* ---- EBR semantic ranking (stage 2): cosine over OPEN bug-report embeddings ---- */
+EJF_SD.rank._ebrVecIndex = null;
+EJF_SD.rank._dirtyEbrVec = true;
+EJF_SD.rank._buildingEbrVec = null;
+
+// In-memory vector list over OPEN bug reports (project EBR) with a current-version embedding. Mirrors
+// _ensureVecIndex but keeps only open EBRs (closed ones aren't ranked and lose their slot).
+EJF_SD.rank._ensureEbrVecIndex = function () {
+    if (EJF_SD.rank._ebrVecIndex && !EJF_SD.rank._dirtyEbrVec) { return Promise.resolve(EJF_SD.rank._ebrVecIndex); }
+    if (EJF_SD.rank._buildingEbrVec) { return EJF_SD.rank._buildingEbrVec; }
+    EJF_SD.rank._buildingEbrVec = EJF_SD.db.allDefects().then(function (recs) {
+        var docs = [];
+        for (var i = 0; i < recs.length; i++) {
+            var r = recs[i];
+            if (r.project !== 'EBR') { continue; }
+            if (EJF_SD.util.isResolved(r.status, r.resolution)) { continue; }   // open reports only
+            if (r.embedding && r.embeddingModelVersion === EJF_SD.MODEL_VERSION) {
+                docs.push({ key: r.key, project: r.project, summary: r.summary, status: r.status, resolution: r.resolution, vec: r.embedding });
+            }
+        }
+        EJF_SD.rank._ebrVecIndex = docs;
+        EJF_SD.rank._dirtyEbrVec = false;
+        EJF_SD.rank._buildingEbrVec = null;
+        return docs;
+    }).catch(function (e) { EJF_SD.rank._buildingEbrVec = null; throw e; });
+    return EJF_SD.rank._buildingEbrVec;
+};
+
+// Cosine-score every stored OPEN-EBR vector against the query vector, sorted best-first. [] if none embedded.
+EJF_SD.rank._semanticScoredEbr = function (qv, excludeKey) {
+    return EJF_SD.rank._ensureEbrVecIndex().then(function (docs) {
+        var scored = [];
+        for (var d = 0; d < docs.length; d++) {
+            if (excludeKey && docs[d].key === excludeKey) { continue; }
+            var sc = EJF_SD.rank._dot(qv, docs[d].vec);
+            if (!isFinite(sc)) { continue; }
+            scored.push({ key: docs[d].key, project: docs[d].project, summary: docs[d].summary, status: docs[d].status, resolution: docs[d].resolution, score: sc });
         }
         scored.sort(function (a, c) { return c.score - a.score; });
         return scored;
@@ -3504,6 +3746,67 @@ EJF_SD.rank.suggestBest = function (text, key, brCreated) {
             settled = true;
             resolve(keywordOnly());
         }, EJF_SD.embed.WARM_WAIT_MS);
+        EJF_SD.embed.load().then(function () {
+            if (settled) { return; }
+            settled = true; clearTimeout(timer);
+            resolve(hybrid());
+        }, function () {
+            if (settled) { return; }
+            settled = true; clearTimeout(timer);
+            resolve(keywordOnly());
+        });
+    });
+};
+
+// EDR (defect) -> matching OPEN bug reports, best available ranking. Same hybrid (semantic + BM25, fused
+// with RRF) approach as suggestBest, but over the EBR indexes and with no stale-demotion (open reports have
+// no fix date). Returns { mode: 'Hybrid' | 'Keyword', results: [...] } with a display % per result.
+EJF_SD.rank.suggestEbrBest = function (text, key) {
+    function keywordOnly() {
+        // suggestEbr already attaches a top-relative pct.
+        return EJF_SD.rank.suggestEbr(text, key, EJF_SD.TOP_N).then(function (list) {
+            return { mode: 'Keyword', results: list };
+        });
+    }
+    function hybrid() {
+        return EJF_SD.embed.embedOne(text).then(function (qv) {
+        return EJF_SD.rank._semanticScoredEbr(qv, key).then(function (sem) {
+            if (!sem.length) { return keywordOnly(); }   // nothing embedded yet
+            return EJF_SD.rank.suggestEbr(text, key, EJF_SD.rank.CAND).then(function (bm) {
+                var K = EJF_SD.rank.RRF_K;
+                var rrf = {}, meta = {}, cosByKey = {};
+                var semTop = sem.slice(0, EJF_SD.rank.CAND);
+                for (var i = 0; i < semTop.length; i++) { rrf[semTop[i].key] = (rrf[semTop[i].key] || 0) + 1 / (K + i); meta[semTop[i].key] = semTop[i]; }
+                for (var j = 0; j < bm.length; j++) { rrf[bm[j].key] = (rrf[bm[j].key] || 0) + 1 / (K + j); if (!meta[bm[j].key]) { meta[bm[j].key] = bm[j]; } }
+                for (var c = 0; c < sem.length; c++) { cosByKey[sem[c].key] = sem[c].score; }
+                var out = Object.keys(rrf).map(function (k) {
+                    var m = meta[k];
+                    var hasCos = (cosByKey[k] !== undefined && isFinite(cosByKey[k]));
+                    return {
+                        key: k, project: m.project, summary: m.summary, status: m.status, resolution: m.resolution,
+                        rrf: rrf[k], pct: hasCos ? Math.round(Math.max(0, Math.min(1, cosByKey[k])) * 100) : 0
+                    };
+                });
+                // RRF decides the cut; present sorted by the displayed similarity % (matches suggestBest).
+                out.sort(function (a, c2) { return c2.rrf - a.rrf; });
+                var topN = out.slice(0, EJF_SD.TOP_N);
+                topN.sort(function (a, c2) { return c2.pct - a.pct; });
+                return { mode: 'Hybrid', results: topN };
+            });
+        });
+        }).catch(function () {
+            EJF_SD.embed._resetPipe();   // drop a possibly-dead pipeline; show keyword results for now
+            return keywordOnly();
+        });
+    }
+
+    if (EJF_SD.embed.ready) { return hybrid(); }
+    if (EJF_SD.embed.unavailable) { return keywordOnly(); }
+    // Not ready yet: kick off the warm-up + embed pass, then briefly wait for the model (fast when cached).
+    EJF_SD.embed.prepare();
+    return new Promise(function (resolve) {
+        var settled = false;
+        var timer = setTimeout(function () { if (settled) { return; } settled = true; resolve(keywordOnly()); }, EJF_SD.embed.WARM_WAIT_MS);
         EJF_SD.embed.load().then(function () {
             if (settled) { return; }
             settled = true; clearTimeout(timer);
@@ -4062,6 +4365,23 @@ EJF_SD.ui = {
         return $li;
     },
 
+    // Row builder for the EDR "matching bug reports" view: like _item but with NO "Mark dup" control (the
+    // dup action is an EBR-page concept) and the link opens in a new tab so the defect page stays put.
+    _reportItem: function (r) {
+        var pct = (typeof r.pct === 'number') ? r.pct : 0;
+        var meta = r.status || '';
+        if (r.resolution) { meta += (meta ? ' · ' : '') + r.resolution; }
+        var $li = $('<li></li>');
+        $li.on('mouseenter', function () { EJF_SD.ui._showTip(r, this, meta); });
+        $li.on('mouseleave', function () { EJF_SD.ui._hideTip(); });
+        $('<a></a>').attr('href', '/browse/' + r.key).attr('target', '_blank').text(r.key).appendTo($li);
+        $('<span class="ejf-sd-proj"></span>').text(r.project || '').appendTo($li);
+        $('<span class="ejf-sd-score"></span>').text(pct + '%').appendTo($li);
+        $('<div class="ejf-sd-sum"></div>').text(r.summary || '').appendTo($li);
+        if (meta) { $('<div class="ejf-sd-meta"></div>').text(meta).appendTo($li); }
+        return $li;
+    },
+
     // Read the open issue's text from the DOM (reusing the Translate selectors); fall back to a REST GET.
     getIssueText: function (key) {
         var title = $("h1[data-testid='issue.views.issue-base.foundation.summary.heading']").text() || '';
@@ -4175,8 +4495,8 @@ EJF_SD.ui = {
         var $box = $('#ejf-sd-loglink');
         if (!$box.length) { return; }
         $box.removeClass('has-hits').empty();
-        EJF_SD.db.countDefects().then(function (n) {
-            if (!n) { return; }   // no local data to match against yet
+        EJF_SD.db.countDefectsOnly().then(function (n) {
+            if (!n) { return; }   // no defects to match the log against yet
             EJF_SD.ui.scanIssueLog(key).then(function (found) {
                 if (EJF_SD.ui.currentKey !== key) { return; }   // navigated to another issue meanwhile
                 var keys = Object.keys(found || {});
@@ -4202,11 +4522,12 @@ EJF_SD.ui = {
 
     render: function (key) {
         EJF_SD.ui._ensurePanel();
+        $('#ejf-sd-title').text('Similar defects');   // reset title (the panel is shared with the EDR reports view)
         EJF_SD.ui.renderLogLink(key);   // scan the attached log for known defects (no need to open it)
         $('#ejf-sd-list').empty();
         EJF_SD.ui.setStatus('Finding similar defects…');
         EJF_SD.ui.getIssueText(key).then(function (text) {
-            return EJF_SD.db.countDefects().then(function (n) {
+            return EJF_SD.db.countDefectsOnly().then(function (n) {
                 if (!n) {
                     EJF_SD.ui.setStatus('No local data yet – open the Tampermonkey menu and click “Sync defects now”.');
                     return;
@@ -4237,21 +4558,83 @@ EJF_SD.ui = {
         }).catch(function (e) { EJF_SD.ui.setStatus('Error: ' + (e && e.message || e)); });
     },
 
-    // Show/refresh the panel only on EBR bug reports; re-query when the issue key changes.
+    // EDR (defect) view: rank the OPEN bug reports that best match this defect's description (keyword BM25),
+    // and list them in the same panel. Mirrors render() but over the EBR index, with no log-scan / mark-dup.
+    renderReports: function (key) {
+        EJF_SD.ui._ensurePanel();
+        $('#ejf-sd-title').text('Matching bug reports');
+        $('#ejf-sd-loglink').removeClass('has-hits').empty();   // EBR-only section; unused on a defect
+        $('#ejf-sd-list').empty();
+        EJF_SD.ui.setStatus('Finding matching bug reports…');
+        EJF_SD.ui.getIssueText(key).then(function (text) {
+            return EJF_SD.db.countEbr().then(function (n) {
+                if (!n) {
+                    EJF_SD.ui.setStatus('No bug reports synced yet – open the Tampermonkey menu and click “Sync bug reports now”.');
+                    return;
+                }
+                if (!text) { EJF_SD.ui.setStatus('Could not read this defect’s text.'); return; }
+                return EJF_SD.rank.suggestEbrBest(text, key).then(function (out) {
+                    var results = out.results || [];
+                    $('#ejf-sd-mode').text(out.mode);   // 'Hybrid' or 'Keyword'
+                    if (!results.length) { EJF_SD.ui.setStatus('No matching bug reports found (' + n + ' open).'); return; }
+                    EJF_SD.ui.setStatus(results.length + ' matches · ' + out.mode + ' · ' + n + ' open reports');
+                    // Enrich with each report's full description for the hover preview (a handful of reads).
+                    return Promise.all(results.map(function (r) {
+                        return EJF_SD.db.getDefect(r.key).then(function (rec) {
+                            if (rec) { r.description = rec.description; }
+                            return r;
+                        }, function () { return r; });
+                    })).then(function () {
+                        var $list = $('#ejf-sd-list');
+                        for (var i = 0; i < results.length; i++) { $list.append(EJF_SD.ui._reportItem(results[i])); }
+                        EJF_SD.ui._fitVertical();   // list height changed - re-check it still fits / drops up
+                    });
+                });
+            });
+        }).catch(function (e) { EJF_SD.ui.setStatus('Error: ' + (e && e.message || e)); });
+    },
+
+    // When we land on an EDR that isn't in the local DB yet (e.g. a freshly created / just-converted defect),
+    // kick off a quiet catch-up sync so it gets indexed. Guarded per key (once per session) and skipped while
+    // a sync is already running or when the defect DB is empty (the initial build stays a deliberate manual
+    // action). The catch-up is incremental, so it cheaply fetches the new EDR via the updated-since cursor.
+    _autoSyncedKeys: {},
+    _maybeSyncForDefect: function (key) {
+        if (EJF_SD.ui._autoSyncedKeys[key]) { return; }
+        if (EJF_SD.sync.running) { return; }
+        EJF_SD.db.countDefectsOnly().then(function (n) {
+            if (!n) { return; }   // no defect DB yet - don't auto-trigger the initial build
+            return EJF_SD.db.getDefect(key).then(function (rec) {
+                if (rec) { return; }   // already indexed - nothing to do
+                EJF_SD.ui._autoSyncedKeys[key] = true;   // don't retrigger for this key this session
+                console.log('[EJF-SD] EDR ' + key + ' not in local DB - triggering catch-up sync');
+                EJF_SD.sync.autoSync();   // quiet incremental catch-up (fetches the new EDR; embeds + refreshes)
+            });
+        });
+    },
+
+    // Show/refresh the panel on EBR bug reports (similar defects) AND on EDR defects (matching reports);
+    // re-query when the issue key changes. Any other issue type removes the panel.
     ensure: function () {
         if (!savedVariables[5][1]) { return; }
         var $bc = $('a[data-testid="issue.views.issue-base.foundation.breadcrumbs.current-issue.item"]');
         if (!$bc.length) { return; }
         var key = $.trim($bc.first().text());
-        if (!/^EBR-/.test(key)) {
-            // not a bug report - remove any stale panel
+        var isEbr = /^EBR-/.test(key), isEdr = /^EDR-/.test(key);
+        if (!isEbr && !isEdr) {
+            // neither a bug report nor a defect - remove any stale panel
             if ($('#ejf-sd-panel').length) { $('#ejf-sd-panel').remove(); }
             EJF_SD.ui.currentKey = null;
             return;
         }
         if ($('#ejf-sd-panel').length && EJF_SD.ui.currentKey === key) { return; }
         EJF_SD.ui.currentKey = key;
-        EJF_SD.ui.render(key);
+        if (isEbr) {
+            EJF_SD.ui.render(key);              // bug report -> similar defects
+        } else {
+            EJF_SD.ui.renderReports(key);       // defect -> matching open bug reports
+            EJF_SD.ui._maybeSyncForDefect(key); // ...and index this EDR if we don't have it yet
+        }
     }
 };
 
