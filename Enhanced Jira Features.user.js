@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.11.0
+// @version     2.12.0
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -28,15 +28,18 @@
 
 
 // Creating various variables which we use later on
-var rows, oc, lc, pdm, pdmdata, driverAge = "unknown", menu_settings, menu_parser, menu_scrollbar, menu_dropdowns, menu_buttons, menu_similarDefects, menu_sdSync, menu_sdRebuild, menu_sdBackend, menu_sdSyncEbr;
+var rows, oc, lc, pdm, pdmdata, driverAge = "unknown", menu_settings, menu_parser, menu_scrollbar, menu_buttons, menu_similarDefects, menu_sdSync, menu_sdRebuild, menu_sdBackend, menu_sdSyncEbr;
 
 
 // Current Date
 var today = new Date();
 
 
-// Array which contains the locally saved values for a couple of variables
-var savedVariables = [["key",""], ["parser", ""], ["scrollbar", ""], ["dropdowns", ""], ["buttons", ""], ["similarDefects", ""]];
+// Array which contains the locally saved values for a couple of variables.
+// NOTE: index 3 ("dropdowns") is a RETIRED feature (Linked Issue Dropdowns, removed because Jira's markup
+// changed and it stopped working). The slot is kept as a placeholder so the later indices (4 = buttons,
+// 5 = similarDefects), which are referenced by number throughout this file, don't shift.
+var savedVariables = [["key",""], ["parser", ""], ["scrollbar", ""], ["dropdowns_retired", ""], ["buttons", ""], ["similarDefects", ""]];
 
 
 // Listener which triggers when the locally saved "scrollbar" value is changed. If the new value is false we remove the custom scrollbar. If the new value is true we add the custom scrollbar.
@@ -63,39 +66,6 @@ GM_addValueChangeListener("buttons", function(key, oldValue, newValue, remote) {
         $('#closeButton').remove();
     } else {
         addButtons();
-    }
-});
-
-
-// Listener which triggers when the locally saved "dropdowns" value is changed. If the new value is false we remove functionality of the LinkedIssue dropdowns. If the new value is true we add the dropdowns to LinkedIssues.
-GM_addValueChangeListener("dropdowns", function(key, oldValue, newValue, remote) {
-    if (!newValue) {
-        let reasons = ['duplicates', 'added to idea', 'blocks', 'is blocked by', 'clones', 'is cloned by', 'is duplicated by', 'has to be finished together with', 'has to be done before', 'has to be done after', 'earliest end is start of', 'start is earliest end of', 'has to be started together with', 'split to', 'split from', 'is parent of', 'is child of', 'is idea for', 'implements', 'is implemented by', 'merged from', 'merged into', 'reviews', 'is reviewed by', 'causes', 'is caused by', 'relates to']
-
-        for (let i = 0; i < reasons.length; i++) {
-            if ($('h3 > span:contains(' + reasons[i] + ')')) {
-                $('h3 > span:contains(' + reasons[i] + ')').text(reasons[i]);
-                $('h3 > span:contains(' + reasons[i] + ')').css('cursor', '');
-                $('h3 > span:contains(' + reasons[i] + ')').parent().next().show();
-                $('h3 > span:contains(' + reasons[i] + ')').off('click');
-            }
-        }
-    } else {
-        let reasons = ['duplicates', 'added to idea', 'blocks', 'is blocked by', 'clones', 'is cloned by', 'is duplicated by', 'has to be finished together with', 'has to be done before', 'has to be done after', 'earliest end is start of', 'start is earliest end of', 'has to be started together with', 'split to', 'split from', 'is parent of', 'is child of', 'is idea for', 'implements', 'is implemented by', 'merged from', 'merged into', 'reviews', 'is reviewed by', 'causes', 'is caused by', 'relates to']
-
-        for (let i = 0; i < reasons.length; i++) {
-            if ($('h3 > span:contains(' + reasons[i] + ')')) {
-                let children = $('h3 > span:contains(' + reasons[i] + ')').parent().next().children().length;
-
-                $('h3 > span:contains(' + reasons[i] + ')').text('> ' + reasons[i] + ' - '+ children +' elements');
-                $('h3 > span:contains(' + reasons[i] + ')').css('cursor', 'pointer');
-                $('h3 > span:contains(' + reasons[i] + ')').parent().next().toggle();
-                $('h3 > span:contains(' + reasons[i] + ')').click(function() {
-                    $(this).parent().next().toggle();
-                    $(this).toggleText('> ' + reasons[i] + ' - '+ children +' elements', '⌄ ' + reasons[i] + ' - '+ children +' elements')
-                });
-            }
-        }
     }
 });
 
@@ -181,14 +151,6 @@ function toggleParser() {
 function toggleScrollbar() {
     savedVariables[2][1] = savedVariables[2][1] ? false : true;
     GM_setValue (savedVariables[2][0], savedVariables[2][1]);
-    refreshMenu();
-};
-
-
-// Function which toggles between true and false for the dropdowns variable and saves it locally
-function toggleDropdown() {
-    savedVariables[3][1] = savedVariables[3][1] ? false : true;
-    GM_setValue (savedVariables[3][0], savedVariables[3][1]);
     refreshMenu();
 };
 
@@ -515,32 +477,6 @@ $.fn.extend({
         return this.text(this.text() == b ? a : b);
     }
 });
-
-
-// When we detect the "Linked Issues" header on the page then we run the createDropdowns function which creates dropdown lists for all linked issues
-var linkedIssues = 'h2:contains(Linked issue)';
-waitForKeyElements (linkedIssues, createDropdowns);
-
-
-// Function which creates dropdown lists for all different types of linked issues instead of listing them all by default
-function createDropdowns() {
-    let reasons = ['duplicates', 'added to idea', 'blocks', 'is blocked by', 'clones', 'is cloned by', 'is duplicated by', 'has to be finished together with', 'has to be done before', 'has to be done after', 'earliest end is start of', 'start is earliest end of', 'has to be started together with', 'split to', 'split from', 'is parent of', 'is child of', 'is idea for', 'implements', 'is implemented by', 'merged from', 'merged into', 'reviews', 'is reviewed by', 'causes', 'is caused by', 'relates to']
-
-    if (savedVariables[3][1]) {
-        for (let i = 0; i < reasons.length; i++) {
-            if ($('h3 > span:contains(' + reasons[i] + ')')) {
-                let children = $('h3 > span:contains(' + reasons[i] + ')').parent().next().children().length;
-                $('h3 > span:contains(' + reasons[i] + ')').text('> ' + reasons[i] + ' - '+ children +' elements');
-                $('h3 > span:contains(' + reasons[i] + ')').css('cursor', 'pointer');
-                $('h3 > span:contains(' + reasons[i] + ')').parent().next().toggle();
-                $('h3 > span:contains(' + reasons[i] + ')').click(function() {
-                    $(this).parent().next().toggle();
-                    $(this).toggleText('> ' + reasons[i] + ' - '+ children +' elements', '⌄ ' + reasons[i] + ' - '+ children +' elements')
-                });
-            }
-        }
-    };
-}
 
 
 // When we detect the "title row" of a log parser file then we swap out the content of the log file with a parsed, more readable version of it with some extra features like buttons which allow you to toggle the visibility of certain types of events
@@ -4880,7 +4816,6 @@ EJF_SD.menu = {
         $('<h3>Features</h3>').appendTo($feat);
         $feat.append(EJF_SD.menu._toggleRow('Log Parser', !!savedVariables[1][1], toggleParser));
         $feat.append(EJF_SD.menu._toggleRow('Custom Scrollbar', !!savedVariables[2][1], toggleScrollbar));
-        $feat.append(EJF_SD.menu._toggleRow('Linked Issue Dropdowns', !!savedVariables[3][1], toggleDropdown));
         $feat.append(EJF_SD.menu._toggleRow('Extra Buttons', !!savedVariables[4][1], toggleButtons));
         $feat.append(EJF_SD.menu._toggleRow('Triage Assistant (Beta)', !!savedVariables[5][1], toggleSimilarDefects));
         $p.append($feat);
