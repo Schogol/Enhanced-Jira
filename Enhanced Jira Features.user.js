@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.12.1
+// @version     2.12.2
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -1849,7 +1849,7 @@ var EJF_SD = {
     HOST: 'https://fenriscreations.atlassian.net',
     SCOPE: 'project in (EDR, EO)',                 // dataset definition (tweak here to change scope)
     EBR_SCOPE: 'project = EBR AND statusCategory != Done',  // open bug reports, for the EDR "matching reports" view
-    FIELDS: ['summary', 'description', 'status', 'resolution', 'resolutiondate', 'components', 'updated', 'project'],
+    FIELDS: ['summary', 'description', 'status', 'resolution', 'resolutiondate', 'created', 'components', 'updated', 'project'],
     DB_NAME: 'EJF_SimilarDefects',
     DB_VERSION: 1,
     PAGE_SIZE: 100,
@@ -1857,8 +1857,14 @@ var EJF_SD = {
     NEAR_LIMIT_DELAY_MS: 3000,                     // back off harder when the rate-limit budget is low
     MAX_RETRIES: 5,
     TOP_N: 8,
-    MODEL_VERSION: 'gte-small-v3'                   // embedding model tag; bump to force a full re-embed
+    MODEL_VERSION: 'gte-small-v3',                  // embedding model tag; bump to force a full re-embed
                                                     // (v1 = NaN from fp16; v2 = fp32; v3 = boilerplate-stripped text)
+    DATA_VERSION: 1                                 // stored-record SCHEMA version. Bump whenever a sync change
+                                                    // adds/changes a FIELD on stored records that a plain
+                                                    // incremental catch-up can't backfill (it only re-fetches
+                                                    // CHANGED issues, so old rows keep the old shape). On load
+                                                    // EJF_SD.migrate auto-re-fetches any dataset stamped below
+                                                    // this. (v1 = added the `created` field for the row date.)
 };
 
 
@@ -2383,6 +2389,15 @@ EJF_SD.util = {
         if (days >= 365) { return Math.round(days / 365 * 10) / 10 + 'y'; }
         if (days >= 60) { return Math.round(days / 30) + 'mo'; }
         return days + 'd';
+    },
+
+    // Format a Jira ISO timestamp as a plain "YYYY-MM-DD" date for display (e.g. a suggestion's created
+    // date). Returns '' for missing / invalid input so callers can skip rendering it.
+    fmtDate: function (iso) {
+        var d = new Date(iso);
+        if (isNaN(d.getTime())) { return ''; }
+        function p(n) { return (n < 10 ? '0' : '') + n; }
+        return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
     }
 };
 
@@ -2588,6 +2603,7 @@ EJF_SD.sync = {
             status: (f.status && f.status.name) || '',
             resolution: (f.resolution && f.resolution.name) || null,
             resolutiondate: f.resolutiondate || null,   // when the defect was fixed/closed (for stale-match demotion)
+            created: f.created || null,                  // when the issue was created (shown in the suggestion row)
             components: components,
             updated: f.updated || '',
             embedding: null,
@@ -2680,8 +2696,13 @@ EJF_SD.sync = {
             return EJF_SD.db.getMeta('lastSyncHighWater').then(function (hw) {
                 var jql = EJF_SD.SCOPE + ' ORDER BY updated ASC';
                 return EJF_SD.sync._run(jql, { startToken: rt || null, startHighWater: hw || '' }).then(function (res) {
+                    // A full crawl re-fetched every defect, so the whole dataset now carries the current field
+                    // set - stamp the schema version + build time (read by EJF_SD.migrate to auto-rebuild a
+                    // stale DB, and shown in the settings menu so you can see when the DB was built).
                     return EJF_SD.db.setMeta('lastFullSyncAt', new Date().toISOString())
                         .then(function () { return EJF_SD.db.setMeta('modelVersion', EJF_SD.MODEL_VERSION); })
+                        .then(function () { return EJF_SD.db.setMeta('dataVersionDefects', EJF_SD.DATA_VERSION); })
+                        .then(function () { return EJF_SD.db.setMeta('dbBuiltAtDefects', new Date().toISOString()); })
                         .then(function () { return res; });
                 });
             });
@@ -2781,6 +2802,55 @@ EJF_SD.sync = {
             });
     },
 
+    // Re-crawl a whole dataset from scratch WITHOUT clearing it first (unlike rebuild). Resetting the cursors
+    // forces a full crawl; because the existing records stay put, _run's "preserve embedding when textHash is
+    // unchanged" path keeps every vector while bulkPut overwrites each record with the current field set - so
+    // a newly-added field (e.g. `created`) is backfilled with NO re-embedding. Used by EJF_SD.migrate to
+    // upgrade a DB built before a field existed. Single-flight via `running`; quiet (no confirm dialog).
+    refetchDefects: function () {
+        if (EJF_SD.sync.running) { return Promise.resolve(); }
+        EJF_SD.sync.running = true;
+        EJF_SD.ui.toast('Updating local defect database to the latest format…');
+        return EJF_SD.db.setMeta('resumeToken', null)
+            .then(function () { return EJF_SD.db.setMeta('lastSyncHighWater', ''); })
+            .then(function () { EJF_SD.rank._dirty = true; EJF_SD.rank._dirtyVec = true; return EJF_SD.sync.fullSync(); })
+            .then(function () {
+                return EJF_SD.db.countDefectsOnly().then(function (total) {
+                    EJF_SD.sync.running = false;
+                    EJF_SD.ui.toast('Defect database updated – ' + total + ' defects.');
+                    EJF_SD.sched.markSynced();
+                    if (EJF_SD.ui.currentKey && /^EBR-/.test(EJF_SD.ui.currentKey)) { EJF_SD.ui.scheduleRender(); }
+                    EJF_SD.embed.prepare(true);
+                });
+            })
+            .catch(function (e) {
+                EJF_SD.sync.running = false;
+                console.log('[EJF-SD] defect refetch (migration) failed:', e && e.message || e);
+            });
+    },
+
+    refetchEbr: function () {
+        if (EJF_SD.sync.running) { return Promise.resolve(); }
+        EJF_SD.sync.running = true;
+        EJF_SD.ui.toast('Updating local bug report database to the latest format…');
+        return EJF_SD.db.setMeta('resumeTokenEbr', null)
+            .then(function () { return EJF_SD.db.setMeta('lastSyncHighWaterEbr', ''); })
+            .then(function () { EJF_SD.rank._dirtyEbr = true; EJF_SD.rank._dirtyEbrVec = true; return EJF_SD.sync.fullSyncEbr(); })
+            .then(function () {
+                return EJF_SD.db.countEbr().then(function (total) {
+                    EJF_SD.sync.running = false;
+                    EJF_SD.ui.toast('Bug report database updated – ' + total + ' open reports.');
+                    EJF_SD.sched.markSynced();
+                    if (EJF_SD.ui.currentKey && EJF_SD.ui._isDefectKey(EJF_SD.ui.currentKey)) { EJF_SD.ui.scheduleRender(); }
+                    EJF_SD.embed.prepare(true);
+                });
+            })
+            .catch(function (e) {
+                EJF_SD.sync.running = false;
+                console.log('[EJF-SD] bug report refetch (migration) failed:', e && e.message || e);
+            });
+    },
+
     // ---- open bug reports (EBR) sync, for the EDR "matching reports" view ----
     // Same paging engine as the defects, but its own meta cursors (resumeTokenEbr / lastSyncHighWaterEbr)
     // and the EBR keyword index as the dirty target. The FULL build uses the open-only scope; the
@@ -2789,7 +2859,12 @@ EJF_SD.sync = {
         return EJF_SD.db.getMeta('resumeTokenEbr').then(function (rt) {
             return EJF_SD.db.getMeta('lastSyncHighWaterEbr').then(function (hw) {
                 var jql = EJF_SD.EBR_SCOPE + ' ORDER BY updated ASC';
-                return EJF_SD.sync._run(jql, { startToken: rt || null, startHighWater: hw || '', metaPrefix: 'Ebr', isEbr: true });
+                return EJF_SD.sync._run(jql, { startToken: rt || null, startHighWater: hw || '', metaPrefix: 'Ebr', isEbr: true }).then(function (res) {
+                    // Full open-EBR crawl -> stamp the EBR schema version + build time (see fullSync / EJF_SD.migrate).
+                    return EJF_SD.db.setMeta('dataVersionEbr', EJF_SD.DATA_VERSION)
+                        .then(function () { return EJF_SD.db.setMeta('dbBuiltAtEbr', new Date().toISOString()); })
+                        .then(function () { return res; });
+                });
             });
         });
     },
@@ -3390,7 +3465,8 @@ EJF_SD.rank.suggestBest = function (text, key, brCreated) {
         if (typeof r.rrf === 'number') { r.rrf *= sf.factor; }
         if (typeof r.pct === 'number') { r.pct = Math.round(r.pct * sf.factor); }
         r.stale = true;
-        r.staleNote = 'Closed · fixed ' + EJF_SD.util.humanizeAge(sf.ageDays) + ' before report';
+        // Note: the meta line already shows the status ("Closed"), so don't repeat it here - just the gap.
+        r.staleNote = 'fixed ' + EJF_SD.util.humanizeAge(sf.ageDays) + ' before report';
     }
     function keywordOnly() {
         // Pull a wider candidate set so the demotion can re-order before we cut to TOP_N (a stale match
@@ -3709,6 +3785,7 @@ EJF_SD.ui = {
 .ejf-sd-list li.ejf-sd-stale { opacity: .6; }\
 .ejf-sd-sum { margin-top: 2px; color: #e6e6e6; }\
 .ejf-sd-meta { margin-top: 2px; color: #7a8694; font-size: 10px; }\
+.ejf-sd-date { margin-top: 2px; color: #7a8694; font-size: 10px; text-align: right; }\
 #ejf-sd-loglink { display: none; padding: 6px 10px; border-bottom: 1px solid #2c333a; background: #20262b; }\
 #ejf-sd-loglink.has-hits { display: block; }\
 #ejf-sd-loglink .ejf-sd-loglink-head { font-weight: 700; color: #ffb547; font-size: 11px; margin-bottom: 4px; }\
@@ -3767,15 +3844,19 @@ EJF_SD.ui = {
 #ejf-side-group #ejf-sd-loglink.has-hits { display: block; }\
 #ejf-side-group #ejf-sd-loglink .ejf-sd-loglink-head { color: var(--ds-text-warning, #974f0c); }\
 /* Responsive 2-up grid: two columns once the context column is wide enough (each cell >= 280px),\
-   automatically collapsing to one column when narrow. align-items:start so each row sizes to its own\
-   items (no stretching short cards to a tall neighbour). */\
-#ejf-side-group #ejf-sd-list { overflow: visible; display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); column-gap: 18px; align-items: start; }\
-#ejf-side-group #ejf-sd-list li { padding: 7px 0; border-bottom: 1px solid var(--ds-border, #091e4224); }\
+   automatically collapsing to one column when narrow. align-items:stretch so both cards in a row share\
+   the height of the taller one (left + right column line up). */\
+#ejf-side-group #ejf-sd-list { overflow: visible; display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); column-gap: 18px; align-items: stretch; }\
+/* Each card is position:relative + bottom padding so the created date can be pinned to the bottom-right\
+   (absolute) of the STRETCHED cell - so the dates line up across the two columns even when one card has\
+   less content than the other (the short card no longer floats its date mid-card with a gap below it). */\
+#ejf-side-group #ejf-sd-list li { position: relative; padding: 7px 0 22px; border-bottom: 1px solid var(--ds-border, #091e4224); }\
+#ejf-side-group .ejf-sd-date { position: absolute; right: 0; bottom: 7px; margin-top: 0; }\
 /* With a grid the simple :last-child no-border rule is wrong (only kills one of the bottom row); leave\
    borders on every item - a faint divider under each card reads fine in either column count. */\
 #ejf-side-group #ejf-sd-list a, #ejf-side-group .ejf-sd-link { color: var(--ds-link, #0c66e4); }\
 #ejf-side-group .ejf-sd-sum { color: var(--ds-text, #172b4d); }\
-#ejf-side-group .ejf-sd-meta, #ejf-side-group .ejf-sd-score { color: var(--ds-text-subtlest, #626f86); }\
+#ejf-side-group .ejf-sd-meta, #ejf-side-group .ejf-sd-score, #ejf-side-group .ejf-sd-date { color: var(--ds-text-subtlest, #626f86); }\
 #ejf-side-group .ejf-sd-proj { background: var(--ds-background-neutral, #091e420f); color: var(--ds-text-subtle, #44546f); }\
 #ejf-side-group .ejf-sd-link.ejf-sd-linked { color: var(--ds-text-success, #216e4e); }',
 
@@ -4377,7 +4458,7 @@ EJF_SD.ui = {
     // "Known defects in attached log" section so both behave identically.
     _markDupButton: function (defectKey) {
         var $dup = $('<span class="ejf-sd-link"></span>')
-            .text('Mark dup')
+            .text('Attach')
             .attr('title', 'Link this bug report as a duplicate of ' + defectKey);
         $dup.on('click', function (ev) {
             ev.preventDefault();
@@ -4396,18 +4477,13 @@ EJF_SD.ui = {
                     ? ('Linked ' + ebr + ' as a duplicate of ' + defectKey + ' and set it to Attached.')
                     : ('Linked ' + ebr + ' as a duplicate of ' + defectKey + ' (could not set Attached).');
                 if (!res.linked) { msg = 'Set ' + ebr + ' to Attached, but the duplicate link failed.'; }
-                // Patch the status lozenge in place rather than reloading the whole page. If we can't find it,
-                // fall back to a full reload so the change is still reflected. (The new link appears in the
-                // Linked Issues section on the next natural refresh.)
-                var patched = res.attached ? EJF_SD.ui.softRefreshStatus('Attached') : false;
-                if (res.attached && !patched) {
-                    EJF_SD.ui.toast(msg + ' Reloading…');
-                    setTimeout(function () { window.location.reload(false); }, 1200);
-                } else {
-                    EJF_SD.ui.toast(msg);
-                }
+                // Soft-patch the status lozenge in place - no full reload. The duplicate link is created
+                // server-side and shows in Jira's "Linked work items" section on the next natural refresh.
+                if (res.attached) { EJF_SD.ui.softRefreshStatus('Attached'); }
+                EJF_SD.ui.toast(msg);
             }, function (e) {
-                $btn.removeClass('ejf-sd-linking').text('Mark dup');
+                console.log('[EJF-SD] mark-dup failed (attachDuplicate rejected):', e && e.message || e);
+                $btn.removeClass('ejf-sd-linking').text('Attach');
                 EJF_SD.ui.toast('Could not link: ' + (e && e.message || e));
             });
         });
@@ -4432,6 +4508,8 @@ EJF_SD.ui = {
         EJF_SD.ui._markDupButton(r.key).appendTo($li);
         $('<div class="ejf-sd-sum"></div>').text(r.summary || '').appendTo($li);
         if (meta) { $('<div class="ejf-sd-meta"></div>').text(meta).appendTo($li); }
+        var created = EJF_SD.util.fmtDate(r.created);
+        if (created) { $('<div class="ejf-sd-date"></div>').text('Created ' + created).appendTo($li); }
         return $li;
     },
 
@@ -4449,6 +4527,8 @@ EJF_SD.ui = {
         $('<span class="ejf-sd-score"></span>').text(pct + '%').appendTo($li);
         $('<div class="ejf-sd-sum"></div>').text(r.summary || '').appendTo($li);
         if (meta) { $('<div class="ejf-sd-meta"></div>').text(meta).appendTo($li); }
+        var created = EJF_SD.util.fmtDate(r.created);
+        if (created) { $('<div class="ejf-sd-date"></div>').text('Created ' + created).appendTo($li); }
         return $li;
     },
 
@@ -4633,7 +4713,7 @@ EJF_SD.ui = {
                     // reads (just the shown results), so it's cheap.
                     return Promise.all(results.map(function (r) {
                         return EJF_SD.db.getDefect(r.key).then(function (rec) {
-                            if (rec) { r.description = rec.description; }
+                            if (rec) { r.description = rec.description; r.created = rec.created; }
                             return r;
                         }, function () { return r; });
                     })).then(function () {
@@ -4671,7 +4751,7 @@ EJF_SD.ui = {
                     // Enrich with each report's full description for the hover preview (a handful of reads).
                     return Promise.all(results.map(function (r) {
                         return EJF_SD.db.getDefect(r.key).then(function (rec) {
-                            if (rec) { r.description = rec.description; }
+                            if (rec) { r.description = rec.description; r.created = rec.created; }
                             return r;
                         }, function () { return r; });
                     })).then(function () {
@@ -4861,13 +4941,22 @@ EJF_SD.menu = {
                 .on('click', function () { toggleEmbedBackend(); }).appendTo($row);
             $ta.append($row);
 
-            // Live "what's indexed" status (defects + open reports), filled in async.
+            // Live "what's indexed" status (defects + open reports) + when each local DB was last built,
+            // filled in async.
             var $status = $('<div class="ejf-menu-status">Loading database status…</div>').appendTo($ta);
             EJF_SD.db.countDefectsOnly().then(function (d) {
                 return EJF_SD.db.countEbr().then(function (e) {
-                    if (document.getElementById('ejf-menu')) {
-                        $status.text(d + ' defects · ' + e + ' open bug reports indexed locally');
-                    }
+                    return EJF_SD.db.getMeta('dbBuiltAtDefects').then(function (bd) {
+                        return EJF_SD.db.getMeta('dbBuiltAtEbr').then(function (be) {
+                            if (!document.getElementById('ejf-menu')) { return; }
+                            var line = d + ' defects · ' + e + ' open bug reports indexed locally';
+                            var built = [];
+                            if (bd) { built.push('defects ' + EJF_SD.util.fmtDate(bd)); }
+                            if (be) { built.push('reports ' + EJF_SD.util.fmtDate(be)); }
+                            if (built.length) { line += ' · built ' + built.join(' / '); }
+                            $status.text(line);
+                        });
+                    });
                 });
             }, function () { $status.text(''); });
 
@@ -4890,6 +4979,44 @@ EJF_SD.menu = {
         GM_setValue('sdGpuDefault_v1', true);
     }
 })();
+
+
+/* ---- data-schema migration: auto-rebuild a local DB that predates a stored-field change ---- */
+// The stored records evolve over time. Most changes are picked up by the normal incremental catch-up, but a
+// few (a brand-new FIELD, like `created`) cannot be: incremental only re-fetches issues whose `updated` moved,
+// so every pre-existing row keeps the old shape forever. To handle that, each dataset is stamped with
+// EJF_SD.DATA_VERSION whenever it is built from scratch (fullSync / fullSyncEbr - which a manual rebuild also
+// routes through). On load, if a POPULATED dataset is stamped BELOW the current DATA_VERSION - or carries no
+// stamp at all, i.e. it was built before this mechanism shipped - we transparently re-fetch just that dataset
+// once (refetchDefects / refetchEbr), which backfills the new field without dropping embeddings. Brand-new /
+// empty DBs need nothing: their first full build stamps the current version.
+EJF_SD.migrate = {
+    _done: false,
+    run: function () {
+        if (EJF_SD.migrate._done) { return; }            // once per session
+        EJF_SD.migrate._done = true;
+        if (!savedVariables[5][1]) { return; }            // Triage Assistant off -> nothing to migrate
+        EJF_SD.db.countDefectsOnly().then(function (nDef) {
+            return EJF_SD.db.getMeta('dataVersionDefects').then(function (dv) {
+                var defStale = nDef > 0 && (Number(dv) || 0) < EJF_SD.DATA_VERSION;
+                return EJF_SD.db.countEbr().then(function (nEbr) {
+                    return EJF_SD.db.getMeta('dataVersionEbr').then(function (ev) {
+                        var ebrStale = nEbr > 0 && (Number(ev) || 0) < EJF_SD.DATA_VERSION;
+                        if (!defStale && !ebrStale) { return; }
+                        console.log('[EJF-SD] local DB schema out of date (defects v' + (Number(dv) || 0) +
+                            ', reports v' + (Number(ev) || 0) + ' < v' + EJF_SD.DATA_VERSION +
+                            ') - auto re-fetching to backfill new fields');
+                        // Sequential: each refetch is single-flight (the `running` guard), so chain them.
+                        var chain = Promise.resolve();
+                        if (defStale) { chain = chain.then(function () { return EJF_SD.sync.refetchDefects(); }); }
+                        if (ebrStale) { chain = chain.then(function () { return EJF_SD.sync.refetchEbr(); }); }
+                        return chain;
+                    });
+                });
+            });
+        }).catch(function (e) { console.log('[EJF-SD] migration check skipped:', e && e.message || e); });
+    }
+};
 
 
 /* ---- background auto-sync scheduler (Phase 3) ---- */
@@ -4977,6 +5104,9 @@ EJF_SD.sched = {
     observer.observe(document.body, { childList: true, subtree: true });
     // also try once on load in case the breadcrumb is already present
     setTimeout(function () { try { EJF_SD.ui.ensure(); } catch (e) { /* swallow */ } }, 1500);
+    // one-time data-schema migration: re-fetch a local DB that predates a stored-field change. Runs before
+    // the scheduler's startup tick (below) so its full re-fetch grabs the single-flight lock first.
+    setTimeout(function () { try { EJF_SD.migrate.run(); } catch (e) { /* swallow */ } }, 4000);
     // start the periodic background catch-up sync
     EJF_SD.sched.start();
 })();
