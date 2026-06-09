@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.13.1
+// @version     2.13.2
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -2046,8 +2046,8 @@ EJF_SD.logsig = {
         return wrap;
     },
 
-    // The standalone "Exception clusters" overview: every signature shared by >=2 defects, biggest first, each
-    // expandable to its members. Reuses the settings-menu overlay chrome (#ejf-menu-overlay / #ejf-menu).
+    // The standalone "Exception clusters" overview: every signature shared by >=2 defects, newest defect
+    // first, each expandable to its members. Reuses the settings-menu overlay chrome (#ejf-menu-overlay / #ejf-menu).
     openClustersView: function () {
         if (EJF_SD.menu && EJF_SD.menu.close) { EJF_SD.menu.close(); }   // close the settings menu if it's open
         EJF_SD.menu._injectCss();
@@ -2072,7 +2072,7 @@ EJF_SD.logsig = {
                 return;
             }
             $('<div class="ejf-menu-status"></div>')
-                .text(clusters.length + ' exception' + (clusters.length === 1 ? '' : 's') + ' shared by 2+ defects · largest first')
+                .text(clusters.length + ' exception' + (clusters.length === 1 ? '' : 's') + ' shared by 2+ defects · newest first')
                 .appendTo($sect);
             clusters.forEach(function (c) { $sect.append(EJF_SD.logsig._clusterRow(c)); });
         }, function () {
