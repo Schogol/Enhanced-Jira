@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.12.2
+// @version     2.12.3
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -2391,13 +2391,15 @@ EJF_SD.util = {
         return days + 'd';
     },
 
-    // Format a Jira ISO timestamp as a plain "YYYY-MM-DD" date for display (e.g. a suggestion's created
-    // date). Returns '' for missing / invalid input so callers can skip rendering it.
+    // Format a Jira ISO timestamp as "DD Mon YYYY" for display (e.g. a suggestion's created date). A textual
+    // month keeps it unambiguous across locales (no DD/MM vs MM/DD confusion). Returns '' for missing /
+    // invalid input so callers can skip rendering it.
     fmtDate: function (iso) {
         var d = new Date(iso);
         if (isNaN(d.getTime())) { return ''; }
+        var MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
         function p(n) { return (n < 10 ? '0' : '') + n; }
-        return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+        return p(d.getDate()) + ' ' + MON[d.getMonth()] + ' ' + d.getFullYear();
     }
 };
 
