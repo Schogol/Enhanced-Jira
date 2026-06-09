@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.13.0
+// @version     2.13.1
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -1939,10 +1939,20 @@ EJF_SD.logsig = {
                     if (!keyToSigs[key]) { keyToSigs[key] = []; }
                     if (keyToSigs[key].indexOf(fp.sig) === -1) {   // first time THIS defect shows THIS signature
                         keyToSigs[key].push(fp.sig);
-                        c.members.push({ key: key, status: recs[i].status || '', resolution: recs[i].resolution || null, resolutiondate: recs[i].resolutiondate || null });
+                        c.members.push({ key: key, status: recs[i].status || '', resolution: recs[i].resolution || null, resolutiondate: recs[i].resolutiondate || null, created: recs[i].created || null });
                     }
                 }
             }
+            // Order each cluster's members NEWEST-FIRST (by created date), so members[0] - the canonical
+            // defect used as the main/log-badge entry and the head of every "related"/sibling list - is the
+            // most recently created one, and the rest read newest->oldest below it.
+            Object.keys(sigMap).forEach(function (s) {
+                sigMap[s].members.sort(function (a, b) {
+                    var ac = a.created || '', bc = b.created || '';
+                    if (ac !== bc) { return ac < bc ? 1 : -1; }   // later ISO timestamp (newer) first
+                    return a.key < b.key ? -1 : 1;                 // stable tiebreak when dates are equal/missing
+                });
+            });
             EJF_SD.logsig._index = { sigMap: sigMap, keyToSigs: keyToSigs };
             EJF_SD.logsig._dirty = false;
             EJF_SD.logsig._building = null;
@@ -1954,8 +1964,8 @@ EJF_SD.logsig = {
         return EJF_SD.logsig._building;
     },
 
-    // The canonical (first-seen) defect for a signature - back-compat for the log -> defect matchers, which
-    // historically mapped a signature to a single defect key.
+    // The canonical (newest, since members are sorted newest-first) defect for a signature - back-compat for
+    // the log -> defect matchers, which map a signature to a single defect key.
     canonical: function (sig) {
         var c = EJF_SD.logsig._index && EJF_SD.logsig._index.sigMap[sig];
         return (c && c.members.length) ? c.members[0].key : null;
@@ -1982,16 +1992,28 @@ EJF_SD.logsig = {
         });
     },
 
-    // All signatures shared by >=2 defects, biggest cluster first. Drives the "Exception clusters" overview.
+    // All signatures shared by >=2 defects, ordered so the clusters whose NEWEST defect is most recent come
+    // first (the freshly-recurring exceptions a triager most wants to see), with cluster size as the
+    // tiebreaker. Drives the "Exception clusters" overview.
     clusters: function () {
+        function newest(members) {
+            var n = '';
+            for (var i = 0; i < members.length; i++) {
+                if (members[i].created && members[i].created > n) { n = members[i].created; }   // ISO strings sort chronologically
+            }
+            return n;
+        }
         return EJF_SD.logsig.ensure().then(function (idx) {
             var out = [];
             if (idx && idx.sigMap) {
                 Object.keys(idx.sigMap).forEach(function (sig) {
                     var c = idx.sigMap[sig];
-                    if (c.members.length >= 2) { out.push({ sig: sig, label: c.label, members: c.members }); }
+                    if (c.members.length >= 2) { out.push({ sig: sig, label: c.label, members: c.members, newest: newest(c.members) }); }
                 });
-                out.sort(function (a, b) { return b.members.length - a.members.length || (a.label < b.label ? -1 : 1); });
+                out.sort(function (a, b) {
+                    if (a.newest !== b.newest) { return a.newest < b.newest ? 1 : -1; }   // most-recent defect first
+                    return b.members.length - a.members.length || (a.label < b.label ? -1 : 1);
+                });
             }
             return out;
         });
@@ -2324,24 +2346,39 @@ EJF_SD.logsig = {
             li.className = 'ejf-logmatch-item';
             li.title = 'Click to scroll to an occurrence of ' + key + (entry.rows.length > 1 ? ' (click again for the next)' : '');
 
+            // The "main" row content (key + count + signature). The hover preview for THIS defect is bound to
+            // this wrapper - NOT the whole <li> - so moving the mouse off a cluster member row back up here
+            // re-fires mouseenter and re-shows the main defect's preview (a <li> mouseenter would not, since
+            // the pointer never actually left the <li>).
+            var mainEl = document.createElement('div');
+            mainEl.className = 'ejf-logmatch-main';
+
             var a = document.createElement('a');
             a.href = '/browse/' + key;
             a.target = '_blank';
             a.textContent = key;
             a.addEventListener('click', function (ev) { ev.stopPropagation(); });   // open the defect, don't scroll
-            li.appendChild(a);
+            mainEl.appendChild(a);
 
             var badge = document.createElement('span');
             badge.className = 'ejf-logmatch-count';
             badge.textContent = entry.count + '×';
-            li.appendChild(badge);
+            mainEl.appendChild(badge);
 
             if (entry.raw) {
                 var sig = document.createElement('div');
                 sig.className = 'ejf-logmatch-sig';
                 sig.textContent = entry.raw;
-                li.appendChild(sig);
+                mainEl.appendChild(sig);
             }
+
+            // Hover preview: show what the defect is about (same styled card as the Similar Defects panel).
+            mainEl.addEventListener('mouseenter', function () { EJF_SD.logsig._showDefectTip(key, mainEl); });
+            mainEl.addEventListener('mouseleave', function () {
+                EJF_SD.logsig._hoverKey = null;
+                if (EJF_SD.ui && EJF_SD.ui._hideTip) { EJF_SD.ui._hideTip(); }
+            });
+            li.appendChild(mainEl);
 
             // The rest of this defect's cluster - every OTHER defect that reported the same exception - behind
             // a "+N related" expander, so a known logged exception shows all its variants, not just one.
@@ -2375,13 +2412,6 @@ EJF_SD.logsig = {
                 target.scrollIntoView({ behavior: 'smooth', block: 'center' });
                 target.classList.add('ejf-logmatch-flash');
                 setTimeout(function () { target.classList.remove('ejf-logmatch-flash'); }, 1500);
-            });
-
-            // Hover preview: show what the defect is about (same styled card as the Similar Defects panel).
-            li.addEventListener('mouseenter', function () { EJF_SD.logsig._showDefectTip(key, li); });
-            li.addEventListener('mouseleave', function () {
-                EJF_SD.logsig._hoverKey = null;
-                if (EJF_SD.ui && EJF_SD.ui._hideTip) { EJF_SD.ui._hideTip(); }
             });
 
             listEl.appendChild(li);
@@ -4019,7 +4049,7 @@ EJF_SD.ui = {
 #ejf-sd-panel.ejf-sd-up { flex-direction: column-reverse; }\
 #ejf-sd-toast { position: fixed; right: 18px; bottom: 18px; z-index: 9001; background: #333; color: #eee; padding: 8px 14px;\
   border-radius: 6px; box-shadow: 0 4px 18px rgba(0,0,0,.45); font-family: -apple-system,Arial,sans-serif; font-size: 12px; max-width: 320px; }\
-#ejf-sd-tip { position: fixed; z-index: 9002; display: none; width: 420px; max-height: 60vh; overflow-y: auto;\
+#ejf-sd-tip { position: fixed; z-index: 10001; display: none; width: 420px; max-height: 60vh; overflow-y: auto;\
   background: #14181b; color: #e6e6e6; border: 1px solid #3a434d; border-radius: 6px; box-shadow: 0 6px 24px rgba(0,0,0,.55);\
   padding: 10px 12px; font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif; font-size: 12px; line-height: 1.45; pointer-events: none; }\
 #ejf-sd-tip .ejf-sd-tip-title { font-weight: 700; color: #fff; margin-bottom: 4px; }\
