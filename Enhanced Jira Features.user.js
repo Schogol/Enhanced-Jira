@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.13.2
+// @version     2.13.3
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -588,7 +588,7 @@ function SwapUI() {
         // CodeMirror's .cm-editor is position:relative but only a sliver tall, which collapses #table and
         // clips every row. Pin #table to the viewport instead (the media viewer is full-screen) so all rows
         // are visible and scrollable.
-        $('#table').css({ position: 'fixed', top: '85px', bottom: '0', left: '0', width: '100%' });
+        $('#table').css({ position: 'fixed', top: '95px', bottom: '0', left: '0', width: '100%' });
         setTimeout(ParseLogs, 250);
         // NB: no early return here. The <span> checks below are no-ops on this layout (no code-block span),
         // but we must fall through to the "$('#gpanel a').click(...)" handler at the end of SwapUI so the
