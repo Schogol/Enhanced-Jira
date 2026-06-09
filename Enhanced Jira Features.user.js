@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.12.3
+// @version     2.13.0
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -1869,18 +1869,20 @@ var EJF_SD = {
 
 
 /* ---- log signatures (Feature D): auto-mined exception fingerprints from defects ----
- * EVE defect descriptions paste crash dumps. Matching on the one-line "Formatted exception info:" message
+ * EVE defect descriptions paste exception dumps. Matching on the one-line "Formatted exception info:" message
  * alone is too weak: many UNRELATED defects share a generic message (e.g. "TypeNotFoundException: 'key not
- * found'"), so a log line was being attributed to the wrong defect. What actually identifies a crash is its
- * STACK, and EVE conveniently emits a deterministic "Stackhash: <n>" per stack. So we fingerprint each
- * exception block by (1) its Stackhash - an exact fingerprint, identical across users/sessions for the same
- * build - and (2) a normalized stack signature: the chain of file:function frames with line numbers dropped,
- * so it still matches across client builds when the stackhash itself differs. We mine those per exception
- * block from every defect, then in the log we group rows into exception blocks and match each block by
- * Stackhash first, stack-signature second. The index rebuilds whenever the defect DB changes.
+ * found'"), so a log line was being attributed to the wrong defect. What actually identifies an exception is
+ * its STACK, so we fingerprint each exception block by a normalized stack signature: the chain of
+ * file:function frames with line numbers dropped, so it still matches across client builds. (EVE also emits a
+ * "Stackhash: <n>", but that value is per-user / per-exception - NOT stable across users - so it is useless
+ * for matching and is no longer read.) We mine the signature per exception block from every defect; defects
+ * that share a signature form a CLUSTER, which drives both directions: flagging known exceptions in a log
+ * (log -> defect) AND grouping duplicate defects (the "Same exception" / "Exception clusters" views). The
+ * index rebuilds whenever the defect DB changes.
  */
 EJF_SD.logsig = {
-    _index: null,         // { hashMap: { stackhash -> defect }, sigMap: { stackSig -> defect } }
+    // { sigMap: { sig -> { sig, label, members:[{key,status,resolution,resolutiondate}] } }, keyToSigs: { key -> [sig,...] } }
+    _index: null,
     _building: null,
     _dirty: true,
     MIN_FRAMES: 2,        // need at least this many stack frames to trust a stack signature (else too generic)
@@ -1894,14 +1896,12 @@ EJF_SD.logsig = {
         return blocks.length ? blocks : [text || ''];
     },
 
-    // Fingerprint one exception block -> { hash, sig, msg }. `hash` is the Stackhash literal (as a string) if
-    // present; `sig` is the lowercased "<message>|<frame>>...>frame>" built from the file:function chain (line
-    // numbers dropped for cross-build robustness), or null when there aren't enough frames to be distinctive;
-    // `msg` is the human "Formatted exception info" text (used only as a panel label).
+    // Fingerprint one exception block -> { sig, msg }. `sig` is the lowercased "<message>|<frame>>...>frame>"
+    // built from the file:function chain (line numbers dropped for cross-build robustness), or null when there
+    // aren't enough frames to be distinctive; `msg` is the human "Formatted exception info" text (used as a
+    // panel / cluster label). (The "Stackhash: <n>" literal is per-user, so it is no longer extracted.)
     _fingerprint: function (text) {
         text = text || '';
-        var hash = null, hm = /Stackhash\s*:?\s*(-?\d+)/i.exec(text);
-        if (hm) { hash = hm[1]; }
         var msg = '', mm = /Formatted exception info\s*:?\s*([\s\S]*?)(?:\bCommon path prefix\b|\bCaught at\b|\bThrown at\b|\bReported from\b|\bThread Locals\b|\bStackhash\b|\bEXCEPTION END\b|$)/i.exec(text);
         if (mm) { msg = (mm[1] || '').replace(/\s+/g, ' ').trim(); }
         var frames = [], fre = /([A-Za-z0-9_.\/\\-]+\.py)\((\d+)\)\s+([A-Za-z0-9_<>]+)/g, fm;
@@ -1911,48 +1911,185 @@ EJF_SD.logsig = {
         var sig = (frames.length >= EJF_SD.logsig.MIN_FRAMES)
             ? (msg + '|' + frames.join('>')).toLowerCase()
             : null;
-        return { hash: hash, sig: sig, msg: msg };
+        return { sig: sig, msg: msg };
     },
 
-    // Build (and cache) the fingerprint index from every stored defect. Deduped by fingerprint (first defect
-    // exhibiting it wins). A defect can paste several exception dumps, so we fingerprint each block.
+    // Build (and cache) the signature index from every stored defect. Every defect exhibiting a signature is
+    // appended to that signature's cluster (NOT deduped to the first - the whole point is to group them);
+    // a defect can paste several exception dumps, so we fingerprint each block. Resolved defects are kept so
+    // a cluster can show "already fixed in EDR-x" / regression. keyToSigs lets a single issue find its
+    // cluster(s) cheaply. The (key, sig) pair is deduped so one defect counts once per signature.
     ensure: function () {
         if (EJF_SD.logsig._index && !EJF_SD.logsig._dirty) { return Promise.resolve(EJF_SD.logsig._index); }
         if (EJF_SD.logsig._building) { return EJF_SD.logsig._building; }
         EJF_SD.logsig._building = EJF_SD.db.allDefects().then(function (recs) {
-            var hashMap = {}, sigMap = {}, nHash = 0, nSig = 0;
+            var sigMap = {}, keyToSigs = {}, nSig = 0;
             for (var i = 0; i < recs.length; i++) {
-                if (recs[i].project === 'EBR') { continue; }   // mine crash signatures from DEFECTS only, not bug reports
+                if (recs[i].project === 'EBR') { continue; }   // mine exception signatures from DEFECTS only, not bug reports
                 var desc = recs[i].description;
                 if (!desc || desc.indexOf('EXCEPTION #') === -1) { continue; }
+                var key = recs[i].key;
                 var blocks = EJF_SD.logsig._splitBlocks(desc);
                 for (var b = 0; b < blocks.length; b++) {
                     var fp = EJF_SD.logsig._fingerprint(blocks[b]);
-                    if (fp.hash && !hashMap[fp.hash]) { hashMap[fp.hash] = recs[i].key; nHash++; }
-                    if (fp.sig && !sigMap[fp.sig]) { sigMap[fp.sig] = recs[i].key; nSig++; }
+                    if (!fp.sig) { continue; }
+                    var c = sigMap[fp.sig];
+                    if (!c) { c = sigMap[fp.sig] = { sig: fp.sig, label: fp.msg || '', members: [] }; nSig++; }
+                    if (!c.label && fp.msg) { c.label = fp.msg; }
+                    if (!keyToSigs[key]) { keyToSigs[key] = []; }
+                    if (keyToSigs[key].indexOf(fp.sig) === -1) {   // first time THIS defect shows THIS signature
+                        keyToSigs[key].push(fp.sig);
+                        c.members.push({ key: key, status: recs[i].status || '', resolution: recs[i].resolution || null, resolutiondate: recs[i].resolutiondate || null });
+                    }
                 }
             }
-            EJF_SD.logsig._index = { hashMap: hashMap, sigMap: sigMap };
+            EJF_SD.logsig._index = { sigMap: sigMap, keyToSigs: keyToSigs };
             EJF_SD.logsig._dirty = false;
             EJF_SD.logsig._building = null;
-            console.log('[EJF-SD] log signatures: ' + nHash + ' stackhashes + ' + nSig + ' stack signatures mined from ' + recs.length + ' defects');
+            var nClusters = 0;
+            Object.keys(sigMap).forEach(function (s) { if (sigMap[s].members.length >= 2) { nClusters++; } });
+            console.log('[EJF-SD] log signatures: ' + nSig + ' stack signatures (' + nClusters + ' shared across ≥2 defects) mined from ' + recs.length + ' defects');
             return EJF_SD.logsig._index;
         }).catch(function (e) { EJF_SD.logsig._building = null; throw e; });
         return EJF_SD.logsig._building;
     },
 
+    // The canonical (first-seen) defect for a signature - back-compat for the log -> defect matchers, which
+    // historically mapped a signature to a single defect key.
+    canonical: function (sig) {
+        var c = EJF_SD.logsig._index && EJF_SD.logsig._index.sigMap[sig];
+        return (c && c.members.length) ? c.members[0].key : null;
+    },
+
+    // Every OTHER defect that shares a signature with `key` (deduped across all of the key's signatures),
+    // each with its status/resolution. Drives the inline "Same exception" section on a defect. [] when none.
+    siblingsForKey: function (key) {
+        return EJF_SD.logsig.ensure().then(function (idx) {
+            var out = [], seen = {};
+            seen[key] = true;
+            var sigs = (idx && idx.keyToSigs && idx.keyToSigs[key]) || [];
+            for (var s = 0; s < sigs.length; s++) {
+                var c = idx.sigMap[sigs[s]];
+                if (!c) { continue; }
+                for (var m = 0; m < c.members.length; m++) {
+                    var mem = c.members[m];
+                    if (seen[mem.key]) { continue; }
+                    seen[mem.key] = true;
+                    out.push(mem);
+                }
+            }
+            return out;
+        });
+    },
+
+    // All signatures shared by >=2 defects, biggest cluster first. Drives the "Exception clusters" overview.
+    clusters: function () {
+        return EJF_SD.logsig.ensure().then(function (idx) {
+            var out = [];
+            if (idx && idx.sigMap) {
+                Object.keys(idx.sigMap).forEach(function (sig) {
+                    var c = idx.sigMap[sig];
+                    if (c.members.length >= 2) { out.push({ sig: sig, label: c.label, members: c.members }); }
+                });
+                out.sort(function (a, b) { return b.members.length - a.members.length || (a.label < b.label ? -1 : 1); });
+            }
+            return out;
+        });
+    },
+
+    // One collapsible cluster row for the overview: "<count> <signature label>" that expands to its members.
+    _clusterRow: function (c) {
+        var wrap = document.createElement('div');
+        wrap.className = 'ejf-excl-cluster';
+        var headRow = document.createElement('div');
+        headRow.className = 'ejf-excl-head';
+        var cnt = document.createElement('span');
+        cnt.className = 'ejf-exc-badge open';
+        cnt.textContent = c.members.length;
+        headRow.appendChild(cnt);
+        var lbl = document.createElement('span');
+        lbl.className = 'ejf-excl-label';
+        lbl.textContent = c.label || c.sig;
+        lbl.title = c.sig;
+        headRow.appendChild(lbl);
+        var members = document.createElement('div');
+        members.className = 'ejf-exc-members';
+        members.style.display = 'none';
+        c.members.forEach(function (m) { members.appendChild(EJF_SD.logsig._memberRowEl(m)); });
+        headRow.addEventListener('click', function () {
+            members.style.display = (members.style.display === 'none') ? '' : 'none';
+        });
+        wrap.appendChild(headRow);
+        wrap.appendChild(members);
+        return wrap;
+    },
+
+    // The standalone "Exception clusters" overview: every signature shared by >=2 defects, biggest first, each
+    // expandable to its members. Reuses the settings-menu overlay chrome (#ejf-menu-overlay / #ejf-menu).
+    openClustersView: function () {
+        if (EJF_SD.menu && EJF_SD.menu.close) { EJF_SD.menu.close(); }   // close the settings menu if it's open
+        EJF_SD.menu._injectCss();
+        EJF_SD.logsig._injectClusterCss();
+        var $overlay = $('<div id="ejf-menu-overlay"></div>');
+        var esc = function (e) { if (e.key === 'Escape') { closeView(); } };
+        function closeView() { $overlay.remove(); document.removeEventListener('keydown', esc); }
+        $overlay.on('click', function (e) { if (e.target === this) { closeView(); } });   // backdrop click
+        var $menu = $('<div id="ejf-menu"></div>').appendTo($overlay);
+        var $head = $('<div class="ejf-menu-head"><h2>Exception clusters</h2></div>');
+        $('<span class="ejf-menu-x" title="Close (Esc)">×</span>').on('click', closeView).appendTo($head);
+        $menu.append($head);
+        var $sect = $('<div class="ejf-menu-sect"></div>').appendTo($menu);
+        $('<div class="ejf-menu-status">Loading clusters…</div>').appendTo($sect);
+        $overlay.appendTo(document.body);
+        document.addEventListener('keydown', esc);
+        EJF_SD.logsig.clusters().then(function (clusters) {
+            if (!document.body.contains($overlay[0])) { return; }   // closed before the build finished
+            $sect.empty();
+            if (!clusters.length) {
+                $('<div class="ejf-menu-status">No exception is shared by 2+ defects yet. (Sync the defect DB first if you haven’t.)</div>').appendTo($sect);
+                return;
+            }
+            $('<div class="ejf-menu-status"></div>')
+                .text(clusters.length + ' exception' + (clusters.length === 1 ? '' : 's') + ' shared by 2+ defects · largest first')
+                .appendTo($sect);
+            clusters.forEach(function (c) { $sect.append(EJF_SD.logsig._clusterRow(c)); });
+        }, function () {
+            if (!document.body.contains($overlay[0])) { return; }
+            $sect.empty();
+            $('<div class="ejf-menu-status">Could not build clusters.</div>').appendTo($sect);
+        });
+    },
+
     // After the main log parser renders, group rows into EXCEPTION blocks, fingerprint each, and match it to
-    // a defect (Stackhash first, stack-signature second). The matched defect is flagged on the block's first
-    // (EXCEPTION #) row - amber accent + tooltip + [EDR-x] badge - and counted for the panel. Async (the index
-    // is built from IndexedDB); safe to call right after ParseLogs - it patches the already-rendered rows.
+    // a defect by stack signature. The matched defect is flagged on the block's first (EXCEPTION #) row -
+    // amber accent + tooltip + [EDR-x] badge - and counted for the panel, which also lists the rest of that
+    // defect's cluster. Async (the index is built from IndexedDB); safe to call right after ParseLogs - it
+    // patches the already-rendered rows.
     applyToTable: function () {
         return EJF_SD.logsig.ensure().then(function (idx) {
             if (!idx) { return; }
             var rows = document.querySelectorAll('#tableContent tbody tr');
-            var found = {};   // defect -> { defect, count, rows:[anchor tr,...], raw (label) }
+            var found = {};   // defect -> { defect, count, rows:[anchor tr,...], raw (label), cluster:[sibling members] }
             function cellText(tr) { var c = tr.lastElementChild; return c ? (c.textContent || '') : ''; }
+            // Every other defect that shares ANY of this defect's signatures (computed from idx, so it is
+            // available on re-passes that only know the stored defect key, not the original signature).
+            function siblings(defect) {
+                var out = [], seen = {};
+                seen[defect] = true;
+                var sigs = (idx.keyToSigs && idx.keyToSigs[defect]) || [];
+                for (var s = 0; s < sigs.length; s++) {
+                    var c = idx.sigMap[sigs[s]];
+                    if (!c) { continue; }
+                    for (var m = 0; m < c.members.length; m++) {
+                        if (seen[c.members[m].key]) { continue; }
+                        seen[c.members[m].key] = true;
+                        out.push(c.members[m]);
+                    }
+                }
+                return out;
+            }
             function tally(defect, tr, label) {
-                if (!found[defect]) { found[defect] = { defect: defect, count: 0, rows: [], raw: label || '' }; }
+                if (!found[defect]) { found[defect] = { defect: defect, count: 0, rows: [], raw: label || '', cluster: siblings(defect) }; }
                 found[defect].count++;
                 found[defect].rows.push(tr);
                 if (!found[defect].raw && label) { found[defect].raw = label; }
@@ -1985,7 +2122,7 @@ EJF_SD.logsig = {
                     if (t2.indexOf('EXCEPTION END') !== -1) { j++; break; }
                 }
                 var fp = EJF_SD.logsig._fingerprint(blockText);
-                var defect = (fp.hash && idx.hashMap[fp.hash]) || (fp.sig && idx.sigMap[fp.sig]) || null;
+                var defect = (fp.sig && idx.sigMap[fp.sig]) ? idx.sigMap[fp.sig].members[0].key : null;
                 // Mark every block row as scanned; only the anchor (first row) carries the defect key.
                 for (var b = 0; b < blockRows.length; b++) {
                     if (!blockRows[b].getAttribute('data-ejf-sig')) {
@@ -2020,7 +2157,7 @@ EJF_SD.logsig = {
             }
             function tallyBlock(blockText) {
                 var fp = EJF_SD.logsig._fingerprint(blockText);
-                var defect = (fp.hash && idx.hashMap[fp.hash]) || (fp.sig && idx.sigMap[fp.sig]) || null;
+                var defect = (fp.sig && idx.sigMap[fp.sig]) ? idx.sigMap[fp.sig].members[0].key : null;
                 if (!defect) { return; }
                 if (!found[defect]) { found[defect] = { defect: defect, count: 0, msg: fp.msg || '' }; }
                 found[defect].count++;
@@ -2077,6 +2214,63 @@ EJF_SD.logsig = {
 .ejf-logmatch-flash > td { animation: ejfLogFlash 1.5s ease-out; }\
 @keyframes ejfLogFlash { 0%, 25% { background-color: rgba(255,181,71,.6); } 100% { background-color: transparent; } }');
         EJF_SD.logsig._cssInjected = true;
+    },
+
+    // Shared styling for cluster member rows + status badges, reused by all three surfaces (the log panel's
+    // "+N related" expander, the inline "Same exception" section, and the "Exception clusters" overview).
+    _clusterCssInjected: false,
+    _injectClusterCss: function () {
+        if (EJF_SD.logsig._clusterCssInjected) { return; }
+        GM_addStyle('\
+.ejf-exc-related-toggle { display: inline-block; margin-top: 5px; color: #9aa6b2; font-size: 11px; cursor: pointer; user-select: none; }\
+.ejf-exc-related-toggle:hover { color: #cfd6dd; }\
+.ejf-exc-members { list-style: none; margin: 4px 0 0; padding: 4px 0 0 8px; border-left: 2px solid #2c333a; }\
+.ejf-exc-member { padding: 3px 0; display: flex; align-items: center; gap: 7px; }\
+.ejf-exc-member a { color: #4c9aff; text-decoration: none; font-weight: 700; }\
+.ejf-exc-member a:hover { text-decoration: underline; }\
+.ejf-exc-badge { font-size: 10px; font-weight: 700; border-radius: 8px; padding: 1px 7px; white-space: nowrap; }\
+.ejf-exc-badge.open { background: #3a434d; color: #cfd6dd; }\
+.ejf-exc-badge.fixed { background: #1f3d2e; color: #7fdca4; }\
+.ejf-exc-badge.warn { background: #5a3a1a; color: #ffb547; }\
+.ejf-excl-cluster { border-bottom: 1px solid #2c333a; padding: 7px 0; }\
+.ejf-excl-head { display: flex; align-items: center; gap: 8px; cursor: pointer; }\
+.ejf-excl-head:hover .ejf-excl-label { color: #fff; }\
+.ejf-excl-label { flex: 1; font-family: "Courier New",monospace; font-size: 11px; color: #cfd6dd; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }\
+/* Inline "Same exception" section: flow the members side-by-side (wrapping) to save vertical space. */\
+#ejf-sd-exccluster .ejf-exc-members { display: flex; flex-wrap: wrap; gap: 5px 14px; }\
+#ejf-sd-exccluster .ejf-exc-member { padding: 2px 0; }');
+        EJF_SD.logsig._clusterCssInjected = true;
+    },
+
+    // A status badge for a cluster member: "Fixed"/<resolution> (green) when resolved, else <status>/"Open".
+    _statusBadgeEl: function (member) {
+        var resolved = !!(member.resolution || member.resolutiondate);
+        var badge = document.createElement('span');
+        badge.className = 'ejf-exc-badge ' + (resolved ? 'fixed' : 'open');
+        badge.textContent = resolved ? (member.resolution || 'Fixed') : (member.status || 'Open');
+        return badge;
+    },
+
+    // One cluster-member row: key link + status badge + hover preview card. `extraEl` is an optional trailing
+    // element (e.g. a ⚠ regression flag). Returns a raw DOM element so both the (vanilla) log panel and the
+    // (jQuery) issue/menu surfaces can use it.
+    _memberRowEl: function (member, extraEl) {
+        var row = document.createElement('div');
+        row.className = 'ejf-exc-member';
+        var a = document.createElement('a');
+        a.href = '/browse/' + member.key;
+        a.target = '_blank';
+        a.textContent = member.key;
+        a.addEventListener('click', function (ev) { ev.stopPropagation(); });
+        row.appendChild(a);
+        row.appendChild(EJF_SD.logsig._statusBadgeEl(member));
+        if (extraEl) { row.appendChild(extraEl); }
+        row.addEventListener('mouseenter', function () { EJF_SD.logsig._showDefectTip(member.key, row); });
+        row.addEventListener('mouseleave', function () {
+            EJF_SD.logsig._hoverKey = null;
+            if (EJF_SD.ui && EJF_SD.ui._hideTip) { EJF_SD.ui._hideTip(); }
+        });
+        return row;
     },
 
     // Remove the panel once the log viewer is gone (closed / navigated away). Called from the global observer.
@@ -2147,6 +2341,28 @@ EJF_SD.logsig = {
                 sig.className = 'ejf-logmatch-sig';
                 sig.textContent = entry.raw;
                 li.appendChild(sig);
+            }
+
+            // The rest of this defect's cluster - every OTHER defect that reported the same exception - behind
+            // a "+N related" expander, so a known logged exception shows all its variants, not just one.
+            if (entry.cluster && entry.cluster.length) {
+                EJF_SD.logsig._injectClusterCss();
+                var members = document.createElement('div');
+                members.className = 'ejf-exc-members';
+                members.style.display = 'none';
+                entry.cluster.forEach(function (m) { members.appendChild(EJF_SD.logsig._memberRowEl(m)); });
+                var toggle = document.createElement('div');
+                toggle.className = 'ejf-exc-related-toggle';
+                toggle.textContent = '+' + entry.cluster.length + ' related ▸';
+                toggle.addEventListener('click', function (ev) {
+                    ev.stopPropagation();   // don't trigger the row's scroll-to-occurrence
+                    var open = members.style.display === 'none';
+                    members.style.display = open ? '' : 'none';
+                    toggle.textContent = '+' + entry.cluster.length + ' related ' + (open ? '▾' : '▸');
+                    EJF_SD.logsig._fitVertical(panel);
+                });
+                li.appendChild(toggle);
+                li.appendChild(members);
             }
 
             li.addEventListener('click', function () {
@@ -3796,7 +4012,10 @@ EJF_SD.ui = {
 #ejf-sd-loglink a { color: #4c9aff; font-weight: 700; text-decoration: none; }\
 #ejf-sd-loglink a:hover { text-decoration: underline; }\
 #ejf-sd-loglink .count { color: #cfd6dd; background: #3a434d; border-radius: 8px; padding: 0 7px; font-size: 10px; font-weight: 700; margin-left: 6px; }\
-#ejf-sd-panel.collapsed #ejf-sd-status, #ejf-sd-panel.collapsed #ejf-sd-loglink, #ejf-sd-panel.collapsed #ejf-sd-list { display: none; }\
+#ejf-sd-exccluster { display: none; padding: 6px 10px; border-bottom: 1px solid #2c333a; background: #20262b; }\
+#ejf-sd-exccluster.has-hits { display: block; }\
+#ejf-sd-exccluster .ejf-sd-exccluster-head { font-weight: 700; color: #cfd6dd; font-size: 11px; margin-bottom: 4px; }\
+#ejf-sd-panel.collapsed #ejf-sd-status, #ejf-sd-panel.collapsed #ejf-sd-loglink, #ejf-sd-panel.collapsed #ejf-sd-exccluster, #ejf-sd-panel.collapsed #ejf-sd-list { display: none; }\
 #ejf-sd-panel.ejf-sd-up { flex-direction: column-reverse; }\
 #ejf-sd-toast { position: fixed; right: 18px; bottom: 18px; z-index: 9001; background: #333; color: #eee; padding: 8px 14px;\
   border-radius: 6px; box-shadow: 0 4px 18px rgba(0,0,0,.45); font-family: -apple-system,Arial,sans-serif; font-size: 12px; max-width: 320px; }\
@@ -3845,6 +4064,10 @@ EJF_SD.ui = {
 #ejf-side-group #ejf-sd-loglink { display: none; padding: 6px 0; border-bottom: 1px solid var(--ds-border, #091e4224); background: transparent; }\
 #ejf-side-group #ejf-sd-loglink.has-hits { display: block; }\
 #ejf-side-group #ejf-sd-loglink .ejf-sd-loglink-head { color: var(--ds-text-warning, #974f0c); }\
+#ejf-side-group #ejf-sd-exccluster { display: none; padding: 6px 0; border-bottom: 1px solid var(--ds-border, #091e4224); background: transparent; }\
+#ejf-side-group #ejf-sd-exccluster.has-hits { display: block; }\
+#ejf-side-group #ejf-sd-exccluster .ejf-sd-exccluster-head { color: var(--ds-text, #172b4d); }\
+#ejf-side-group #ejf-sd-exccluster .ejf-exc-member a { color: var(--ds-link, #0c66e4); }\
 /* Responsive 2-up grid: two columns once the context column is wide enough (each cell >= 280px),\
    automatically collapsing to one column when narrow. align-items:stretch so both cards in a row share\
    the height of the taller one (left + right column line up). */\
@@ -4246,6 +4469,7 @@ EJF_SD.ui = {
             '    <span id="ejf-sd-mode">Keyword</span><span id="ejf-sd-collapse" title="Collapse / expand">–</span></div>' +
             '  <div id="ejf-sd-status"></div>' +
             '  <div id="ejf-sd-loglink"></div>' +
+            '  <div id="ejf-sd-exccluster"></div>' +
             '  <ul id="ejf-sd-list"></ul>' +
             '</div>'
         );
@@ -4277,6 +4501,7 @@ EJF_SD.ui = {
         return '<div class="ejf-side-subhead"><span id="ejf-sd-title">Similar defects</span><span id="ejf-sd-mode">Keyword</span></div>' +
                '<div id="ejf-sd-status"></div>' +
                '<div id="ejf-sd-loglink"></div>' +
+               '<div id="ejf-sd-exccluster"></div>' +
                '<ul id="ejf-sd-list"></ul>';
     },
 
@@ -4694,6 +4919,7 @@ EJF_SD.ui = {
     render: function (key) {
         EJF_SD.ui._ensurePanel();
         $('#ejf-sd-title').text('Similar defects');   // reset title (the panel is shared with the EDR reports view)
+        $('#ejf-sd-exccluster').removeClass('has-hits').empty();   // defect-only section; clear it on the EBR view
         EJF_SD.ui.renderLogLink(key);   // scan the attached log for known defects (no need to open it)
         $('#ejf-sd-list').empty();
         EJF_SD.ui.setStatus('Finding similar defects…');
@@ -4737,6 +4963,7 @@ EJF_SD.ui = {
         $('#ejf-sd-title').text('Matching bug reports');
         $('#ejf-sd-loglink').removeClass('has-hits').empty();   // EBR-only section; unused on a defect
         $('#ejf-sd-list').empty();
+        EJF_SD.ui.renderExceptionCluster(key);   // list other defects that reported the same exception
         EJF_SD.ui.setStatus('Finding matching bug reports…');
         EJF_SD.ui.getIssueText(key).then(function (text) {
             return EJF_SD.db.countEbr().then(function (n) {
@@ -4765,6 +4992,43 @@ EJF_SD.ui = {
                 });
             });
         }).catch(function (e) { EJF_SD.ui.setStatus('Error: ' + (e && e.message || e)); });
+    },
+
+    // Populate the "Same exception" section: every OTHER defect that reported the same exception signature as
+    // this one, each with its status (Open / Fixed). A sibling that is already FIXED while this defect is still
+    // open is flagged "⚠ regression?". Hidden unless there are siblings. Reuses the shared cluster member rows.
+    renderExceptionCluster: function (key) {
+        var $box = $('#ejf-sd-exccluster');
+        if (!$box.length) { return; }
+        $box.removeClass('has-hits').empty();
+        EJF_SD.logsig.siblingsForKey(key).then(function (siblings) {
+            if (EJF_SD.ui.currentKey !== key) { return; }       // navigated to another issue meanwhile
+            if (!siblings || !siblings.length) { return; }
+            return EJF_SD.db.getDefect(key).then(function (rec) {
+                if (EJF_SD.ui.currentKey !== key) { return; }
+                var currentResolved = !!(rec && (rec.resolution || rec.resolutiondate));
+                EJF_SD.logsig._injectClusterCss();
+                var $b = $('#ejf-sd-exccluster');
+                $b.empty();
+                $('<div class="ejf-sd-exccluster-head"></div>').text('Same exception (' + siblings.length + ')').appendTo($b);
+                var members = document.createElement('div');
+                members.className = 'ejf-exc-members';
+                siblings.forEach(function (m) {
+                    var resolved = !!(m.resolution || m.resolutiondate);
+                    var warn = null;
+                    if (resolved && !currentResolved) {   // already fixed elsewhere, but this one is still open
+                        warn = document.createElement('span');
+                        warn.className = 'ejf-exc-badge warn';
+                        warn.textContent = '⚠ regression?';
+                        warn.title = 'This exception was already resolved in ' + m.key + ', but the current issue is still open – possible regression.';
+                    }
+                    members.appendChild(EJF_SD.logsig._memberRowEl(m, warn));
+                });
+                $b.append(members);
+                $b.addClass('has-hits');
+                EJF_SD.ui._fitVertical();
+            });
+        }).catch(function () { /* swallow - the section just stays hidden */ });
     },
 
     // When we land on an EDR that isn't in the local DB yet (e.g. a freshly created / just-converted defect),
@@ -4921,6 +5185,8 @@ EJF_SD.menu = {
                 .on('click', function () { EJF_SD.menu.close(); EJF_SD.sync.rebuild(); }).appendTo($actions);
             $('<button class="ejf-btn">Rebuild BR DB</button>')
                 .on('click', function () { EJF_SD.menu.close(); EJF_SD.sync.rebuildEbr(); }).appendTo($actions);
+            $('<button class="ejf-btn">Exception clusters</button>')
+                .on('click', function () { EJF_SD.logsig.openClustersView(); }).appendTo($actions);
             $ta.append($actions);
 
             // Panel style (integrated sidebar vs floating box). EJF_SD.ui.toggleStyle() re-mounts in place.
