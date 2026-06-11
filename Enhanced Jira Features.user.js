@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.13.4
+// @version     2.13.5
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -288,7 +288,7 @@ function addButtons() {
 if ($('#translateButton').length === 0) {
   var translateButton = $(
     '<button id="translateButton" type="button" tabindex="1" class="' + buttonClass + '" ' +
-    'style="margin-left: 8px; width: fit-content; padding: 6px 12px; white-space: nowrap; display: inline-flex; align-items: center;">' +
+    'style="margin-left: 8px; width: fit-content; padding: 6px 8px 6px 3px; white-space: nowrap; display: inline-flex; align-items: center;">' +
     '<span class="' + innerSpanClass + '"></span>' +
     '<span style="font-size: 13px;">Translate</span>' +
     '</button>'
@@ -348,7 +348,7 @@ if ($('#translateButton').length === 0) {
 if ($('#GMButton').length === 0) {
   var GMButton = $(
     '<button id="GMButton" aria-label="GMButton" class="' + buttonClass + '" type="button" tabindex="1" ' +
-    'style="margin-left: 8px; width: fit-content; padding: 6px 12px; white-space: nowrap; display: inline-flex; align-items: center;">' +
+    'style="margin-left: 8px; width: fit-content; padding: 6px 8px 6px 3px; white-space: nowrap; display: inline-flex; align-items: center;">' +
     '<span class="' + innerSpanClass + '"></span>' +
     '<span style="font-size: 13px;">Assign to GM</span>' +
     '</button>'
@@ -403,7 +403,7 @@ if ($('#GMButton').length === 0) {
 if ($('#convertToDefectButton').length === 0) {
   var convertToDefectButton = $(
     '<button id="convertToDefectButton" aria-label="ConvertToDefect" class="' + buttonClass + '" type="button" tabindex="0" ' +
-    'style="margin-left: 8px; width: fit-content; padding: 6px 12px; white-space: nowrap; display: inline-flex; align-items: center;">' +
+    'style="margin-left: 8px; width: fit-content; padding: 6px 8px 6px 3px; white-space: nowrap; display: inline-flex; align-items: center;">' +
     '<span class="' + innerSpanClass + '"></span>' +
     '<span style="font-size: 13px;">Convert to Defect</span>' +
     '</button>'
@@ -456,7 +456,7 @@ if ($('#convertToDefectButton').length === 0) {
 if ($('#closeButton').length === 0) {
   var closeButton = $(
     '<button id="closeButton" aria-label="Close Button" class="' + buttonClass + '" type="button" tabindex="1" ' +
-    'style="margin-left: 8px; width: fit-content; padding: 6px 12px; white-space: nowrap; display: inline-flex; align-items: center;">' +
+    'style="margin-left: 8px; width: fit-content; padding: 6px 8px 6px 3px; white-space: nowrap; display: inline-flex; align-items: center;">' +
     '<span class="' + innerSpanClass + '"></span>' +
     '<span style="font-size: 13px;">Close</span>' +
     '</button>'
