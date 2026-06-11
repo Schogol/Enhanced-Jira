@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.13.3
+// @version     2.13.4
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -1902,6 +1902,14 @@ EJF_SD.logsig = {
     // panel / cluster label). (The "Stackhash: <n>" literal is per-user, so it is no longer extracted.)
     _fingerprint: function (text) {
         text = text || '';
+        // Strip the EVE log-line prefix ("HH:MM:SS<TAB>facility<TAB>type<TAB>") that a DEFECT DESCRIPTION
+        // carries when someone pastes the RAW log into it. Without this, the blank lines between "Formatted
+        // exception info:" and "Common path prefix" leak their "timestamp facility type" prefix into the
+        // captured message, so the defect's signature (e.g. "keyerror: 2 22:10:48 client::general error|…")
+        // no longer matches the SAME exception seen in the parsed log, whose rows are message-column only
+        // ("keyerror: 2|…"). Stripping here normalizes both sides. (Log-side block text has no such prefix,
+        // so this is a no-op there.)
+        text = text.replace(/^[ \t]*\d{1,2}:\d{2}:\d{2}\t[^\t\n]*\t[^\t\n]*\t/gm, '');
         var msg = '', mm = /Formatted exception info\s*:?\s*([\s\S]*?)(?:\bCommon path prefix\b|\bCaught at\b|\bThrown at\b|\bReported from\b|\bThread Locals\b|\bStackhash\b|\bEXCEPTION END\b|$)/i.exec(text);
         if (mm) { msg = (mm[1] || '').replace(/\s+/g, ' ').trim(); }
         var frames = [], fre = /([A-Za-z0-9_.\/\\-]+\.py)\((\d+)\)\s+([A-Za-z0-9_<>]+)/g, fm;
@@ -2156,6 +2164,17 @@ EJF_SD.logsig = {
             }
             EJF_SD.logsig.renderPanel(found);
         }).catch(function (e) { console.log('[EJF-SD] log signature apply skipped:', e && e.message || e); });
+    },
+
+    // Re-run the log->defect match against the CURRENT (possibly just-synced) signature index. Clears the
+    // per-row data-ejf-sig scan cache first so EVERY exception block is re-fingerprinted - otherwise rows
+    // marked '0' (no match) on the first pass would never re-match a defect that has since been synced in.
+    // No-op when no parsed log is open. Called after a sync completes (EJF_SD.sched.markSynced).
+    rematch: function () {
+        if (!document.getElementById('tableContent')) { return; }   // no parsed log open
+        var rows = document.querySelectorAll('#tableContent tbody tr');
+        for (var i = 0; i < rows.length; i++) { rows[i].removeAttribute('data-ejf-sig'); }
+        EJF_SD.logsig.applyToTable();
     },
 
     // Match a RAW logs.txt (fetched straight from an EBR's attachments, WITHOUT opening it in the parser)
@@ -4079,6 +4098,12 @@ EJF_SD.ui = {
    inner wrapper partial border so we do not double up. */\
 #ejf-side-group.ejf-ta-native { margin: 8px 0; border: 1px solid var(--ds-border, #091e4224); border-radius: 8px; box-sizing: border-box; overflow: hidden; }\
 #ejf-side-group.ejf-ta-native > div { border: none; }\
+/* Kill the lingering focus ring on the (cloned) header button after a collapse-toggle click - the cloned\
+   role=button keeps focus and Jira draws a blue outline/box-shadow around the whole card, which we do not\
+   want on this static toggle. */\
+#ejf-side-group:focus, #ejf-side-group:focus-within, #ejf-side-group:focus-visible,\
+#ejf-side-group *:focus, #ejf-side-group *:focus-visible,\
+#ejf-side-header:focus, #ejf-side-header:focus-visible { outline: none !important; box-shadow: none !important; }\
 /* Manual fallback path: drawn by hand to mimic the native group when the clone template is unavailable. */\
 #ejf-side-group.ejf-ta-manual { margin: 8px 0; padding: 0 16px 4px; border: 1px solid var(--ds-border, #091e4224); border-radius: 8px; }\
 #ejf-side-group.ejf-ta-manual.collapsed { padding-bottom: 0; }\
@@ -4651,11 +4676,31 @@ EJF_SD.ui = {
                     // top padding, so the top spacing is identical regardless of which group was cloned.
                     var headerWrap = titleEl;
                     while (headerWrap && headerWrap.parentNode && headerWrap.parentNode !== clone) { headerWrap = headerWrap.parentNode; }
+                    // headerWrap is the clone-root child (a <section>) that wraps BOTH the header AND the body.
+                    // Vertical padding here therefore also shows as an empty gap BELOW the hidden body when
+                    // COLLAPSED - the reported "too much space at the bottom". Zero its top/bottom padding (keep
+                    // its native horizontal padding) and move the symmetric vertical spacing onto the HEADER ROW
+                    // itself (below), so the title is centered when collapsed with no trailing body gap.
                     if (headerWrap && headerWrap !== clone && headerWrap.style && headerWrap.style.setProperty) {
-                        headerWrap.style.setProperty('padding', '0 0 8px', 'important');
+                        headerWrap.style.setProperty('padding-top', '0', 'important');
+                        headerWrap.style.setProperty('padding-bottom', '0', 'important');
                         headerWrap.style.setProperty('margin', '0', 'important');
                     }
-                    if (clone.style && clone.style.setProperty) { clone.style.setProperty('padding-top', '0', 'important'); }
+                    // Symmetric vertical padding on the header row (chevron + title) keeps the title vertically
+                    // centered in the collapsed card regardless of which native group was cloned, independent of
+                    // the section padding we just zeroed. Top/bottom only - preserve the header's native
+                    // horizontal padding so the chevron stays aligned with the card edge.
+                    if (btnEl && btnEl.style && btnEl.style.setProperty) {
+                        btnEl.style.setProperty('padding-top', '8px', 'important');
+                        btnEl.style.setProperty('padding-bottom', '8px', 'important');
+                    }
+                    // Zero the clone root's own top AND bottom padding. The bottom one is what left a big empty
+                    // gap under the title when COLLAPSED (the body is hidden, but the card kept its padding); the
+                    // expanded view gets its bottom spacing from the body's own padding-bottom instead.
+                    if (clone.style && clone.style.setProperty) {
+                        clone.style.setProperty('padding-top', '0', 'important');
+                        clone.style.setProperty('padding-bottom', '0', 'important');
+                    }
                     // The actual culprit behind the intermittent top gap: a cloned <section> carries an inline
                     // `top: 49px` (a positioned offset that survives the clone). Sweep EVERY section in the
                     // clone - not just the body-wrapper chain - back to static flow so nothing is pushed down.
@@ -4702,7 +4747,13 @@ EJF_SD.ui = {
                 EJF_SD.ui._setChevron(group, isColl);
                 try { headerClickTarget.setAttribute('aria-expanded', isColl ? 'false' : 'true'); } catch (e) { /* ignore */ }
                 try { if (typeof GM_setValue === 'function') { GM_setValue(EJF_SD.ui.SIDE_COLLAPSE_KEY, isColl); } } catch (e2) { /* ignore */ }
+                // Drop focus so the cloned button doesn't keep Jira's blue focus ring after the toggle click.
+                try { headerClickTarget.blur(); } catch (e3) { /* ignore */ }
             });
+            // Belt-and-suspenders: a mousedown focuses the button before click fires, so the ring can flash
+            // even with the post-click blur. Suppress the focus on pointer interaction entirely (keyboard
+            // focus via Tab still works for accessibility); a plain click then toggles without a lingering ring.
+            headerClickTarget.addEventListener('mousedown', function (e) { e.preventDefault(); });
         }
 
         if (anchor.nextSibling) { anchor.parentNode.insertBefore(group, anchor.nextSibling); }
@@ -5348,6 +5399,9 @@ EJF_SD.sched = {
     // completion path (autoSync / syncNow / rebuild).
     markSynced: function () {
         try { if (typeof GM_setValue === 'function') { GM_setValue(EJF_SD.sched.LAST_SYNC_KEY, Date.now()); } } catch (e) { /* ignore */ }
+        // If a log is open, re-match it against the freshly-synced defect index so a newly-indexed defect
+        // (e.g. one you just created) appears in the "Defects in log" panel without reopening the log.
+        try { if (EJF_SD.logsig) { EJF_SD.logsig.rematch(); } } catch (e2) { /* ignore */ }
     },
 
     // Best-effort single-syncer lease across tabs. Returns true if this tab may sync now. Not perfectly
