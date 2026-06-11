@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.13.6
+// @version     2.13.7
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -231,9 +231,129 @@ var ejfButtonObserver = new MutationObserver(function () {
     setTimeout(function () {
         ejfButtonGuardScheduled = false;
         ensureButtonsPresent();
+        try { ejfShowIssueDates(); } catch (e) { /* ignore */ }   // mirror Created/Updated into the top header
+        try { ejfHideNativeDates(); } catch (e) { /* ignore */ }   // ...and hide Jira's native bottom timestamps
     }, 200);
 });
 ejfButtonObserver.observe(document.body, { childList: true, subtree: true });
+
+
+// ---- Surface the issue's Created / Updated dates at the TOP of the header ----
+// Jira only renders Created/Updated ("N ago") at the very BOTTOM of the right context column, so you have to
+// scroll to see them. Mirror them into the top header bar (the empty space between the breadcrumb and the
+// lock / watch / share / … action icons) so they're visible at a glance. Same-origin REST read, cached per
+// issue. Always on for issue pages; cheap early-exit once mounted for the current issue.
+var ejfDatesCache = {};   // issueKey -> { created, updated } ISO strings
+function ejfFmtDateShort(iso) {
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) { return ''; }
+    var MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    function p(n) { return (n < 10 ? '0' : '') + n; }
+    return p(d.getDate()) + ' ' + MON[d.getMonth()] + ' ' + d.getFullYear();
+}
+
+// Find where to drop the dates element. The lock / watch / share / … icons live in the sticky header bar
+// #jira-issue-header-actions, which spans the full width of the issue's right-most context column but only
+// contains the (right-aligned) action-icon group - so the whole empty left part of that bar is the "red box".
+// We anchor to that bar and absolutely-position the dates at its LEFT edge (the bar is position:sticky, i.e. a
+// positioning context, so left:0 lands on the red-box border and top:50% keeps it level with the icons). The
+// breadcrumb is in a SEPARATE left structure, so it can't be used as a row anchor. Fallbacks probe the sticky-
+// header testid, then derive the bar from the watch button.
+function ejfDatesTarget() {
+    var bar = document.getElementById('jira-issue-header-actions')
+        || document.querySelector('[data-testid="issue-view-sticky-header-container.sticky-header"]');
+    if (!bar) {
+        var watch = document.querySelector('button[data-testid="issue.watchers.action-button.root"]')
+            || document.querySelector('button[data-testid*="watch" i]')
+            || document.querySelector('button[aria-label*="watch" i]');
+        bar = (watch && watch.closest)
+            ? (watch.closest('#jira-issue-header-actions') || watch.closest('[data-testid="issue-view-sticky-header-container.sticky-header"]'))
+            : null;
+    }
+    if (!bar) { return null; }
+    return { row: bar, before: null };   // before:null -> append; the element is absolutely positioned at left:0
+}
+
+function ejfShowIssueDates() {
+    var bc = document.querySelector('a[data-testid="issue.views.issue-base.foundation.breadcrumbs.current-issue.item"]');
+    if (!bc) {   // not on an issue page -> drop any stale element
+        var gone = document.getElementById('ejf-issue-dates');
+        if (gone && gone.parentNode) { gone.parentNode.removeChild(gone); }
+        return;
+    }
+    var key = (bc.textContent || '').trim();
+    if (!key) { return; }
+    var existing = document.getElementById('ejf-issue-dates');
+    if (existing && existing.getAttribute('data-key') === key && existing.isConnected) { return; }   // already shown for this issue
+    var tgt = ejfDatesTarget();
+    if (!tgt) { return; }   // header not ready yet; the observer will retry
+    if (existing && existing.parentNode) { existing.parentNode.removeChild(existing); }
+
+    var el = document.createElement('div');
+    el.id = 'ejf-issue-dates';
+    el.setAttribute('data-key', key);
+    // Absolutely positioned near the LEFT edge of the sticky header bar (its positioning context), vertically
+    // centered with the icons. A small left inset (not 0) clears the bar's left clip/overflow so the first
+    // characters aren't cut off. Two stacked rows; each row is a flex with the LABEL left and the DATE pushed
+    // to the right (margin-left:auto), and the rows stretch to the same width so the dates line up right-bound.
+    el.style.cssText = 'position:absolute; left:24px; top:50%; transform:translateY(-50%);' +
+        ' display:flex; flex-direction:column; gap:1px;' +
+        ' font-size:12px; line-height:1.35; color:var(--ds-text-subtle,#8c9bab); white-space:nowrap; user-select:none;';
+    el.textContent = '…';
+    tgt.row.insertBefore(el, tgt.before);   // before:null -> append
+
+    function paint(created, updated) {
+        if (el.getAttribute('data-key') !== key || !el.isConnected) { return; }   // navigated away meanwhile
+        el.textContent = '';
+        function part(label, iso) {
+            if (!iso) { return; }
+            var row = document.createElement('div');
+            row.style.cssText = 'display:flex; gap:18px;';
+            try { row.title = label + ': ' + new Date(iso).toLocaleString(); } catch (e) { /* ignore */ }
+            var lbl = document.createElement('span');
+            lbl.textContent = label;
+            var val = document.createElement('span');
+            val.textContent = ejfFmtDateShort(iso);
+            val.style.marginLeft = 'auto';   // push the date to the right edge of the (stretched) row
+            row.appendChild(lbl);
+            row.appendChild(val);
+            el.appendChild(row);
+        }
+        part('Created', created);
+        part('Updated', updated);
+    }
+
+    if (ejfDatesCache[key]) { paint(ejfDatesCache[key].created, ejfDatesCache[key].updated); return; }
+    $.ajax({ url: 'https://fenriscreations.atlassian.net/rest/api/2/issue/' + key + '?fields=created,updated', dataType: 'json' })
+        .done(function (d) {
+            var f = (d && d.fields) || {};
+            ejfDatesCache[key] = { created: f.created || null, updated: f.updated || null };
+            paint(ejfDatesCache[key].created, ejfDatesCache[key].updated);
+        })
+        .fail(function () { if (el.isConnected) { el.textContent = ''; } });
+}
+
+// Jira renders the issue's Created/Updated timestamps a second time at the very BOTTOM of the right context
+// column (the spot you'd otherwise have to scroll to). Now that we mirror them into the top header, hide that
+// native block so the date isn't shown twice. Jira gives those rows stable testids
+// ("created-date.ui.read.meta-date" / "updated-date.ui.read.meta-date"), so we target them directly. Idempotent.
+function ejfHideNativeDates() {
+    var nodes = document.querySelectorAll(
+        '[data-testid="created-date.ui.read.meta-date"], [data-testid="updated-date.ui.read.meta-date"],' +
+        ' [data-testid$="-date.ui.read.meta-date"]');
+    for (var i = 0; i < nodes.length; i++) {
+        var n = nodes[i];
+        if (n.getAttribute('data-ejf-hidden-dates')) { continue; }   // already hidden
+        n.style.display = 'none';
+        n.setAttribute('data-ejf-hidden-dates', '1');
+    }
+}
+
+// Initial nudge in case the header is already present before the first DOM mutation fires.
+waitForKeyElements(issueItem, function () {
+    try { ejfShowIssueDates(); } catch (e) { /* ignore */ }
+    try { ejfHideNativeDates(); } catch (e) { /* ignore */ }
+});
 
 
 // Free translation via Google's keyless "gtx" endpoint (translate_a/single). No API key, no cost - this
