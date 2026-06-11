@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.13.5
+// @version     2.13.6
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -1509,6 +1509,10 @@ var cssLogParser = `
     .sig-hit {
       box-shadow: inset 4px 0 0 #ffb547 !important;
     }
+
+    .sig-hit-loose {
+      box-shadow: inset 4px 0 0 #6b7785 !important;
+    }
 `
 
 
@@ -1881,11 +1885,18 @@ var EJF_SD = {
  * index rebuilds whenever the defect DB changes.
  */
 EJF_SD.logsig = {
-    // { sigMap: { sig -> { sig, label, members:[{key,status,resolution,resolutiondate}] } }, keyToSigs: { key -> [sig,...] } }
+    // _index: {
+    //   sigMap:    { sig -> { sig, label, members:[{key,status,resolution,resolutiondate,created}] } },  // EXACT (full chain)
+    //   keyToSigs: { key -> [sig,...] },
+    //   crashMap:  { crashSig -> { crashSig, label, members:[...] } },  // LOOSE (crash site = message + innermost frames)
+    //   keyToCrash:{ key -> [crashSig,...] }
+    // }
     _index: null,
     _building: null,
     _dirty: true,
     MIN_FRAMES: 2,        // need at least this many stack frames to trust a stack signature (else too generic)
+    CRASH_FRAMES: 2,      // crash-site signature uses only the INNERMOST this-many frames (the throw location),
+                          // so the same bug reached via a different call path still matches as "possibly related"
 
     // Split a blob of text into individual EXCEPTION blocks. Stored descriptions have newlines collapsed to
     // spaces, but "EXCEPTION #" / "EXCEPTION END" / "Stackhash:" all survive as substrings, so this works on
@@ -1919,7 +1930,14 @@ EJF_SD.logsig = {
         var sig = (frames.length >= EJF_SD.logsig.MIN_FRAMES)
             ? (msg + '|' + frames.join('>')).toLowerCase()
             : null;
-        return { sig: sig, msg: msg };
+        // Crash-site signature: message + only the INNERMOST CRASH_FRAMES frames (where the exception was
+        // actually thrown). Two defects that crash at the SAME place with the SAME message but were reached by
+        // a DIFFERENT call path share this even though their full `sig` differs - it drives the looser
+        // "possibly related" hint (never an exact cluster). Same null condition as `sig` (needs >= MIN_FRAMES).
+        var crashSig = (frames.length >= EJF_SD.logsig.MIN_FRAMES)
+            ? (msg + '|' + frames.slice(-EJF_SD.logsig.CRASH_FRAMES).join('>')).toLowerCase()
+            : null;
+        return { sig: sig, crashSig: crashSig, msg: msg };
     },
 
     // Build (and cache) the signature index from every stored defect. Every defect exhibiting a signature is
@@ -1931,37 +1949,52 @@ EJF_SD.logsig = {
         if (EJF_SD.logsig._index && !EJF_SD.logsig._dirty) { return Promise.resolve(EJF_SD.logsig._index); }
         if (EJF_SD.logsig._building) { return EJF_SD.logsig._building; }
         EJF_SD.logsig._building = EJF_SD.db.allDefects().then(function (recs) {
-            var sigMap = {}, keyToSigs = {}, nSig = 0;
+            var sigMap = {}, keyToSigs = {}, crashMap = {}, keyToCrash = {}, nSig = 0;
             for (var i = 0; i < recs.length; i++) {
                 if (recs[i].project === 'EBR') { continue; }   // mine exception signatures from DEFECTS only, not bug reports
                 var desc = recs[i].description;
                 if (!desc || desc.indexOf('EXCEPTION #') === -1) { continue; }
                 var key = recs[i].key;
+                // One member record per defect, shared (by reference) across whatever clusters it lands in.
+                var member = { key: key, status: recs[i].status || '', resolution: recs[i].resolution || null, resolutiondate: recs[i].resolutiondate || null, created: recs[i].created || null };
                 var blocks = EJF_SD.logsig._splitBlocks(desc);
                 for (var b = 0; b < blocks.length; b++) {
                     var fp = EJF_SD.logsig._fingerprint(blocks[b]);
                     if (!fp.sig) { continue; }
+                    // EXACT cluster: keyed on the full stack-frame chain (precise).
                     var c = sigMap[fp.sig];
                     if (!c) { c = sigMap[fp.sig] = { sig: fp.sig, label: fp.msg || '', members: [] }; nSig++; }
                     if (!c.label && fp.msg) { c.label = fp.msg; }
                     if (!keyToSigs[key]) { keyToSigs[key] = []; }
                     if (keyToSigs[key].indexOf(fp.sig) === -1) {   // first time THIS defect shows THIS signature
                         keyToSigs[key].push(fp.sig);
-                        c.members.push({ key: key, status: recs[i].status || '', resolution: recs[i].resolution || null, resolutiondate: recs[i].resolutiondate || null, created: recs[i].created || null });
+                        c.members.push(member);
+                    }
+                    // CRASH-SITE cluster: keyed on message + innermost frames only, so the same bug reached via
+                    // a different call path groups here (drives the looser "possibly related" relation).
+                    if (fp.crashSig) {
+                        var cc = crashMap[fp.crashSig];
+                        if (!cc) { cc = crashMap[fp.crashSig] = { crashSig: fp.crashSig, label: fp.msg || '', members: [] }; }
+                        if (!cc.label && fp.msg) { cc.label = fp.msg; }
+                        if (!keyToCrash[key]) { keyToCrash[key] = []; }
+                        if (keyToCrash[key].indexOf(fp.crashSig) === -1) {
+                            keyToCrash[key].push(fp.crashSig);
+                            cc.members.push(member);
+                        }
                     }
                 }
             }
             // Order each cluster's members NEWEST-FIRST (by created date), so members[0] - the canonical
             // defect used as the main/log-badge entry and the head of every "related"/sibling list - is the
             // most recently created one, and the rest read newest->oldest below it.
-            Object.keys(sigMap).forEach(function (s) {
-                sigMap[s].members.sort(function (a, b) {
-                    var ac = a.created || '', bc = b.created || '';
-                    if (ac !== bc) { return ac < bc ? 1 : -1; }   // later ISO timestamp (newer) first
-                    return a.key < b.key ? -1 : 1;                 // stable tiebreak when dates are equal/missing
-                });
-            });
-            EJF_SD.logsig._index = { sigMap: sigMap, keyToSigs: keyToSigs };
+            function memberSort(a, b) {
+                var ac = a.created || '', bc = b.created || '';
+                if (ac !== bc) { return ac < bc ? 1 : -1; }   // later ISO timestamp (newer) first
+                return a.key < b.key ? -1 : 1;                 // stable tiebreak when dates are equal/missing
+            }
+            Object.keys(sigMap).forEach(function (s) { sigMap[s].members.sort(memberSort); });
+            Object.keys(crashMap).forEach(function (s) { crashMap[s].members.sort(memberSort); });
+            EJF_SD.logsig._index = { sigMap: sigMap, keyToSigs: keyToSigs, crashMap: crashMap, keyToCrash: keyToCrash };
             EJF_SD.logsig._dirty = false;
             EJF_SD.logsig._building = null;
             var nClusters = 0;
@@ -1992,6 +2025,35 @@ EJF_SD.logsig = {
                 for (var m = 0; m < c.members.length; m++) {
                     var mem = c.members[m];
                     if (seen[mem.key]) { continue; }
+                    seen[mem.key] = true;
+                    out.push(mem);
+                }
+            }
+            return out;
+        });
+    },
+
+    // Every defect that shares this key's CRASH SITE (message + innermost frames) but is NOT already an exact
+    // sibling - i.e. the SAME bug reached via a DIFFERENT call path. Looser than siblingsForKey; drives the
+    // "Possibly related" hint. [] when none.
+    relatedForKey: function (key) {
+        return EJF_SD.logsig.ensure().then(function (idx) {
+            if (!idx) { return []; }
+            var exclude = {};
+            exclude[key] = true;
+            var sigs = (idx.keyToSigs && idx.keyToSigs[key]) || [];
+            for (var s = 0; s < sigs.length; s++) {   // exclude exact siblings (already shown under "Same exception")
+                var sc = idx.sigMap[sigs[s]];
+                if (sc) { for (var e = 0; e < sc.members.length; e++) { exclude[sc.members[e].key] = true; } }
+            }
+            var out = [], seen = {};
+            var csigs = (idx.keyToCrash && idx.keyToCrash[key]) || [];
+            for (var c = 0; c < csigs.length; c++) {
+                var cc = idx.crashMap[csigs[c]];
+                if (!cc) { continue; }
+                for (var m = 0; m < cc.members.length; m++) {
+                    var mem = cc.members[m];
+                    if (exclude[mem.key] || seen[mem.key]) { continue; }
                     seen[mem.key] = true;
                     out.push(mem);
                 }
@@ -2118,18 +2180,50 @@ EJF_SD.logsig = {
                 }
                 return out;
             }
-            function tally(defect, tr, label) {
-                if (!found[defect]) { found[defect] = { defect: defect, count: 0, rows: [], raw: label || '', cluster: siblings(defect) }; }
+            // Defects that share this defect's CRASH SITE but aren't exact siblings (same bug, different path).
+            function crashPeers(defect) {
+                var out = [], seen = {};
+                seen[defect] = true;
+                var cs = (idx.keyToCrash && idx.keyToCrash[defect]) || [];
+                for (var s = 0; s < cs.length; s++) {
+                    var cc = idx.crashMap[cs[s]];
+                    if (!cc) { continue; }
+                    for (var m = 0; m < cc.members.length; m++) {
+                        if (seen[cc.members[m].key]) { continue; }
+                        seen[cc.members[m].key] = true;
+                        out.push(cc.members[m]);
+                    }
+                }
+                return out;
+            }
+            // The "+N related" list for a found defect: exact-path siblings first, then (tagged) crash-site peers.
+            function clusterFor(defect) {
+                var exact = siblings(defect), seen = {};
+                for (var i2 = 0; i2 < exact.length; i2++) { seen[exact[i2].key] = true; }
+                var rel = [], peers = crashPeers(defect);
+                for (var p = 0; p < peers.length; p++) {
+                    if (seen[peers[p].key]) { continue; }
+                    var o = {}, src = peers[p];
+                    for (var k in src) { if (Object.prototype.hasOwnProperty.call(src, k)) { o[k] = src[k]; } }
+                    o.related = true;   // "~ similar" (same crash site, different call path)
+                    rel.push(o);
+                }
+                return exact.concat(rel);
+            }
+            function tally(defect, tr, label, loose) {
+                if (!found[defect]) { found[defect] = { defect: defect, count: 0, rows: [], raw: label || '', loose: !!loose, cluster: clusterFor(defect) }; }
                 found[defect].count++;
                 found[defect].rows.push(tr);
                 if (!found[defect].raw && label) { found[defect].raw = label; }
+                if (!loose) { found[defect].loose = false; }   // any exact hit upgrades the entry from "possibly related"
             }
-            function markAnchor(tr, defect) {
+            function markAnchor(tr, defect, loose) {
                 var cell = tr.lastElementChild;
-                tr.className += ' sig-hit';
+                tr.className += loose ? ' sig-hit-loose' : ' sig-hit';
                 if (cell) {
-                    cell.title = 'Known exception · ' + defect;
-                    cell.innerHTML = '<a href="/browse/' + defect + '" target="_blank" style="color:#4c9aff;font-weight:700;margin-right:6px;">[' + defect + ']</a>' + cell.innerHTML;
+                    cell.title = (loose ? 'Possibly related (same crash site) · ' : 'Known exception · ') + defect;
+                    var col = loose ? '#9aa6b2' : '#4c9aff';
+                    cell.innerHTML = '<a href="/browse/' + defect + '" target="_blank" style="color:' + col + ';font-weight:700;margin-right:6px;">[' + (loose ? '~' : '') + defect + ']</a>' + cell.innerHTML;
                 }
             }
             var i = 0;
@@ -2137,7 +2231,10 @@ EJF_SD.logsig = {
                 var tr = rows[i];
                 var marked = tr.getAttribute('data-ejf-sig');
                 if (marked) {                                     // already processed in a previous pass
-                    if (marked !== '0') { tally(marked, tr); }    // ...re-count anchors for the panel
+                    if (marked !== '0') {                          // ...re-count anchors for the panel
+                        var lk = marked.charAt(0) === '~';        // '~' prefix = loose (crash-site) match
+                        tally(lk ? marked.slice(1) : marked, tr, null, lk);
+                    }
                     i++;
                     continue;
                 }
@@ -2153,13 +2250,19 @@ EJF_SD.logsig = {
                 }
                 var fp = EJF_SD.logsig._fingerprint(blockText);
                 var defect = (fp.sig && idx.sigMap[fp.sig]) ? idx.sigMap[fp.sig].members[0].key : null;
-                // Mark every block row as scanned; only the anchor (first row) carries the defect key.
+                var loose = false;
+                if (!defect && fp.crashSig && idx.crashMap[fp.crashSig]) {   // no exact hit -> same-crash-site fallback
+                    defect = idx.crashMap[fp.crashSig].members[0].key;
+                    loose = true;
+                }
+                // Mark every block row as scanned; only the anchor (first row) carries the defect key (a '~'
+                // prefix flags a loose crash-site match so a re-pass keeps the right styling).
                 for (var b = 0; b < blockRows.length; b++) {
                     if (!blockRows[b].getAttribute('data-ejf-sig')) {
-                        blockRows[b].setAttribute('data-ejf-sig', (b === 0 && defect) ? defect : '0');
+                        blockRows[b].setAttribute('data-ejf-sig', (b === 0 && defect) ? ((loose ? '~' : '') + defect) : '0');
                     }
                 }
-                if (defect) { markAnchor(tr, defect); tally(defect, tr, fp.msg); }
+                if (defect) { markAnchor(tr, defect, loose); tally(defect, tr, fp.msg, loose); }
                 i = j;
             }
             EJF_SD.logsig.renderPanel(found);
@@ -2199,9 +2302,15 @@ EJF_SD.logsig = {
             function tallyBlock(blockText) {
                 var fp = EJF_SD.logsig._fingerprint(blockText);
                 var defect = (fp.sig && idx.sigMap[fp.sig]) ? idx.sigMap[fp.sig].members[0].key : null;
+                var loose = false;
+                if (!defect && fp.crashSig && idx.crashMap[fp.crashSig]) {   // no exact hit -> same-crash-site fallback
+                    defect = idx.crashMap[fp.crashSig].members[0].key;
+                    loose = true;
+                }
                 if (!defect) { return; }
-                if (!found[defect]) { found[defect] = { defect: defect, count: 0, msg: fp.msg || '' }; }
+                if (!found[defect]) { found[defect] = { defect: defect, count: 0, msg: fp.msg || '', loose: loose }; }
                 found[defect].count++;
+                if (!loose) { found[defect].loose = false; }   // an exact hit upgrades it from "possibly related"
                 if (!found[defect].msg && fp.msg) { found[defect].msg = fp.msg; }
             }
             // Group message lines into exception blocks exactly like applyToTable: EXCEPTION # starts a block,
@@ -2273,6 +2382,7 @@ EJF_SD.logsig = {
 .ejf-exc-badge.open { background: #3a434d; color: #cfd6dd; }\
 .ejf-exc-badge.fixed { background: #1f3d2e; color: #7fdca4; }\
 .ejf-exc-badge.warn { background: #5a3a1a; color: #ffb547; }\
+.ejf-exc-badge.rel { background: transparent; color: #9aa6b2; border: 1px solid #3a434d; }\
 .ejf-excl-cluster { border-bottom: 1px solid #2c333a; padding: 7px 0; }\
 .ejf-excl-head { display: flex; align-items: center; gap: 8px; cursor: pointer; }\
 .ejf-excl-head:hover .ejf-excl-label { color: #fff; }\
@@ -2305,6 +2415,13 @@ EJF_SD.logsig = {
         a.addEventListener('click', function (ev) { ev.stopPropagation(); });
         row.appendChild(a);
         row.appendChild(EJF_SD.logsig._statusBadgeEl(member));
+        if (member.related) {   // crash-site peer (same bug, different call path) - flag it as looser
+            var rel = document.createElement('span');
+            rel.className = 'ejf-exc-badge rel';
+            rel.textContent = '~ similar';
+            rel.title = 'Same crash site, reached via a different call path — possibly related';
+            row.appendChild(rel);
+        }
         if (extraEl) { row.appendChild(extraEl); }
         row.addEventListener('mouseenter', function () { EJF_SD.logsig._showDefectTip(member.key, row); });
         row.addEventListener('mouseleave', function () {
@@ -2383,6 +2500,17 @@ EJF_SD.logsig = {
             badge.className = 'ejf-logmatch-count';
             badge.textContent = entry.count + '×';
             mainEl.appendChild(badge);
+
+            if (entry.loose) {   // matched only by crash site (no exact stack match) - flag it as looser
+                var lt = document.createElement('span');
+                lt.className = 'ejf-logmatch-count';   // reuse the pill, but muted + transparent
+                lt.style.background = 'transparent';
+                lt.style.color = '#9aa6b2';
+                lt.style.marginRight = '6px';
+                lt.textContent = '~ similar';
+                lt.title = 'Same crash site, reached via a different call path — possibly related';
+                mainEl.appendChild(lt);
+            }
 
             if (entry.raw) {
                 var sig = document.createElement('div');
@@ -4061,6 +4189,7 @@ EJF_SD.ui = {
 #ejf-sd-loglink a { color: #4c9aff; font-weight: 700; text-decoration: none; }\
 #ejf-sd-loglink a:hover { text-decoration: underline; }\
 #ejf-sd-loglink .count { color: #cfd6dd; background: #3a434d; border-radius: 8px; padding: 0 7px; font-size: 10px; font-weight: 700; margin-left: 6px; }\
+.ejf-sd-loose { font-size: 10px; color: #9aa6b2; margin-left: 6px; }\
 #ejf-sd-exccluster { display: none; padding: 6px 10px; border-bottom: 1px solid #2c333a; background: #20262b; }\
 #ejf-sd-exccluster.has-hits { display: block; }\
 #ejf-sd-exccluster .ejf-sd-exccluster-head { font-weight: 700; color: #cfd6dd; font-size: 11px; margin-bottom: 4px; }\
@@ -4926,8 +5055,9 @@ EJF_SD.ui = {
                     var merged = {}, pending = logs.length;
                     function mergeFound(found) {
                         Object.keys(found || {}).forEach(function (k) {
-                            if (!merged[k]) { merged[k] = { defect: k, count: 0, msg: found[k].msg }; }
+                            if (!merged[k]) { merged[k] = { defect: k, count: 0, msg: found[k].msg, loose: !!found[k].loose }; }
                             merged[k].count += found[k].count;
+                            if (!found[k].loose) { merged[k].loose = false; }   // an exact hit upgrades it
                             if (!merged[k].msg && found[k].msg) { merged[k].msg = found[k].msg; }
                         });
                         if (--pending === 0) {
@@ -4967,6 +5097,10 @@ EJF_SD.ui = {
                 keys.forEach(function (k) {
                     var $li = $('<li></li>');
                     $('<a></a>').attr('href', '/browse/' + k).attr('target', '_blank').text(k).appendTo($li);
+                    if (found[k].loose) {   // matched only by crash site (same bug, different path)
+                        $('<span class="ejf-sd-loose"></span>').text('~ similar')
+                            .attr('title', 'Same crash site, reached via a different call path — possibly related').appendTo($li);
+                    }
                     EJF_SD.ui._markDupButton(k).appendTo($li);   // same one-click "Mark dup" as the suggestions
                     $('<span class="count"></span>').text(found[k].count + '×').appendTo($li);
                     $li.on('mouseenter', function () { EJF_SD.logsig._showDefectTip(k, this); });
@@ -5082,30 +5216,38 @@ EJF_SD.ui = {
         var $box = $('#ejf-sd-exccluster');
         if (!$box.length) { return; }
         $box.removeClass('has-hits').empty();
-        EJF_SD.logsig.siblingsForKey(key).then(function (siblings) {
+        // Exact stack siblings ("Same exception") AND looser crash-site peers ("Possibly related").
+        Promise.all([EJF_SD.logsig.siblingsForKey(key), EJF_SD.logsig.relatedForKey(key)]).then(function (res) {
             if (EJF_SD.ui.currentKey !== key) { return; }       // navigated to another issue meanwhile
-            if (!siblings || !siblings.length) { return; }
+            var siblings = res[0] || [], related = res[1] || [];
+            if (!siblings.length && !related.length) { return; }
             return EJF_SD.db.getDefect(key).then(function (rec) {
                 if (EJF_SD.ui.currentKey !== key) { return; }
                 var currentResolved = !!(rec && (rec.resolution || rec.resolutiondate));
                 EJF_SD.logsig._injectClusterCss();
                 var $b = $('#ejf-sd-exccluster');
                 $b.empty();
-                $('<div class="ejf-sd-exccluster-head"></div>').text('Same exception (' + siblings.length + ')').appendTo($b);
-                var members = document.createElement('div');
-                members.className = 'ejf-exc-members';
-                siblings.forEach(function (m) {
-                    var resolved = !!(m.resolution || m.resolutiondate);
-                    var warn = null;
-                    if (resolved && !currentResolved) {   // already fixed elsewhere, but this one is still open
-                        warn = document.createElement('span');
-                        warn.className = 'ejf-exc-badge warn';
-                        warn.textContent = '⚠ regression?';
-                        warn.title = 'This exception was already resolved in ' + m.key + ', but the current issue is still open – possible regression.';
-                    }
-                    members.appendChild(EJF_SD.logsig._memberRowEl(m, warn));
-                });
-                $b.append(members);
+                // ⚠ regression flag: a peer that's already FIXED while this defect is still open.
+                function regressionWarn(m) {
+                    if (!((m.resolution || m.resolutiondate) && !currentResolved)) { return null; }
+                    var warn = document.createElement('span');
+                    warn.className = 'ejf-exc-badge warn';
+                    warn.textContent = '⚠ regression?';
+                    warn.title = 'This exception was already resolved in ' + m.key + ', but the current issue is still open – possible regression.';
+                    return warn;
+                }
+                function section(headText, headTitle, list, marginTop) {
+                    var $h = $('<div class="ejf-sd-exccluster-head"></div>').text(headText);
+                    if (headTitle) { $h.attr('title', headTitle); }
+                    if (marginTop) { $h.css('margin-top', '8px'); }
+                    $h.appendTo($b);
+                    var box = document.createElement('div');
+                    box.className = 'ejf-exc-members';
+                    list.forEach(function (m) { box.appendChild(EJF_SD.logsig._memberRowEl(m, regressionWarn(m))); });
+                    $b.append(box);
+                }
+                if (siblings.length) { section('Same exception (' + siblings.length + ')', '', siblings, false); }
+                if (related.length) { section('Possibly related (' + related.length + ')', 'Same crash site, reached via a different call path', related, siblings.length > 0); }
                 $b.addClass('has-hits');
                 EJF_SD.ui._fitVertical();
             });
