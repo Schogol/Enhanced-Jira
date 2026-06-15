@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.13.8
+// @version     2.13.9
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -4375,10 +4375,12 @@ EJF_SD.ui = {
 #ejf-side-group #ejf-sd-exccluster.has-hits { display: block; }\
 #ejf-side-group #ejf-sd-exccluster .ejf-sd-exccluster-head { color: var(--ds-text, #172b4d); }\
 #ejf-side-group #ejf-sd-exccluster .ejf-exc-member a { color: var(--ds-link, #0c66e4); }\
-/* Responsive 2-up grid: two columns once the context column is wide enough (each cell >= 280px),\
-   automatically collapsing to one column when narrow. align-items:stretch so both cards in a row share\
-   the height of the taller one (left + right column line up). */\
-#ejf-side-group #ejf-sd-list { overflow: visible; display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); column-gap: 18px; align-items: stretch; }\
+/* Responsive 2-up grid: two columns once the context column is wide enough (each cell >= 180px),\
+   automatically collapsing to one column when narrow. The min track is 180px (not 280px) because the Jira\
+   context column on a 1920-wide screen is only ~400px, so a 280px min never left room for a second column\
+   there; 180px fits two columns (2*180 + 14px gap) in that width while still collapsing to one on a narrow\
+   laptop. align-items:stretch so both cards in a row share the height of the taller one (columns line up). */\
+#ejf-side-group #ejf-sd-list { overflow: visible; display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); column-gap: 14px; align-items: stretch; }\
 /* Each card is position:relative + bottom padding so the created date can be pinned to the bottom-right\
    (absolute) of the STRETCHED cell - so the dates line up across the two columns even when one card has\
    less content than the other (the short card no longer floats its date mid-card with a gap below it). */\
