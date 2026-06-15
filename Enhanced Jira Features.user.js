@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.13.7
+// @version     2.13.8
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -2873,11 +2873,14 @@ EJF_SD.util = {
 
     delay: function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); },
 
-    // True when a defect is effectively resolved/closed. We check BOTH the resolution field (set on any
-    // closed issue) and the status name, because the EVE instance uses custom statuses we can't enumerate.
+    // True when a defect / bug report is effectively resolved / closed / handled. We check BOTH the resolution
+    // field (set on any closed issue) and the status name, because the EVE instance uses custom statuses we
+    // can't enumerate. "Attached" is the terminal EBR state set when a bug report is attached to a defect as a
+    // duplicate (sometimes WITHOUT a Resolution), so it must count as not-open or those reports get ranked /
+    // listed as open in the EDR "matching reports" view.
     isResolved: function (status, resolution) {
         if (resolution) { return true; }
-        return /closed|done|resolved|rejected|cancel/i.test(status || '');
+        return /closed|done|resolved|rejected|cancel|attached/i.test(status || '');
     },
 
     // Stale-match demotion factor. A defect that was FIXED long before this bug report was even filed is
