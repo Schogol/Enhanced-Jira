@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.14.4
+// @version     2.14.5
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -2047,15 +2047,27 @@ EJF_SD.logsig = {
         while ((fm = fre.exec(text))) {
             frames.push(fm[1].replace(/^.*[\/\\]/, '') + ':' + fm[3]);   // basename:function (no line number)
         }
+        // The SAME bug at the SAME stack site is constantly reported with a DIFFERENT volatile id baked into
+        // the exception MESSAGE - e.g. "KeyError: 9002284116000004218L" vs "KeyError: 9002235721000238019L"
+        // (an itemID/typeID/charID), or a hex object address. Left as-is, the message makes every report's
+        // signature unique and the two never cluster even though the frame chain is identical. So we normalize
+        // those volatile literals to a placeholder for the SIGNATURE only: any 0x hex address, any python long
+        // (`<digits>L`), and any bare run of 4+ digits -> '#'. The stack frames still gate every match, so this
+        // only ever collapses "same bug, different id"; it can't merge unrelated exceptions. The RAW msg is
+        // kept untouched for the human-readable panel / cluster label.
+        var nmsg = msg
+            .replace(/0x[0-9a-fA-F]+/g, '0x#')   // memory addresses (e.g. object repr ids)
+            .replace(/\b\d+L\b/g, '#')            // python long literals - always an id (item/type/char/...)
+            .replace(/\b\d{4,}\b/g, '#');         // other long numeric ids
         var sig = (frames.length >= EJF_SD.logsig.MIN_FRAMES)
-            ? (msg + '|' + frames.join('>')).toLowerCase()
+            ? (nmsg + '|' + frames.join('>')).toLowerCase()
             : null;
         // Crash-site signature: message + only the INNERMOST CRASH_FRAMES frames (where the exception was
         // actually thrown). Two defects that crash at the SAME place with the SAME message but were reached by
         // a DIFFERENT call path share this even though their full `sig` differs - it drives the looser
         // "possibly related" hint (never an exact cluster). Same null condition as `sig` (needs >= MIN_FRAMES).
         var crashSig = (frames.length >= EJF_SD.logsig.MIN_FRAMES)
-            ? (msg + '|' + frames.slice(-EJF_SD.logsig.CRASH_FRAMES).join('>')).toLowerCase()
+            ? (nmsg + '|' + frames.slice(-EJF_SD.logsig.CRASH_FRAMES).join('>')).toLowerCase()
             : null;
         return { sig: sig, crashSig: crashSig, msg: msg };
     },
