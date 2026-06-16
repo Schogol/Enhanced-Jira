@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.13.9
+// @version     2.14.4
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -3425,6 +3425,14 @@ EJF_SD.sync = {
         });
     },
 
+    // Menu entry point for the single "Sync now" button: sync the defect dataset, then the bug-report
+    // dataset, sequentially (each is single-flight via `running`, so we chain them). Each leg shows its own
+    // toast / status as before. Guarded up front so a click while a sync is running is a no-op + toast.
+    syncAllNow: function () {
+        if (EJF_SD.sync.running) { EJF_SD.ui.toast('A sync is already running…'); return Promise.resolve(); }
+        return EJF_SD.sync.syncNow().then(function () { return EJF_SD.sync.syncEbrNow(); });
+    },
+
     // Quiet background catch-up used by the auto-sync scheduler. BOTH datasets AUTO-INITIALIZE on the first
     // run (full build when the DB is empty) and then run incremental catch-ups: DEFECTS (EDR/EO) and OPEN
     // BUG REPORTS (EBRs). No start/finish toasts; re-embeds / refreshes the open panel only on actual changes.
@@ -4132,6 +4140,23 @@ EJF_SD.rank.suggestEbrBest = function (text, key) {
 /* ---- issue linking: "mark as duplicate" (Feature B) ---- */
 EJF_SD.link = {
     _info: null,   // cached { name, ebrSide } - the link-type name + which side the EBR goes on
+    _me: null,     // cached current-user accountId (for the defect-side attach assignee gate)
+
+    // Resolve the current user's accountId (cached). Used by the defect-side "Attach" control to gate which
+    // bug reports may be attached (only unassigned ones, or ones already assigned to me). Prefer the
+    // ajs-atlassian-account-id meta tag Jira renders into the page; fall back to /myself. Resolves null if
+    // it can't be determined (callers then disallow attaching anything that IS assigned, to be safe).
+    currentUser: function () {
+        if (EJF_SD.link._me) { return Promise.resolve(EJF_SD.link._me); }
+        var meta = document.querySelector('meta[name="ajs-atlassian-account-id"]');
+        var id = meta && meta.getAttribute('content');
+        if (id) { EJF_SD.link._me = id; return Promise.resolve(id); }
+        return new Promise(function (resolve) {
+            $.ajax({ url: EJF_SD.HOST + '/rest/api/2/myself', dataType: 'json' })
+                .done(function (d) { EJF_SD.link._me = (d && d.accountId) || null; resolve(EJF_SD.link._me); })
+                .fail(function () { resolve(null); });
+        });
+    },
 
     // Resolve the duplicate link type AND the side the bug report must sit on so the EBR reads "duplicates"
     // (not "is duplicated by"). Jira links go outward->inward: the outward issue shows the type's `outward`
@@ -4214,7 +4239,7 @@ EJF_SD.link = {
     // Graceful fallbacks: if the transition screen has no Linked Issues field we transition, then create the
     // link separately; if there's no such transition at all we just create the link. Resolves with
     // { attached: bool, linked: bool }.
-    attachDuplicate: function (ebrKey, otherKey, statusName, preferredResolution) {
+    attachDuplicate: function (ebrKey, otherKey, statusName, preferredResolution, assigneeAccountId) {
         return EJF_SD.link.dupInfo().then(function (info) {
             return new Promise(function (resolve, reject) {
                 $.ajax({ url: EJF_SD.HOST + '/rest/api/3/issue/' + ebrKey + '/transitions?expand=transitions.fields', dataType: 'json' })
@@ -4243,6 +4268,14 @@ EJF_SD.link = {
                             }
                             if (!chosen && rf.required && allowed.length) { chosen = allowed[0]; }
                             if (chosen) { payload.fields = { resolution: { id: chosen.id } }; }
+                        }
+                        // Assignee field on the screen: when an account id is passed (the defect-side attach),
+                        // set it so the attached report is attributed to the triager - mirrors Jira's native
+                        // Attach dialog, which posts the assignee, and covers a transition screen that requires
+                        // one. Only set it when the screen actually carries the field.
+                        if (assigneeAccountId && t.fields && t.fields.assignee) {
+                            payload.fields = payload.fields || {};
+                            payload.fields.assignee = { accountId: assigneeAccountId };
                         }
                         // Linked Issues field on the screen: add the duplicate link inline (single call).
                         var hasLinkField = !!(t.fields && t.fields.issuelinks);
@@ -4300,6 +4333,7 @@ EJF_SD.ui = {
 .ejf-sd-link:hover { color: #4c9aff; text-decoration: underline; }\
 .ejf-sd-link.ejf-sd-linking { color: #7a8694; cursor: default; text-decoration: none; }\
 .ejf-sd-link.ejf-sd-linked { color: #4caf7d; cursor: default; text-decoration: none; }\
+.ejf-sd-link.ejf-sd-noattach { color: #7a8694 !important; cursor: default; text-decoration: none; }\
 .ejf-sd-list li.ejf-sd-stale { opacity: .6; }\
 .ejf-sd-sum { margin-top: 2px; color: #e6e6e6; }\
 .ejf-sd-meta { margin-top: 2px; color: #7a8694; font-size: 10px; }\
@@ -5041,7 +5075,15 @@ EJF_SD.ui = {
                 if (!res.linked) { msg = 'Set ' + ebr + ' to Attached, but the duplicate link failed.'; }
                 // Soft-patch the status lozenge in place - no full reload. The duplicate link is created
                 // server-side and shows in Jira's "Linked work items" section on the next natural refresh.
-                if (res.attached) { EJF_SD.ui.softRefreshStatus('Attached'); }
+                if (res.attached) {
+                    EJF_SD.ui.softRefreshStatus('Attached');
+                    // Drop the now-Attached report from the local open-report DB immediately so it no longer
+                    // shows up as an open match on defects before the next EBR sync prunes it.
+                    EJF_SD.db.deleteDefects([ebr]).then(function () {
+                        EJF_SD.rank._dirtyEbr = true;
+                        EJF_SD.rank._dirtyEbrVec = true;
+                    });
+                }
                 EJF_SD.ui.toast(msg);
             }, function (e) {
                 console.log('[EJF-SD] mark-dup failed (attachDuplicate rejected):', e && e.message || e);
@@ -5050,6 +5092,205 @@ EJF_SD.ui = {
             });
         });
         return $dup;
+    },
+
+    // Fetch (and cache per key) a bug report's current assignee. Resolves { accountId, name } when assigned,
+    // or null when unassigned; REJECTS on a network failure so the caller can refuse to offer the attach
+    // action when it couldn't verify who owns the report.
+    _assigneeCache: {},
+    _getAssignee: function (key) {
+        if (Object.prototype.hasOwnProperty.call(EJF_SD.ui._assigneeCache, key)) {
+            return Promise.resolve(EJF_SD.ui._assigneeCache[key]);
+        }
+        return new Promise(function (resolve, reject) {
+            $.ajax({ url: EJF_SD.HOST + '/rest/api/2/issue/' + key + '?fields=assignee', dataType: 'json' })
+                .done(function (d) {
+                    var a = d && d.fields && d.fields.assignee;
+                    var v = a ? { accountId: a.accountId, name: a.displayName || a.name || '' } : null;
+                    EJF_SD.ui._assigneeCache[key] = v;
+                    resolve(v);
+                })
+                .fail(function () { reject(new Error('assignee fetch failed')); });
+        });
+    },
+
+    // Defect-side mirror of _markDupButton: build an "Attach" control on a matching-bug-report row that links
+    // the report (`reportKey`) as a duplicate of the CURRENT defect and moves it to Attached - via the same
+    // single transition (status + resolution + link + assignee) as the EBR-side button, just with the report
+    // as the issue being transitioned. Triage rule: we only ever attach a report that is UNASSIGNED or already
+    // assigned to the current user (never one someone else is working). So the button stays in a muted
+    // "checking…" state until we've confirmed the assignee, then either enables ("Attach") or shows a muted,
+    // non-clickable "assigned" hint. On attach it also sets the assignee to the current user (matches Jira's
+    // native Attach dialog). The assignee can change server-side, so we gate on a LIVE fetch, not stored data.
+    _attachReportButton: function (reportKey) {
+        var defectKey = EJF_SD.ui.currentKey;   // the defect this row was rendered for (captured now)
+        var $btn = $('<span class="ejf-sd-link ejf-sd-linking"></span>').text('…')
+            .attr('title', 'Checking assignee…');
+
+        function wireAttach() {
+            $btn.removeClass('ejf-sd-linking ejf-sd-noattach').text('Attach')
+                .attr('title', 'Attach ' + reportKey + ' to ' + defectKey + ' as a duplicate (sets it to Attached)');
+            $btn.on('click', function (ev) {
+                ev.preventDefault();
+                ev.stopPropagation();
+                var $b = $(this);
+                if ($b.hasClass('ejf-sd-linked') || $b.hasClass('ejf-sd-linking')) { return; }
+                if (!confirm('Attach ' + reportKey + ' to ' + defectKey + ' as a duplicate and set it to Attached?')) { return; }
+                $b.addClass('ejf-sd-linking').text('…');
+                // Pass the current user so the report is assigned to the triager on attach (the gate guarantees
+                // it was unassigned or already mine, so this never steals someone else's assignment).
+                EJF_SD.link.currentUser().then(function (me) {
+                    return EJF_SD.link.attachDuplicate(reportKey, defectKey, 'Attached', 'Duplicate', me).then(function (res) {
+                        EJF_SD.ui._hideTip();
+                        $b.removeClass('ejf-sd-linking').addClass('ejf-sd-linked').text(res.attached ? '✓ attached' : '✓ linked');
+                        var msg = res.attached
+                            ? ('Attached ' + reportKey + ' to ' + defectKey + '.')
+                            : ('Linked ' + reportKey + ' to ' + defectKey + ' (could not set Attached).');
+                        if (!res.linked) { msg = 'Set ' + reportKey + ' to Attached, but the duplicate link failed.'; }
+                        EJF_SD.ui.toast(msg);
+                        // Only remove it once the Attached transition actually succeeded (so it's genuinely
+                        // resolved). Drop it from the local open-report DB, mark the EBR indexes dirty, then
+                        // collapse/fade its row out (the rows below slide up) and re-render so a fresh
+                        // suggestion loads into the freed slot. If only the link was created (status still
+                        // open), leave the row in place - the report is still an open match.
+                        if (res.attached) {
+                            return EJF_SD.db.deleteDefects([reportKey]).then(function () {
+                                EJF_SD.rank._dirtyEbr = true;
+                                EJF_SD.rank._dirtyEbrVec = true;
+                                EJF_SD.ui._fadeOutAndReplace($b.closest('li'), defectKey);
+                            });
+                        }
+                    });
+                }).catch(function (e) {
+                    console.log('[EJF-SD] attach-report failed:', e && e.message || e);
+                    $b.removeClass('ejf-sd-linking').text('Attach');
+                    EJF_SD.ui.toast('Could not attach: ' + (e && e.message || e));
+                });
+            });
+        }
+
+        // Gate on the report's live assignee: only unassigned or assigned-to-me may be attached.
+        Promise.all([EJF_SD.link.currentUser(), EJF_SD.ui._getAssignee(reportKey)]).then(function (res) {
+            var me = res[0], assignee = res[1];   // assignee: { accountId, name } or null (unassigned)
+            if (!assignee || (me && assignee.accountId === me)) {
+                wireAttach();
+            } else {
+                $btn.removeClass('ejf-sd-linking').addClass('ejf-sd-noattach').text('assigned')
+                    .attr('title', 'Assigned to ' + (assignee.name || 'someone else') +
+                        ' — only unassigned reports or ones assigned to you can be attached');
+            }
+        }, function () {
+            $btn.remove();   // couldn't determine the assignee -> don't offer the action
+        });
+
+        return $btn;
+    },
+
+    // After a report is attached from the defect view, animate the change incrementally instead of rebuilding
+    // the whole list (which flickered): collapse + fade the attached row out (the rows below slide up into the
+    // gap), remove it, then query for ONE fresh candidate not already shown and slide it into the freed last
+    // slot. The record is already deleted from the local DB and the EBR indexes marked dirty by the caller, so
+    // the re-query no longer returns the attached report. We snapshot the keys still on screen BEFORE the
+    // collapse so the new query can pick the best result that isn't already listed.
+    _fadeOutAndReplace: function ($li, defectKey) {
+        var el = $li && $li[0];
+        // Snapshot the keys currently shown (minus the one being removed) so _appendNextReport can find the
+        // first ranked result that isn't already on screen.
+        var shown = {};
+        $('#ejf-sd-list').children('li').each(function () {
+            var k = this.getAttribute('data-ejf-key');
+            if (k && this !== el) { shown[k] = true; }
+        });
+        function appendFresh() {
+            if (EJF_SD.ui.currentKey === defectKey) { EJF_SD.ui._appendNextReport(defectKey, shown); }
+        }
+        if (!el) { appendFresh(); return; }
+        var h = el.offsetHeight;
+        el.style.overflow = 'hidden';
+        el.style.maxHeight = h + 'px';
+        // Force a reflow so the starting max-height is applied before we transition to 0 (otherwise the
+        // browser may collapse the two style writes into one and skip the animation).
+        void el.offsetHeight;
+        el.style.transition = 'max-height .3s ease, opacity .3s ease, padding .3s ease, margin .3s ease';
+        el.style.opacity = '0';
+        el.style.maxHeight = '0px';
+        el.style.paddingTop = '0px';
+        el.style.paddingBottom = '0px';
+        el.style.marginTop = '0px';
+        el.style.marginBottom = '0px';
+        setTimeout(function () {
+            if (el.parentNode) { el.parentNode.removeChild(el); }   // drop the collapsed row (rows below have slid up)
+            appendFresh();
+        }, 320);
+    },
+
+    // Query the matching-reports ranking again and slide in the single best result that isn't already on
+    // screen (the keys in `shown`), filling the slot freed by the just-attached row. Also refreshes the
+    // status-line count + mode. No-op if nothing new ranks (e.g. fewer matches than slots) - the list just
+    // ends up one row shorter. Used by _fadeOutAndReplace so we don't rebuild the whole list.
+    _appendNextReport: function (defectKey, shown) {
+        EJF_SD.ui.getIssueText(defectKey).then(function (text) {
+            if (EJF_SD.ui.currentKey !== defectKey || !text) { return; }
+            return EJF_SD.rank.suggestEbrBest(text, defectKey).then(function (out) {
+                if (EJF_SD.ui.currentKey !== defectKey) { return; }
+                var results = out.results || [];
+                $('#ejf-sd-mode').text(out.mode);
+                var pick = null;
+                for (var i = 0; i < results.length; i++) {
+                    if (!shown[results[i].key]) { pick = results[i]; break; }   // first ranked result not already listed
+                }
+                function refreshCount() {
+                    EJF_SD.db.countEbr().then(function (n) {
+                        if (EJF_SD.ui.currentKey !== defectKey) { return; }
+                        var c = $('#ejf-sd-list').children('li').length;
+                        EJF_SD.ui.setStatus(c + ' matches · ' + out.mode + ' · ' + n + ' open reports');
+                    });
+                }
+                if (!pick) { refreshCount(); return; }
+                // Enrich with the report's full description + created date (for the hover preview / date row),
+                // then build the row and slide it in at the bottom.
+                return EJF_SD.db.getDefect(pick.key).then(function (rec) {
+                    if (rec) { pick.description = rec.description; pick.created = rec.created; }
+                }, function () { /* ignore */ }).then(function () {
+                    if (EJF_SD.ui.currentKey !== defectKey) { return; }
+                    EJF_SD.ui._slideInRow(EJF_SD.ui._reportItem(pick), $('#ejf-sd-list'));
+                    refreshCount();
+                });
+            });
+        }).catch(function (e) { console.log('[EJF-SD] append-next-report skipped:', e && e.message || e); });
+    },
+
+    // Append a freshly-built row to the list and animate it sliding/expanding in from a collapsed state. We
+    // measure the row's natural height (and padding/margins) first, then start it collapsed and transition to
+    // those values; once the transition ends we clear the inline animation styles so the row sits in fully
+    // natural layout (important for the responsive grid, where a leftover max-height would clip a taller card).
+    _slideInRow: function ($row, $list) {
+        var el = $row[0];
+        $list.append($row);
+        var cs = window.getComputedStyle(el);
+        var full = el.offsetHeight;
+        var padTop = cs.paddingTop, padBot = cs.paddingBottom, marTop = cs.marginTop, marBot = cs.marginBottom;
+        el.style.overflow = 'hidden';
+        el.style.maxHeight = '0px';
+        el.style.opacity = '0';
+        el.style.paddingTop = '0px';
+        el.style.paddingBottom = '0px';
+        el.style.marginTop = '0px';
+        el.style.marginBottom = '0px';
+        void el.offsetHeight;   // reflow at the collapsed start so the transition actually runs
+        el.style.transition = 'max-height .3s ease, opacity .3s ease, padding .3s ease, margin .3s ease';
+        el.style.maxHeight = full + 'px';
+        el.style.opacity = '1';
+        el.style.paddingTop = padTop;
+        el.style.paddingBottom = padBot;
+        el.style.marginTop = marTop;
+        el.style.marginBottom = marBot;
+        setTimeout(function () {
+            el.style.transition = ''; el.style.maxHeight = ''; el.style.overflow = '';
+            el.style.opacity = ''; el.style.paddingTop = ''; el.style.paddingBottom = '';
+            el.style.marginTop = ''; el.style.marginBottom = '';
+            EJF_SD.ui._fitVertical();
+        }, 340);
     },
 
     _item: function (r) {
@@ -5081,12 +5322,14 @@ EJF_SD.ui = {
         var pct = (typeof r.pct === 'number') ? r.pct : 0;
         var meta = r.status || '';
         if (r.resolution) { meta += (meta ? ' · ' : '') + r.resolution; }
-        var $li = $('<li></li>');
+        var $li = $('<li></li>').attr('data-ejf-key', r.key);   // key on the row so the incremental attach/slide-in can diff what's shown
         $li.on('mouseenter', function () { EJF_SD.ui._showTip(r, this, meta); });
         $li.on('mouseleave', function () { EJF_SD.ui._hideTip(); });
         $('<a></a>').attr('href', '/browse/' + r.key).attr('target', '_blank').text(r.key).appendTo($li);
         $('<span class="ejf-sd-proj"></span>').text(r.project || '').appendTo($li);
         $('<span class="ejf-sd-score"></span>').text(pct + '%').appendTo($li);
+        // Attach this bug report to the current defect (gated on assignee: unassigned or mine only).
+        EJF_SD.ui._attachReportButton(r.key).appendTo($li);
         $('<div class="ejf-sd-sum"></div>').text(r.summary || '').appendTo($li);
         if (meta) { $('<div class="ejf-sd-meta"></div>').text(meta).appendTo($li); }
         var created = EJF_SD.util.fmtDate(r.created);
@@ -5525,10 +5768,8 @@ EJF_SD.menu = {
             $('<h3>Triage Assistant</h3>').appendTo($ta);
 
             var $actions = $('<div class="ejf-menu-actions"></div>');
-            $('<button class="ejf-btn">Sync defects now</button>')
-                .on('click', function () { EJF_SD.menu.close(); EJF_SD.sync.syncNow(); }).appendTo($actions);
-            $('<button class="ejf-btn">Sync bug reports now</button>')
-                .on('click', function () { EJF_SD.menu.close(); EJF_SD.sync.syncEbrNow(); }).appendTo($actions);
+            $('<button class="ejf-btn">Sync now</button>')
+                .on('click', function () { EJF_SD.menu.close(); EJF_SD.sync.syncAllNow(); }).appendTo($actions);
             $('<button class="ejf-btn">Rebuild defect DB</button>')
                 .on('click', function () { EJF_SD.menu.close(); EJF_SD.sync.rebuild(); }).appendTo($actions);
             $('<button class="ejf-btn">Rebuild BR DB</button>')
