@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.14.5
+// @version     2.15.0
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -1980,7 +1980,19 @@ var EJF_SD = {
     PAGE_DELAY_MS: 250,                            // polite gap between search pages
     NEAR_LIMIT_DELAY_MS: 3000,                     // back off harder when the rate-limit budget is low
     MAX_RETRIES: 5,
-    TOP_N: 8,
+    // How many related issues the panel lists (similar defects / matching bug reports). User-configurable
+    // from the settings menu, persisted in the GM flag 'sdTopN'; default 8, clamped 1..30 (kept below
+    // EJF_SD.rank.CAND so the fusion candidate pool is never the limiting factor). Read live at query time,
+    // so changing it from the menu re-renders with the new count without a reload.
+    TOP_N: (function () {
+        try {
+            if (typeof GM_getValue === 'function') {
+                var v = parseInt(GM_getValue('sdTopN', 8), 10);
+                if (!isNaN(v) && v >= 1 && v <= 30) { return v; }
+            }
+        } catch (e) { /* ignore */ }
+        return 8;
+    })(),
     MODEL_VERSION: 'gte-small-v3',                  // embedding model tag; bump to force a full re-embed
                                                     // (v1 = NaN from fp16; v2 = fp32; v3 = boilerplate-stripped text)
     DATA_VERSION: 1                                 // stored-record SCHEMA version. Bump whenever a sync change
@@ -5717,6 +5729,8 @@ EJF_SD.menu = {
 #ejf-menu .ejf-menu-actions { display: flex; flex-wrap: wrap; gap: 8px; padding: 6px 0 2px; }\
 #ejf-menu .ejf-btn { background: #2c333a; color: #e6e6e6; border: 1px solid #3a434d; border-radius: 5px; padding: 6px 10px; cursor: pointer; font-size: 12px; }\
 #ejf-menu .ejf-btn:hover { background: #343c44; border-color: #4c9aff; }\
+#ejf-menu .ejf-num { width: 56px; flex: 0 0 auto; background: #2c333a; color: #e6e6e6; border: 1px solid #3a434d; border-radius: 5px; padding: 5px 8px; font-size: 12px; text-align: center; }\
+#ejf-menu .ejf-num:focus { outline: none; border-color: #4c9aff; }\
 #ejf-menu .ejf-menu-status { color: #9aa6b2; font-size: 11px; padding: 8px 0 0; }',
 
     _injectCss: function () {
@@ -5799,6 +5813,32 @@ EJF_SD.menu = {
             $('<button class="ejf-btn"></button>').text(sidebarOn ? 'Switch to floating' : 'Switch to sidebar')
                 .on('click', function () { EJF_SD.menu.close(); EJF_SD.ui.toggleStyle(); }).appendTo($styleRow);
             $ta.append($styleRow);
+
+            // Results shown: how many related issues the panel lists (EJF_SD.TOP_N). Persisted in 'sdTopN';
+            // committing a new value updates EJF_SD.TOP_N live and re-renders the open view (no reload). The
+            // ranking reads TOP_N at query time and CAND (50) bounds the candidate pool, so 1..30 is safe.
+            var $cntRow = $('<div class="ejf-menu-row"></div>');
+            $('<span class="lbl">Results shown</span>')
+                .append($('<span class="sub"></span>').text('How many related issues to list (1–30)'))
+                .appendTo($cntRow);
+            var $cnt = $('<input type="number" min="1" max="30" class="ejf-num">').val(EJF_SD.TOP_N);
+            function commitTopN() {
+                var v = parseInt($cnt.val(), 10);
+                if (isNaN(v)) { v = EJF_SD.TOP_N; }
+                v = Math.max(1, Math.min(30, v));
+                $cnt.val(v);
+                if (v === EJF_SD.TOP_N) { return; }
+                EJF_SD.TOP_N = v;
+                try { if (typeof GM_setValue === 'function') { GM_setValue('sdTopN', v); } } catch (e) { /* ignore */ }
+                // Re-render whichever view is open so the new count takes effect immediately.
+                var k = EJF_SD.ui.currentKey;
+                if (k && /^EBR-/.test(k)) { EJF_SD.ui.render(k); }
+                else if (k && EJF_SD.ui._isDefectKey(k)) { EJF_SD.ui.renderReports(k); }
+            }
+            $cnt.on('change', commitTopN);
+            $cnt.on('keydown', function (e) { if (e.key === 'Enter') { commitTopN(); } });
+            $cntRow.append($cnt);
+            $ta.append($cntRow);
 
             // Embedding backend (GPU vs CPU). Same flags toggleEmbedBackend() reads/writes; it reloads.
             var gpuOn = (typeof GM_getValue !== 'function') || (GM_getValue('sdTryWebgpu', true) && !GM_getValue('sdForceCpu', false));
