@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.15.0
+// @version     2.17.4
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -2059,18 +2059,26 @@ EJF_SD.logsig = {
         while ((fm = fre.exec(text))) {
             frames.push(fm[1].replace(/^.*[\/\\]/, '') + ':' + fm[3]);   // basename:function (no line number)
         }
-        // The SAME bug at the SAME stack site is constantly reported with a DIFFERENT volatile id baked into
-        // the exception MESSAGE - e.g. "KeyError: 9002284116000004218L" vs "KeyError: 9002235721000238019L"
-        // (an itemID/typeID/charID), or a hex object address. Left as-is, the message makes every report's
-        // signature unique and the two never cluster even though the frame chain is identical. So we normalize
-        // those volatile literals to a placeholder for the SIGNATURE only: any 0x hex address, any python long
-        // (`<digits>L`), and any bare run of 4+ digits -> '#'. The stack frames still gate every match, so this
-        // only ever collapses "same bug, different id"; it can't merge unrelated exceptions. The RAW msg is
-        // kept untouched for the human-readable panel / cluster label.
+        // The SAME bug at the SAME stack site is constantly reported with DIFFERENT volatile numbers baked into
+        // the exception MESSAGE, which would otherwise make every report's signature unique even though the
+        // frame chain is identical. We normalize ONLY the clearly-incidental numbers to '#' for the SIGNATURE
+        // (the RAW msg is kept for the human-readable label), and DELIBERATELY leave a bare scalar argument
+        // alone so it still distinguishes otherwise-identical exceptions:
+        //   - 0x hex addresses (object repr ids)                       e.g. "at 0x254ffd..."   -> "at 0x#"
+        //   - python longs (`<digits>L`) - always an id               "KeyError: 90022...218L" -> "KeyError: #"
+        //   - runs of 4+ digits - long item/type/char ids             "...(.., 1677)" -> "...(.., #)"
+        //   - numbers INSIDE a tuple/list/dict payload (bracket- or    "(12, 1677)" / "(13, 1)" -> "(#, #)"
+        //     comma-adjacent), since those are per-report args
+        // The bare-scalar exception, though, is preserved: "KeyError: 2" and "KeyError: 188" stay DISTINCT
+        // (1-3 digits, not bracketed), because for a KeyError/ValueError the scalar key IS the meaningful part.
+        // Identifiers/words (UserError, MISMATCH_COST, ...) are never touched, and the stack still gates every
+        // match on top of this.
         var nmsg = msg
-            .replace(/0x[0-9a-fA-F]+/g, '0x#')   // memory addresses (e.g. object repr ids)
-            .replace(/\b\d+L\b/g, '#')            // python long literals - always an id (item/type/char/...)
-            .replace(/\b\d{4,}\b/g, '#');         // other long numeric ids
+            .replace(/0x[0-9a-fA-F]+/g, '0x#')        // memory addresses (e.g. object repr ids)
+            .replace(/\b\d+L\b/g, '#')                 // python long literals - always an id (item/type/char/...)
+            .replace(/([(\[{,]\s*)\d+/g, '$1#')        // tuple/list/dict element (leading edge: after ( [ { or ,)
+            .replace(/\d+(\s*[)\]},])/g, '#$1')        // ...and trailing edge (before ) ] } or ,)
+            .replace(/\b\d{4,}\b/g, '#');              // other long numeric ids (a bare scalar < 4 digits survives)
         var sig = (frames.length >= EJF_SD.logsig.MIN_FRAMES)
             ? (nmsg + '|' + frames.join('>')).toLowerCase()
             : null;
@@ -2902,8 +2910,20 @@ EJF_SD.util = {
     // can't enumerate. "Attached" is the terminal EBR state set when a bug report is attached to a defect as a
     // duplicate (sometimes WITHOUT a Resolution), so it must count as not-open or those reports get ranked /
     // listed as open in the EDR "matching reports" view.
+    // Used by the DEFECT side (stale-match demotion), where a set resolution genuinely means "fixed". The EBR
+    // open/closed side uses isClosedStatus() instead - see why there.
     isResolved: function (status, resolution) {
         if (resolution) { return true; }
+        return /closed|done|resolved|rejected|cancel|attached/i.test(status || '');
+    },
+
+    // True when a BUG REPORT is closed/handled, judged by its STATUS NAME ONLY (open / closed / attached, the
+    // same closed-status vocabulary as isResolved) - deliberately NOT the resolution field. A REOPENED bug
+    // report typically keeps its old Resolution (the reopen transition doesn't clear it), so a resolution-based
+    // check (isResolved) would wrongly treat a reopened-and-open report as closed and hide it from the EDR
+    // "matching reports" view. The status is the authoritative open/closed signal for EBRs, so the EBR index /
+    // vector index / embed-skip / incremental-sync prune all gate on this.
+    isClosedStatus: function (status) {
         return /closed|done|resolved|rejected|cancel|attached/i.test(status || '');
     },
 
@@ -3194,11 +3214,13 @@ EJF_SD.sync = {
                         return rec;
                     });
                 })).then(function (merged) {
-                    // pruneResolved: split into keep (still open) vs drop (now resolved -> delete from store).
+                    // pruneResolved (EBR incremental sync): split into keep (still open) vs drop (now closed ->
+                    // delete from store). Judge closed by STATUS only (isClosedStatus), NOT the resolution field,
+                    // so a REOPENED report that kept a stale resolution is kept instead of wrongly pruned.
                     if (opts.pruneResolved) {
                         var keep = [], drop = [];
                         for (var k = 0; k < merged.length; k++) {
-                            if (EJF_SD.util.isResolved(merged[k].status, merged[k].resolution)) { drop.push(merged[k].key); }
+                            if (EJF_SD.util.isClosedStatus(merged[k].status)) { drop.push(merged[k].key); }
                             else { keep.push(merged[k]); }
                         }
                         return EJF_SD.db.deleteDefects(drop).then(function () { return EJF_SD.db.bulkPut(keep); });
@@ -3518,6 +3540,15 @@ EJF_SD.rank = {
         return out;
     },
 
+    // True when `hay` (a doc's lowercased key+summary+description) contains EVERY term. Drives the filter box,
+    // which restricts the ranked corpus to issues matching the typed text before TOP_N is taken.
+    _matchTerms: function (hay, terms) {
+        if (!terms || !terms.length) { return true; }
+        if (!hay) { return false; }
+        for (var i = 0; i < terms.length; i++) { if (hay.indexOf(terms[i]) === -1) { return false; } }
+        return true;
+    },
+
     _ensureIndex: function () {
         if (EJF_SD.rank._index && !EJF_SD.rank._dirty) { return Promise.resolve(EJF_SD.rank._index); }
         if (EJF_SD.rank._building) { return EJF_SD.rank._building; }
@@ -3534,7 +3565,7 @@ EJF_SD.rank = {
                     if (!seen[tk]) { df[tk] = (df[tk] || 0) + 1; seen[tk] = true; }
                 }
                 totalLen += toks.length;
-                docs.push({ key: rec.key, project: rec.project, summary: rec.summary, status: rec.status, resolution: rec.resolution, resolutiondate: rec.resolutiondate, tf: tf, len: toks.length });
+                docs.push({ key: rec.key, project: rec.project, summary: rec.summary, status: rec.status, resolution: rec.resolution, resolutiondate: rec.resolutiondate, tf: tf, len: toks.length, hay: ((rec.key || '') + ' ' + (rec.summary || '') + ' ' + (rec.description || '')).toLowerCase() });
             }
             EJF_SD.rank._index = { N: docs.length, avgdl: docs.length ? (totalLen / docs.length) : 0, df: df, docs: docs };
             EJF_SD.rank._dirty = false;
@@ -3545,7 +3576,7 @@ EJF_SD.rank = {
     },
 
     // Rank stored defects against the query text. Returns up to `limit` (default TOP_N) scored results.
-    suggest: function (text, excludeKey, limit) {
+    suggest: function (text, excludeKey, limit, filterTerms) {
         return EJF_SD.rank._ensureIndex().then(function (idx) {
             if (!idx || !idx.N) { return []; }
             var qTokens = EJF_SD.rank._tokenize(text);
@@ -3564,6 +3595,7 @@ EJF_SD.rank = {
             for (var d = 0; d < idx.docs.length; d++) {
                 var doc = idx.docs[d];
                 if (excludeKey && doc.key === excludeKey) { continue; }
+                if (filterTerms && filterTerms.length && !EJF_SD.rank._matchTerms(doc.hay, filterTerms)) { continue; }   // filter box: restrict the whole corpus
                 var score = 0;
                 for (var q = 0; q < terms.length; q++) {
                     var tf = doc.tf[terms[q]];
@@ -3572,6 +3604,7 @@ EJF_SD.rank = {
                     score += idf[terms[q]] * (tf * (k1 + 1)) / denom;
                 }
                 if (score > 0) { scored.push({ key: doc.key, project: doc.project, summary: doc.summary, status: doc.status, resolution: doc.resolution, resolutiondate: doc.resolutiondate, score: score }); }
+                else if (filterTerms && filterTerms.length) { scored.push({ key: doc.key, project: doc.project, summary: doc.summary, status: doc.status, resolution: doc.resolution, resolutiondate: doc.resolutiondate, score: 0 }); }   // filter match with no issue-text overlap - still a candidate
             }
             scored.sort(function (a, c) { return c.score - a.score; });
             return scored.slice(0, limit || EJF_SD.TOP_N);
@@ -3589,7 +3622,7 @@ EJF_SD.rank = {
             for (var i = 0; i < records.length; i++) {
                 var rec = records[i];
                 if (rec.project !== 'EBR') { continue; }
-                if (EJF_SD.util.isResolved(rec.status, rec.resolution)) { continue; }   // open reports only
+                if (EJF_SD.util.isClosedStatus(rec.status)) { continue; }   // open reports only (by status, not resolution)
                 var toks = EJF_SD.rank._tokenize(EJF_SD.util.cleanForCompare(rec.summary, rec.description));
                 var tf = {}, seen = {};
                 for (var j = 0; j < toks.length; j++) {
@@ -3598,7 +3631,7 @@ EJF_SD.rank = {
                     if (!seen[tk]) { df[tk] = (df[tk] || 0) + 1; seen[tk] = true; }
                 }
                 totalLen += toks.length;
-                docs.push({ key: rec.key, project: rec.project, summary: rec.summary, status: rec.status, resolution: rec.resolution, resolutiondate: rec.resolutiondate, tf: tf, len: toks.length });
+                docs.push({ key: rec.key, project: rec.project, summary: rec.summary, status: rec.status, resolution: rec.resolution, resolutiondate: rec.resolutiondate, tf: tf, len: toks.length, hay: ((rec.key || '') + ' ' + (rec.summary || '') + ' ' + (rec.description || '')).toLowerCase() });
             }
             EJF_SD.rank._ebrIndex = { N: docs.length, avgdl: docs.length ? (totalLen / docs.length) : 0, df: df, docs: docs };
             EJF_SD.rank._dirtyEbr = false;
@@ -3610,7 +3643,7 @@ EJF_SD.rank = {
 
     // Rank OPEN bug reports against the query text (a defect's text). Returns up to `limit` scored results,
     // each with a display `pct` relative to the top score. Mirrors `suggest` but over the EBR index.
-    suggestEbr: function (text, excludeKey, limit) {
+    suggestEbr: function (text, excludeKey, limit, filterTerms) {
         return EJF_SD.rank._ensureEbrIndex().then(function (idx) {
             if (!idx || !idx.N) { return []; }
             var qTokens = EJF_SD.rank._tokenize(text);
@@ -3628,6 +3661,7 @@ EJF_SD.rank = {
             for (var d = 0; d < idx.docs.length; d++) {
                 var doc = idx.docs[d];
                 if (excludeKey && doc.key === excludeKey) { continue; }
+                if (filterTerms && filterTerms.length && !EJF_SD.rank._matchTerms(doc.hay, filterTerms)) { continue; }   // filter box: restrict the whole corpus
                 var score = 0;
                 for (var q = 0; q < terms.length; q++) {
                     var tf = doc.tf[terms[q]];
@@ -3636,6 +3670,7 @@ EJF_SD.rank = {
                     score += idf[terms[q]] * (tf * (k1 + 1)) / denom;
                 }
                 if (score > 0) { scored.push({ key: doc.key, project: doc.project, summary: doc.summary, status: doc.status, resolution: doc.resolution, resolutiondate: doc.resolutiondate, score: score }); }
+                else if (filterTerms && filterTerms.length) { scored.push({ key: doc.key, project: doc.project, summary: doc.summary, status: doc.status, resolution: doc.resolution, resolutiondate: doc.resolutiondate, score: 0 }); }   // filter match with no issue-text overlap - still a candidate
             }
             scored.sort(function (a, c) { return c.score - a.score; });
             scored = scored.slice(0, limit || EJF_SD.TOP_N);
@@ -3805,7 +3840,7 @@ EJF_SD.embed = {
             for (var i = 0; i < recs.length; i++) {
                 // Embed BOTH defects and open bug reports (EBRs): hybrid ranking is used on both the EBR
                 // (similar defects) and EDR (matching reports) views. Skip closed EBRs - they're not ranked.
-                if (recs[i].project === 'EBR' && EJF_SD.util.isResolved(recs[i].status, recs[i].resolution)) { continue; }
+                if (recs[i].project === 'EBR' && EJF_SD.util.isClosedStatus(recs[i].status)) { continue; }
                 if (recs[i].embedding && recs[i].embeddingModelVersion === EJF_SD.MODEL_VERSION) { curVer++; }
                 else { todo.push(recs[i]); }
             }
@@ -3915,7 +3950,7 @@ EJF_SD.rank._ensureVecIndex = function () {
             var r = recs[i];
             if (r.project === 'EBR') { continue; }   // bug reports are keyword-ranked only, not part of the defect vector index
             if (r.embedding && r.embeddingModelVersion === EJF_SD.MODEL_VERSION) {
-                docs.push({ key: r.key, project: r.project, summary: r.summary, status: r.status, resolution: r.resolution, resolutiondate: r.resolutiondate, vec: r.embedding });
+                docs.push({ key: r.key, project: r.project, summary: r.summary, status: r.status, resolution: r.resolution, resolutiondate: r.resolutiondate, vec: r.embedding, hay: ((r.key || '') + ' ' + (r.summary || '') + ' ' + (r.description || '')).toLowerCase() });
             }
         }
         EJF_SD.rank._vecIndex = docs;
@@ -3936,12 +3971,26 @@ EJF_SD.rank._dot = function (a, b) {
 EJF_SD.rank.CAND = 50;     // candidates pulled from each retriever before fusion
 EJF_SD.rank.RRF_K = 60;    // Reciprocal-Rank-Fusion constant (standard default)
 
+// Embed the query text, caching the most recent (text -> vector) so filter-box keystrokes (which re-rank the
+// SAME issue text against a changing filter) don't re-run the transformer every time - only the filter +
+// scoring re-run, not the expensive inference.
+EJF_SD.rank._qvText = null;
+EJF_SD.rank._qvVec = null;
+EJF_SD.rank._embedQuery = function (text) {
+    if (EJF_SD.rank._qvText === text && EJF_SD.rank._qvVec) { return Promise.resolve(EJF_SD.rank._qvVec); }
+    return EJF_SD.embed.embedOne(text).then(function (qv) {
+        EJF_SD.rank._qvText = text; EJF_SD.rank._qvVec = qv; return qv;
+    });
+};
+
 // Cosine-score every stored vector against the query vector, sorted best-first. Returns [] if none embedded.
-EJF_SD.rank._semanticScored = function (qv, excludeKey) {
+// `filterTerms` (from the filter box) restricts scoring to docs whose key+title+description contains them all.
+EJF_SD.rank._semanticScored = function (qv, excludeKey, filterTerms) {
     return EJF_SD.rank._ensureVecIndex().then(function (docs) {
         var scored = [];
         for (var d = 0; d < docs.length; d++) {
             if (excludeKey && docs[d].key === excludeKey) { continue; }
+            if (filterTerms && filterTerms.length && !EJF_SD.rank._matchTerms(docs[d].hay, filterTerms)) { continue; }
             var sc = EJF_SD.rank._dot(qv, docs[d].vec);
             if (!isFinite(sc)) { continue; }   // defensively drop any corrupt (NaN/Inf) vector
             scored.push({
@@ -3970,9 +4019,9 @@ EJF_SD.rank._ensureEbrVecIndex = function () {
         for (var i = 0; i < recs.length; i++) {
             var r = recs[i];
             if (r.project !== 'EBR') { continue; }
-            if (EJF_SD.util.isResolved(r.status, r.resolution)) { continue; }   // open reports only
+            if (EJF_SD.util.isClosedStatus(r.status)) { continue; }   // open reports only (by status, not resolution)
             if (r.embedding && r.embeddingModelVersion === EJF_SD.MODEL_VERSION) {
-                docs.push({ key: r.key, project: r.project, summary: r.summary, status: r.status, resolution: r.resolution, vec: r.embedding });
+                docs.push({ key: r.key, project: r.project, summary: r.summary, status: r.status, resolution: r.resolution, vec: r.embedding, hay: ((r.key || '') + ' ' + (r.summary || '') + ' ' + (r.description || '')).toLowerCase() });
             }
         }
         EJF_SD.rank._ebrVecIndex = docs;
@@ -3984,11 +4033,12 @@ EJF_SD.rank._ensureEbrVecIndex = function () {
 };
 
 // Cosine-score every stored OPEN-EBR vector against the query vector, sorted best-first. [] if none embedded.
-EJF_SD.rank._semanticScoredEbr = function (qv, excludeKey) {
+EJF_SD.rank._semanticScoredEbr = function (qv, excludeKey, filterTerms) {
     return EJF_SD.rank._ensureEbrVecIndex().then(function (docs) {
         var scored = [];
         for (var d = 0; d < docs.length; d++) {
             if (excludeKey && docs[d].key === excludeKey) { continue; }
+            if (filterTerms && filterTerms.length && !EJF_SD.rank._matchTerms(docs[d].hay, filterTerms)) { continue; }
             var sc = EJF_SD.rank._dot(qv, docs[d].vec);
             if (!isFinite(sc)) { continue; }
             scored.push({ key: docs[d].key, project: docs[d].project, summary: docs[d].summary, status: docs[d].status, resolution: docs[d].resolution, score: sc });
@@ -4003,7 +4053,7 @@ EJF_SD.rank._semanticScoredEbr = function (qv, excludeKey) {
 // shared terms (item/module names, error strings) that embeddings smooth over are caught by BM25, while
 // paraphrases are caught by the embeddings, so the "obvious" duplicate surfaces far more reliably.
 // Returns { mode: 'Hybrid' | 'Keyword', results: [...] } with a display % already attached to each result.
-EJF_SD.rank.suggestBest = function (text, key, brCreated) {
+EJF_SD.rank.suggestBest = function (text, key, brCreated, forceMode, filterTerms) {
     // Feature A: gently demote a Closed defect that was fixed long before this bug report was filed - it
     // is very unlikely to be the report's real duplicate. Scales whatever score fields the result carries
     // (score / rrf / pct) by the age factor and tags it so the panel can grey it and explain why.
@@ -4021,7 +4071,7 @@ EJF_SD.rank.suggestBest = function (text, key, brCreated) {
     function keywordOnly() {
         // Pull a wider candidate set so the demotion can re-order before we cut to TOP_N (a stale match
         // shouldn't keep a slot a fresher one deserves).
-        return EJF_SD.rank.suggest(text, key, EJF_SD.rank.CAND).then(function (list) {
+        return EJF_SD.rank.suggest(text, key, EJF_SD.rank.CAND, filterTerms).then(function (list) {
             for (var d = 0; d < list.length; d++) { demote(list[d]); }
             list.sort(function (a, c) { return c.score - a.score; });
             list = list.slice(0, EJF_SD.TOP_N);
@@ -4032,10 +4082,10 @@ EJF_SD.rank.suggestBest = function (text, key, brCreated) {
     }
     // Build the HYBRID (semantic + keyword) result set. Called once the embedding model is ready.
     function hybrid() {
-        return EJF_SD.embed.embedOne(text).then(function (qv) {
-        return EJF_SD.rank._semanticScored(qv, key).then(function (sem) {
-            if (!sem.length) { return keywordOnly(); }   // nothing embedded yet
-            return EJF_SD.rank.suggest(text, key, EJF_SD.rank.CAND).then(function (bm) {
+        return EJF_SD.rank._embedQuery(text).then(function (qv) {
+        return EJF_SD.rank._semanticScored(qv, key, filterTerms).then(function (sem) {
+            if (!sem.length) { return keywordOnly(); }   // nothing embedded yet (or filter excluded all)
+            return EJF_SD.rank.suggest(text, key, EJF_SD.rank.CAND, filterTerms).then(function (bm) {
                 var K = EJF_SD.rank.RRF_K;
                 var rrf = {}, meta = {}, cosByKey = {};
                 var semTop = sem.slice(0, EJF_SD.rank.CAND);
@@ -4071,6 +4121,8 @@ EJF_SD.rank.suggestBest = function (text, key, brCreated) {
         });
     }
 
+    // User forced keyword ranking this session (clicked the badge) -> skip the model entirely.
+    if (forceMode === 'Keyword') { return keywordOnly(); }
     // Model already loaded -> straight to Hybrid. Permanently unavailable -> Keyword only.
     if (EJF_SD.embed.ready) { return hybrid(); }
     if (EJF_SD.embed.unavailable) { return keywordOnly(); }
@@ -4102,18 +4154,18 @@ EJF_SD.rank.suggestBest = function (text, key, brCreated) {
 // EDR (defect) -> matching OPEN bug reports, best available ranking. Same hybrid (semantic + BM25, fused
 // with RRF) approach as suggestBest, but over the EBR indexes and with no stale-demotion (open reports have
 // no fix date). Returns { mode: 'Hybrid' | 'Keyword', results: [...] } with a display % per result.
-EJF_SD.rank.suggestEbrBest = function (text, key) {
+EJF_SD.rank.suggestEbrBest = function (text, key, forceMode, filterTerms) {
     function keywordOnly() {
         // suggestEbr already attaches a top-relative pct.
-        return EJF_SD.rank.suggestEbr(text, key, EJF_SD.TOP_N).then(function (list) {
+        return EJF_SD.rank.suggestEbr(text, key, EJF_SD.TOP_N, filterTerms).then(function (list) {
             return { mode: 'Keyword', results: list };
         });
     }
     function hybrid() {
-        return EJF_SD.embed.embedOne(text).then(function (qv) {
-        return EJF_SD.rank._semanticScoredEbr(qv, key).then(function (sem) {
-            if (!sem.length) { return keywordOnly(); }   // nothing embedded yet
-            return EJF_SD.rank.suggestEbr(text, key, EJF_SD.rank.CAND).then(function (bm) {
+        return EJF_SD.rank._embedQuery(text).then(function (qv) {
+        return EJF_SD.rank._semanticScoredEbr(qv, key, filterTerms).then(function (sem) {
+            if (!sem.length) { return keywordOnly(); }   // nothing embedded yet (or filter excluded all)
+            return EJF_SD.rank.suggestEbr(text, key, EJF_SD.rank.CAND, filterTerms).then(function (bm) {
                 var K = EJF_SD.rank.RRF_K;
                 var rrf = {}, meta = {}, cosByKey = {};
                 var semTop = sem.slice(0, EJF_SD.rank.CAND);
@@ -4141,6 +4193,7 @@ EJF_SD.rank.suggestEbrBest = function (text, key) {
         });
     }
 
+    if (forceMode === 'Keyword') { return keywordOnly(); }   // user forced keyword ranking this session
     if (EJF_SD.embed.ready) { return hybrid(); }
     if (EJF_SD.embed.unavailable) { return keywordOnly(); }
     // Not ready yet: kick off the warm-up + embed pass, then briefly wait for the model (fast when cached).
@@ -4344,12 +4397,15 @@ EJF_SD.ui = {
 #ejf-sd-head { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: #282d33; cursor: move; user-select: none; }\
 #ejf-sd-panel.ejf-sd-dragging { opacity: .92; }\
 #ejf-sd-title { font-weight: 700; flex: 1; }\
-#ejf-sd-mode { font-size: 10px; background: #3a434d; padding: 1px 6px; border-radius: 8px; }\
+#ejf-sd-mode { font-size: 10px; background: #3a434d; padding: 1px 6px; border-radius: 8px; cursor: pointer; user-select: none; }\
+#ejf-sd-mode:hover { background: #4a545f; }\
+#ejf-sd-filter { flex: 1 1 60px; min-width: 0; height: 20px; box-sizing: border-box; padding: 0 6px; font-size: 11px; border: 1px solid #3a434d; border-radius: 8px; background: #14181b; color: #e6e6e6; outline: none; }\
+#ejf-sd-filter:focus { border-color: #4c9aff; }\
 #ejf-sd-collapse { cursor: pointer; padding: 0 4px; font-weight: 700; }\
 #ejf-sd-status { padding: 6px 10px; color: #aab3bd; border-bottom: 1px solid #2c333a; }\
 #ejf-sd-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; }\
-#ejf-sd-list li { padding: 7px 10px; border-bottom: 1px solid #2c333a; }\
-#ejf-sd-list a { color: #4c9aff; font-weight: 700; text-decoration: none; }\
+#ejf-sd-list li { padding: 7px 10px; border-bottom: 1px solid #2c333a; min-width: 0; overflow-wrap: anywhere; word-break: break-word; }\
+#ejf-sd-list a { color: #4c9aff; font-weight: 700; text-decoration: none; overflow-wrap: anywhere; }\
 #ejf-sd-list a:hover { text-decoration: underline; }\
 .ejf-sd-proj { font-size: 10px; background: #3a434d; padding: 0 5px; border-radius: 7px; margin-left: 6px; }\
 .ejf-sd-score { float: right; color: #7a8694; font-size: 10px; }\
@@ -4359,8 +4415,8 @@ EJF_SD.ui = {
 .ejf-sd-link.ejf-sd-linked { color: #4caf7d; cursor: default; text-decoration: none; }\
 .ejf-sd-link.ejf-sd-noattach { color: #7a8694 !important; cursor: default; text-decoration: none; }\
 .ejf-sd-list li.ejf-sd-stale { opacity: .6; }\
-.ejf-sd-sum { margin-top: 2px; color: #e6e6e6; }\
-.ejf-sd-meta { margin-top: 2px; color: #7a8694; font-size: 10px; }\
+.ejf-sd-sum { margin-top: 2px; color: #e6e6e6; overflow-wrap: anywhere; word-break: break-word; }\
+.ejf-sd-meta { margin-top: 2px; color: #7a8694; font-size: 10px; overflow-wrap: anywhere; word-break: break-word; }\
 .ejf-sd-date { margin-top: 2px; color: #7a8694; font-size: 10px; text-align: right; }\
 #ejf-sd-loglink { display: none; padding: 6px 10px; border-bottom: 1px solid #2c333a; background: #20262b; }\
 #ejf-sd-loglink.has-hits { display: block; }\
@@ -4425,6 +4481,8 @@ EJF_SD.ui = {
 .ejf-side-subhead { display: flex; align-items: center; gap: 8px; margin: 2px 0 4px; }\
 .ejf-side-subhead #ejf-sd-title { flex: 1; font-weight: 600; font-size: 12px; color: var(--ds-text-subtle, #44546f); }\
 #ejf-side-group #ejf-sd-mode { font-size: 10px; background: var(--ds-background-neutral, #091e420f); color: var(--ds-text-subtle, #44546f); padding: 1px 6px; border-radius: 8px; }\
+#ejf-side-group #ejf-sd-filter { background: var(--ds-surface, #fff); color: var(--ds-text, #172b4d); border-color: var(--ds-border-input, #8590a2); }\
+#ejf-side-group #ejf-sd-filter:focus { border-color: var(--ds-border-focused, #388bff); }\
 #ejf-side-group #ejf-sd-status { padding: 4px 0; border-bottom: none; color: var(--ds-text-subtlest, #626f86); }\
 #ejf-side-group #ejf-sd-loglink { display: none; padding: 6px 0; border-bottom: 1px solid var(--ds-border, #091e4224); background: transparent; }\
 #ejf-side-group #ejf-sd-loglink.has-hits { display: block; }\
@@ -4467,6 +4525,57 @@ EJF_SD.ui = {
     },
 
     setStatus: function (msg) { $('#ejf-sd-status').text(msg); },
+
+    // ---- live filter box + clickable ranking-mode badge (left of the Keyword/Hybrid label) ----
+    // The filter re-QUERIES the whole local database (not just the rows already on screen): the typed word(s)
+    // are pushed into the ranker as a hard pre-filter, so it picks the best TOP_N matches from EVERY stored
+    // defect / bug report whose key+title+description contains ALL the terms (AND semantics). Empty -> normal
+    // ranking. Debounced so a burst of keystrokes triggers a single re-render.
+    // The Keyword/Hybrid badge is clickable: it toggles a SESSION-ONLY ranking-mode override (Hybrid <-> Keyword)
+    // and re-renders. The override is in-memory only, so a reload resets it to automatic (which prefers Hybrid
+    // whenever the embedding model is available).
+    modeOverride: null,        // null = automatic (prefer Hybrid); 'Hybrid' / 'Keyword' = user-forced this session
+    _filterTimer: null,
+    _wireFilter: function () {
+        if (EJF_SD.ui._filterWired) { return; }   // one set of delegated handlers survives chrome re-mounts
+        EJF_SD.ui._filterWired = true;
+        $(document).on('click', '#ejf-sd-mode', function () { EJF_SD.ui._cycleMode(); });
+        // Debounced re-query as the user types. (We previously tried to keep Jira from flagging the page as
+        // having "unsubmitted changes" - it warns on reload because the filter input lives inside its issue
+        // view - but the detection runs ahead of anything we can intercept, so we just accept the warning.)
+        $(document).on('input', '#ejf-sd-filter', function () {
+            if (EJF_SD.ui._filterTimer) { clearTimeout(EJF_SD.ui._filterTimer); }
+            EJF_SD.ui._filterTimer = setTimeout(function () { EJF_SD.ui._rerenderCurrent(); }, 200);
+        });
+    },
+    // The active filter terms (lowercased, whitespace-split) from the box, or [] when empty.
+    _filterTerms: function () {
+        var $inp = $('#ejf-sd-filter');
+        if (!$inp.length) { return []; }
+        var q = ($inp.val() || '').toLowerCase().replace(/\s+/g, ' ').trim();
+        return q ? q.split(' ') : [];
+    },
+    // Re-render whichever view is open (EBR -> similar defects, EDR/EO -> matching reports), re-reading the
+    // filter terms + mode override. Used by the filter box and the mode-badge toggle.
+    _rerenderCurrent: function () {
+        var k = EJF_SD.ui.currentKey;
+        if (!k) { return; }
+        if (/^EBR-/.test(k)) { EJF_SD.ui.render(k); }
+        else if (EJF_SD.ui._isDefectKey(k)) { EJF_SD.ui.renderReports(k); }
+    },
+    // Toggle the session ranking-mode override (Hybrid <-> Keyword) and re-render. No-op (with a hint) when
+    // semantic embeddings are unavailable, since Hybrid isn't possible then.
+    _cycleMode: function () {
+        if (EJF_SD.embed && EJF_SD.embed.unavailable) { EJF_SD.ui.toast('Semantic embeddings unavailable — keyword ranking only.'); return; }
+        var cur = EJF_SD.ui.modeOverride;
+        if (cur === 'Keyword') { EJF_SD.ui.modeOverride = 'Hybrid'; }
+        else if (cur === 'Hybrid') { EJF_SD.ui.modeOverride = 'Keyword'; }
+        else {   // automatic so far -> flip to the opposite of what's currently displayed
+            var shown = ($('#ejf-sd-mode').text() || '').toLowerCase();
+            EJF_SD.ui.modeOverride = (shown.indexOf('hybrid') >= 0) ? 'Keyword' : 'Hybrid';
+        }
+        EJF_SD.ui._rerenderCurrent();
+    },
 
     // Soft-refresh the open issue after a "Mark dup": patch the status lozenge text in place instead of a
     // full page reload (Jira's SPA exposes no clean "refetch this issue" hook). Mirrors how the GM / Close
@@ -4756,6 +4865,8 @@ EJF_SD.ui = {
         $head.on('mousedown', function (e) {
             if (e.which && e.which !== 1) { return; }                 // left button only
             if ($(e.target).closest('#ejf-sd-collapse').length) { return; }  // let the collapse toggle work
+            if ($(e.target).closest('#ejf-sd-filter').length) { return; }    // let the filter input take focus / select text
+            if ($(e.target).closest('#ejf-sd-mode').length) { return; }      // let the mode badge toggle ranking
             // Drag relative to the HEADER's current top (works whether we're top-anchored or in drop-up),
             // so the header tracks the cursor and _fitVertical re-evaluates up/down on every move.
             var hTop = $head[0].getBoundingClientRect().top;
@@ -4818,6 +4929,7 @@ EJF_SD.ui = {
     // Jira context column / Details anchor isn't in the DOM (yet).
     _ensurePanel: function () {
         EJF_SD.ui.injectCss();
+        EJF_SD.ui._wireFilter();   // bind the mode-badge click + window-level filter guards once
         if (EJF_SD.ui.mode() === 'sidebar' && EJF_SD.ui._ensureSidebar()) {
             if ($('#ejf-sd-panel').length) { $('#ejf-sd-panel').remove(); }   // drop a lingering floating box
             return;
@@ -4833,7 +4945,9 @@ EJF_SD.ui = {
         var $p = $(
             '<div id="ejf-sd-panel">' +
             '  <div id="ejf-sd-head"><span id="ejf-sd-title">Similar defects</span>' +
-            '    <span id="ejf-sd-mode">Keyword</span><span id="ejf-sd-collapse" title="Collapse / expand">–</span></div>' +
+            '    <input id="ejf-sd-filter" type="text" placeholder="Filter…" autocomplete="off" title="Filter the whole database by this text (key / title / description) and show the best matches">' +
+            '    <span id="ejf-sd-mode" title="Click to switch ranking mode (resets to automatic on reload)">Keyword</span>' +
+            '    <span id="ejf-sd-collapse" title="Collapse / expand">–</span></div>' +
             '  <div id="ejf-sd-status"></div>' +
             '  <div id="ejf-sd-loglink"></div>' +
             '  <div id="ejf-sd-exccluster"></div>' +
@@ -4865,7 +4979,9 @@ EJF_SD.ui = {
 
     // The inner body of the group (subhead + the shared chrome ids), shared by the clone and manual builders.
     _sidebarBodyHtml: function () {
-        return '<div class="ejf-side-subhead"><span id="ejf-sd-title">Similar defects</span><span id="ejf-sd-mode">Keyword</span></div>' +
+        return '<div class="ejf-side-subhead"><span id="ejf-sd-title">Similar defects</span>' +
+               '<input id="ejf-sd-filter" type="text" placeholder="Filter…" autocomplete="off" title="Filter the whole database by this text (key / title / description) and show the best matches">' +
+               '<span id="ejf-sd-mode" title="Click to switch ranking mode (resets to automatic on reload)">Keyword</span></div>' +
                '<div id="ejf-sd-status"></div>' +
                '<div id="ejf-sd-loglink"></div>' +
                '<div id="ejf-sd-exccluster"></div>' +
@@ -5253,9 +5369,10 @@ EJF_SD.ui = {
     // status-line count + mode. No-op if nothing new ranks (e.g. fewer matches than slots) - the list just
     // ends up one row shorter. Used by _fadeOutAndReplace so we don't rebuild the whole list.
     _appendNextReport: function (defectKey, shown) {
+        var terms = EJF_SD.ui._filterTerms();   // honor the active filter when picking the replacement row
         EJF_SD.ui.getIssueText(defectKey).then(function (text) {
             if (EJF_SD.ui.currentKey !== defectKey || !text) { return; }
-            return EJF_SD.rank.suggestEbrBest(text, defectKey).then(function (out) {
+            return EJF_SD.rank.suggestEbrBest(text, defectKey, EJF_SD.ui.modeOverride, terms).then(function (out) {
                 if (EJF_SD.ui.currentKey !== defectKey) { return; }
                 var results = out.results || [];
                 $('#ejf-sd-mode').text(out.mode);
@@ -5525,6 +5642,7 @@ EJF_SD.ui = {
 
     render: function (key) {
         EJF_SD.ui._ensurePanel();
+        var terms = EJF_SD.ui._filterTerms();   // filter box: restrict the ranked corpus to these terms (whole DB)
         $('#ejf-sd-title').text('Similar defects');   // reset title (the panel is shared with the EDR reports view)
         $('#ejf-sd-exccluster').removeClass('has-hits').empty();   // defect-only section; clear it on the EBR view
         EJF_SD.ui.renderLogLink(key);   // scan the attached log for known defects (no need to open it)
@@ -5538,7 +5656,7 @@ EJF_SD.ui = {
                 }
                 if (!text) { EJF_SD.ui.setStatus('Could not read this issue’s text.'); return; }
                 return EJF_SD.ui._getCreated(key).then(function (brCreated) {
-                return EJF_SD.rank.suggestBest(text, key, brCreated).then(function (out) {
+                return EJF_SD.rank.suggestBest(text, key, brCreated, EJF_SD.ui.modeOverride, terms).then(function (out) {
                     var results = out.results || [];
                     $('#ejf-sd-mode').text(out.mode);   // 'Hybrid' or 'Keyword'
                     if (!results.length) { EJF_SD.ui.setStatus('No similar defects found (' + n + ' indexed).'); return; }
@@ -5567,6 +5685,7 @@ EJF_SD.ui = {
     // and list them in the same panel. Mirrors render() but over the EBR index, with no log-scan / mark-dup.
     renderReports: function (key) {
         EJF_SD.ui._ensurePanel();
+        var terms = EJF_SD.ui._filterTerms();   // filter box: restrict the ranked corpus to these terms (whole DB)
         $('#ejf-sd-title').text('Matching bug reports');
         $('#ejf-sd-loglink').removeClass('has-hits').empty();   // EBR-only section; unused on a defect
         $('#ejf-sd-list').empty();
@@ -5579,7 +5698,7 @@ EJF_SD.ui = {
                     return;
                 }
                 if (!text) { EJF_SD.ui.setStatus('Could not read this defect’s text.'); return; }
-                return EJF_SD.rank.suggestEbrBest(text, key).then(function (out) {
+                return EJF_SD.rank.suggestEbrBest(text, key, EJF_SD.ui.modeOverride, terms).then(function (out) {
                     var results = out.results || [];
                     $('#ejf-sd-mode').text(out.mode);   // 'Hybrid' or 'Keyword'
                     if (!results.length) { EJF_SD.ui.setStatus('No matching bug reports found (' + n + ' open).'); return; }
