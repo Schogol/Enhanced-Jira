@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.17.4
+// @version     2.18.0
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -2964,6 +2964,83 @@ EJF_SD.util = {
 };
 
 
+/* ---- hidden ("ignored") suggestions ----
+   A user can dismiss a suggested issue for a chosen window (max 90 days). The hidden set is persisted in GM
+   storage (NOT IndexedDB) on purpose: GM values survive a script auto-update, whereas a DB rebuild/migration
+   could wipe the store. Shape: { issueKey: expiryEpochMs }. The ranking layer skips hidden keys so they never
+   take a result slot, and each entry auto-expires (lazily pruned) once its window passes. */
+EJF_SD.hidden = {
+    KEY: 'sdHidden',     // GM flag holding the { key: expiryMs } map
+    MAX_DAYS: 90,
+    _map: null,          // in-memory cache of the parsed GM map (null = not loaded yet)
+
+    // Duration choices offered by the hide popover (all <= MAX_DAYS).
+    PRESETS: [
+        { label: '1 day', days: 1 },
+        { label: '1 week', days: 7 },
+        { label: '30 days', days: 30 },
+        { label: '90 days', days: 90 }
+    ],
+
+    _load: function () {
+        if (EJF_SD.hidden._map) { return EJF_SD.hidden._map; }
+        var m = {};
+        try { if (typeof GM_getValue === 'function') { m = GM_getValue(EJF_SD.hidden.KEY, {}) || {}; } } catch (e) { m = {}; }
+        if (!m || typeof m !== 'object') { m = {}; }
+        EJF_SD.hidden._map = m;
+        return m;
+    },
+
+    _persist: function () {
+        try { if (typeof GM_setValue === 'function') { GM_setValue(EJF_SD.hidden.KEY, EJF_SD.hidden._map || {}); } } catch (e) { /* ignore */ }
+    },
+
+    // Drop expired entries from the in-memory map; returns true if anything was removed.
+    _prune: function () {
+        var m = EJF_SD.hidden._load(), now = Date.now(), changed = false;
+        for (var k in m) {
+            if (Object.prototype.hasOwnProperty.call(m, k) && !(m[k] > now)) { delete m[k]; changed = true; }
+        }
+        return changed;
+    },
+
+    // Cheap, allocation-free check used in the ranking loops (no persistence side effects - cleanup happens in
+    // _prune()/count(), called when the settings menu opens or a hide is added).
+    isHidden: function (key) {
+        if (!key) { return false; }
+        var exp = EJF_SD.hidden._load()[key];
+        return !!exp && exp > Date.now();
+    },
+
+    hide: function (key, days) {
+        if (!key) { return; }
+        var d = Math.max(1, Math.min(EJF_SD.hidden.MAX_DAYS, parseInt(days, 10) || 0));
+        var m = EJF_SD.hidden._load();
+        m[key] = Date.now() + d * 24 * 60 * 60 * 1000;
+        EJF_SD.hidden._prune();
+        EJF_SD.hidden._persist();
+    },
+
+    unhide: function (key) {
+        var m = EJF_SD.hidden._load();
+        if (m[key]) { delete m[key]; EJF_SD.hidden._persist(); }
+    },
+
+    clear: function () {
+        EJF_SD.hidden._map = {};
+        EJF_SD.hidden._persist();
+    },
+
+    // Count of currently-active (non-expired) hidden issues; prunes+persists any that have lapsed.
+    count: function () {
+        if (EJF_SD.hidden._prune()) { EJF_SD.hidden._persist(); }
+        var m = EJF_SD.hidden._load(), n = 0;
+        for (var k in m) { if (Object.prototype.hasOwnProperty.call(m, k)) { n++; } }
+        return n;
+    }
+};
+
+
 /* ---- storage layer: IndexedDB ---- */
 EJF_SD.db = {
     _db: null,
@@ -3595,6 +3672,7 @@ EJF_SD.rank = {
             for (var d = 0; d < idx.docs.length; d++) {
                 var doc = idx.docs[d];
                 if (excludeKey && doc.key === excludeKey) { continue; }
+                if (EJF_SD.hidden.isHidden(doc.key)) { continue; }   // user-hidden suggestion (temporary, persisted across updates)
                 if (filterTerms && filterTerms.length && !EJF_SD.rank._matchTerms(doc.hay, filterTerms)) { continue; }   // filter box: restrict the whole corpus
                 var score = 0;
                 for (var q = 0; q < terms.length; q++) {
@@ -3661,6 +3739,7 @@ EJF_SD.rank = {
             for (var d = 0; d < idx.docs.length; d++) {
                 var doc = idx.docs[d];
                 if (excludeKey && doc.key === excludeKey) { continue; }
+                if (EJF_SD.hidden.isHidden(doc.key)) { continue; }   // user-hidden suggestion (temporary, persisted across updates)
                 if (filterTerms && filterTerms.length && !EJF_SD.rank._matchTerms(doc.hay, filterTerms)) { continue; }   // filter box: restrict the whole corpus
                 var score = 0;
                 for (var q = 0; q < terms.length; q++) {
@@ -3990,6 +4069,7 @@ EJF_SD.rank._semanticScored = function (qv, excludeKey, filterTerms) {
         var scored = [];
         for (var d = 0; d < docs.length; d++) {
             if (excludeKey && docs[d].key === excludeKey) { continue; }
+            if (EJF_SD.hidden.isHidden(docs[d].key)) { continue; }   // user-hidden suggestion (temporary, persisted across updates)
             if (filterTerms && filterTerms.length && !EJF_SD.rank._matchTerms(docs[d].hay, filterTerms)) { continue; }
             var sc = EJF_SD.rank._dot(qv, docs[d].vec);
             if (!isFinite(sc)) { continue; }   // defensively drop any corrupt (NaN/Inf) vector
@@ -4038,6 +4118,7 @@ EJF_SD.rank._semanticScoredEbr = function (qv, excludeKey, filterTerms) {
         var scored = [];
         for (var d = 0; d < docs.length; d++) {
             if (excludeKey && docs[d].key === excludeKey) { continue; }
+            if (EJF_SD.hidden.isHidden(docs[d].key)) { continue; }   // user-hidden suggestion (temporary, persisted across updates)
             if (filterTerms && filterTerms.length && !EJF_SD.rank._matchTerms(docs[d].hay, filterTerms)) { continue; }
             var sc = EJF_SD.rank._dot(qv, docs[d].vec);
             if (!isFinite(sc)) { continue; }
@@ -4414,6 +4495,13 @@ EJF_SD.ui = {
 .ejf-sd-link.ejf-sd-linking { color: #7a8694; cursor: default; text-decoration: none; }\
 .ejf-sd-link.ejf-sd-linked { color: #4caf7d; cursor: default; text-decoration: none; }\
 .ejf-sd-link.ejf-sd-noattach { color: #7a8694 !important; cursor: default; text-decoration: none; }\
+.ejf-sd-hide { float: right; margin-right: 8px; cursor: pointer; color: #7a8694; display: inline-flex; align-items: center; user-select: none; }\
+.ejf-sd-hide:hover { color: #ff8f8f; }\
+.ejf-sd-hide svg { display: block; }\
+#ejf-sd-hidemenu { position: fixed; z-index: 10002; background: #14181b; color: #e6e6e6; border: 1px solid #3a434d; border-radius: 6px; box-shadow: 0 6px 24px rgba(0,0,0,.55); padding: 6px; font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif; font-size: 12px; min-width: 150px; }\
+#ejf-sd-hidemenu .ejf-sd-hidemenu-label { color: #9aa6b2; font-size: 10px; padding: 2px 6px 6px; white-space: nowrap; }\
+#ejf-sd-hidemenu .ejf-sd-hidemenu-btn { display: block; width: 100%; text-align: left; background: transparent; color: #e6e6e6; border: none; border-radius: 4px; padding: 6px 8px; cursor: pointer; font-size: 12px; }\
+#ejf-sd-hidemenu .ejf-sd-hidemenu-btn:hover { background: #2c333a; }\
 .ejf-sd-list li.ejf-sd-stale { opacity: .6; }\
 .ejf-sd-sum { margin-top: 2px; color: #e6e6e6; overflow-wrap: anywhere; word-break: break-word; }\
 .ejf-sd-meta { margin-top: 2px; color: #7a8694; font-size: 10px; overflow-wrap: anywhere; word-break: break-word; }\
@@ -4508,6 +4596,8 @@ EJF_SD.ui = {
 #ejf-side-group .ejf-sd-sum { color: var(--ds-text, #172b4d); }\
 #ejf-side-group .ejf-sd-meta, #ejf-side-group .ejf-sd-score, #ejf-side-group .ejf-sd-date { color: var(--ds-text-subtlest, #626f86); }\
 #ejf-side-group .ejf-sd-proj { background: var(--ds-background-neutral, #091e420f); color: var(--ds-text-subtle, #44546f); }\
+#ejf-side-group .ejf-sd-hide { color: var(--ds-text-subtlest, #626f86); }\
+#ejf-side-group .ejf-sd-hide:hover { color: #c9372c; }\
 #ejf-side-group .ejf-sd-link.ejf-sd-linked { color: var(--ds-text-success, #216e4e); }',
 
     injectCss: function () {
@@ -5192,6 +5282,83 @@ EJF_SD.ui = {
     // Feature B: build a "Mark dup" control that links the open EBR as a duplicate of `defectKey` and moves
     // it to Attached (status + resolution + link in one transition). Shared by the suggestions list AND the
     // "Known defects in attached log" section so both behave identically.
+    // ---- hide ("ignore") control: temporarily dismiss a defect ----
+    // Eye-off icon (Material "visibility_off"); clicking opens a small duration popover. The chosen hide is
+    // persisted by EJF_SD.hidden (GM storage -> survives script updates) and the ranking layer skips hidden
+    // keys, so a hidden defect never takes a result slot. Shown next to each defect in the "Known defects in
+    // attached log" list (renderLogLink) - hiding keys on the issue key, so it also drops out of the ranked
+    // "Similar defects" suggestions.
+    _eyeOffSvg: '<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><path d="M12 7c2.76 0 5 2.24 5 5 0 .65-.13 1.26-.36 1.83l2.92 2.92c1.51-1.26 2.7-2.89 3.43-4.75-1.73-4.39-6-7.5-11-7.5-1.4 0-2.74.25-3.98.7l2.16 2.16C10.74 7.13 11.35 7 12 7zM2 4.27l2.28 2.28.46.46C3.08 8.3 1.78 10.02 1 12c1.73 4.39 6 7.5 11 7.5 1.55 0 3.03-.3 4.38-.84l.42.42L19.73 22 21 20.73 3.27 3 2 4.27zM7.53 9.8l1.55 1.55c-.05.21-.08.43-.08.65 0 1.66 1.34 3 3 3 .22 0 .44-.03.65-.08l1.55 1.55c-.67.33-1.41.53-2.2.53-2.76 0-5-2.24-5-5 0-.79.2-1.53.53-2.2zm4.31-.78l3.15 3.15.02-.16c0-1.66-1.34-3-3-3l-.17.01z"></path></svg>',
+
+    _hideButton: function (key) {
+        var $h = $('<span class="ejf-sd-hide"></span>')
+            .attr('title', 'Hide ' + key + ' from suggestions for a while')
+            .html(EJF_SD.ui._eyeOffSvg);
+        $h.on('click', function (ev) {
+            ev.preventDefault();
+            ev.stopPropagation();
+            EJF_SD.ui._showHideMenu(key, this);
+        });
+        return $h;
+    },
+
+    // Small popover anchored to the eye-off icon: pick how long to hide (presets, max 90 days). On choice we
+    // persist the hide and re-render the current view so the slot refills from the next-best non-hidden match.
+    _showHideMenu: function (key, anchor) {
+        EJF_SD.ui._closeHideMenu();
+        EJF_SD.ui._hideTip();   // don't leave a hover card up behind the popover
+        var menu = document.createElement('div');
+        menu.id = 'ejf-sd-hidemenu';
+        var label = document.createElement('div');
+        label.className = 'ejf-sd-hidemenu-label';
+        label.textContent = 'Hide ' + key + ' for…';
+        menu.appendChild(label);
+        EJF_SD.hidden.PRESETS.forEach(function (p) {
+            var b = document.createElement('button');
+            b.type = 'button';
+            b.className = 'ejf-sd-hidemenu-btn';
+            b.textContent = p.label;
+            b.addEventListener('click', function (ev) {
+                ev.stopPropagation();
+                EJF_SD.hidden.hide(key, p.days);
+                EJF_SD.ui._closeHideMenu();
+                EJF_SD.ui._hideTip();
+                EJF_SD.ui.toast('Hidden ' + key + ' for ' + p.label + '.');
+                EJF_SD.ui._rerenderCurrent();
+            });
+            menu.appendChild(b);
+        });
+        document.body.appendChild(menu);
+        // Position under the icon, clamped to the viewport (flip above if it would overflow the bottom).
+        var r = anchor.getBoundingClientRect();
+        var mw = menu.offsetWidth, mh = menu.offsetHeight;
+        var left = Math.min(r.left, window.innerWidth - mw - 6);
+        var top = r.bottom + 4;
+        if (top + mh > window.innerHeight - 6) { top = r.top - mh - 4; }
+        menu.style.left = Math.max(6, left) + 'px';
+        menu.style.top = Math.max(6, top) + 'px';
+        // Dismiss on outside click or Esc (capture phase, registered next tick so the opening click is ignored).
+        EJF_SD.ui._hideMenuDismiss = function (e) {
+            if (e.type === 'keydown') { if (e.key === 'Escape') { EJF_SD.ui._closeHideMenu(); } return; }
+            if (menu.contains(e.target)) { return; }
+            EJF_SD.ui._closeHideMenu();
+        };
+        setTimeout(function () {
+            document.addEventListener('mousedown', EJF_SD.ui._hideMenuDismiss, true);
+            document.addEventListener('keydown', EJF_SD.ui._hideMenuDismiss, true);
+        }, 0);
+    },
+
+    _closeHideMenu: function () {
+        var m = document.getElementById('ejf-sd-hidemenu');
+        if (m && m.parentNode) { m.parentNode.removeChild(m); }
+        if (EJF_SD.ui._hideMenuDismiss) {
+            document.removeEventListener('mousedown', EJF_SD.ui._hideMenuDismiss, true);
+            document.removeEventListener('keydown', EJF_SD.ui._hideMenuDismiss, true);
+            EJF_SD.ui._hideMenuDismiss = null;
+        }
+    },
+
     _markDupButton: function (defectKey) {
         var $dup = $('<span class="ejf-sd-link"></span>')
             .text('Attach')
@@ -5446,7 +5613,6 @@ EJF_SD.ui = {
         $li.on('mouseenter', function () { EJF_SD.ui._showTip(r, this, meta); });
         $li.on('mouseleave', function () { EJF_SD.ui._hideTip(); });
         $('<a></a>').attr('href', '/browse/' + r.key).attr('target', '_self').text(r.key).appendTo($li);
-        $('<span class="ejf-sd-proj"></span>').text(r.project || '').appendTo($li);
         $('<span class="ejf-sd-score"></span>').text(pct + '%').appendTo($li);
         // Feature B: one-click "mark this bug report as a duplicate of that defect" (links the open EBR to r.key).
         EJF_SD.ui._markDupButton(r.key).appendTo($li);
@@ -5467,7 +5633,6 @@ EJF_SD.ui = {
         $li.on('mouseenter', function () { EJF_SD.ui._showTip(r, this, meta); });
         $li.on('mouseleave', function () { EJF_SD.ui._hideTip(); });
         $('<a></a>').attr('href', '/browse/' + r.key).attr('target', '_blank').text(r.key).appendTo($li);
-        $('<span class="ejf-sd-proj"></span>').text(r.project || '').appendTo($li);
         $('<span class="ejf-sd-score"></span>').text(pct + '%').appendTo($li);
         // Attach this bug report to the current defect (gated on assignee: unassigned or mine only).
         EJF_SD.ui._attachReportButton(r.key).appendTo($li);
@@ -5597,6 +5762,7 @@ EJF_SD.ui = {
             EJF_SD.ui.scanIssueLog(key).then(function (found) {
                 if (EJF_SD.ui.currentKey !== key) { return; }   // navigated to another issue meanwhile
                 var keys = Object.keys(found || {});
+                keys = keys.filter(function (k) { return !EJF_SD.hidden.isHidden(k); });   // drop user-hidden defects from the list
                 if (!keys.length) { return; }
                 keys.sort(function (a, b) { return found[b].count - found[a].count || (a < b ? -1 : 1); });
                 var $b = $('#ejf-sd-loglink');
@@ -5611,6 +5777,7 @@ EJF_SD.ui = {
                             .attr('title', 'Same crash site, reached via a different call path — possibly related').appendTo($li);
                     }
                     EJF_SD.ui._markDupButton(k).appendTo($li);   // same one-click "Mark dup" as the suggestions
+                    EJF_SD.ui._hideButton(k).appendTo($li);      // temporarily ignore this defect (also hides it from Similar defects)
                     $('<span class="count"></span>').text(found[k].count + '×').appendTo($li);
                     $li.on('mouseenter', function () { EJF_SD.logsig._showDefectTip(k, this); });
                     $li.on('mouseleave', function () { EJF_SD.logsig._hoverKey = null; if (EJF_SD.ui._hideTip) { EJF_SD.ui._hideTip(); } });
@@ -5848,6 +6015,8 @@ EJF_SD.menu = {
 #ejf-menu .ejf-menu-actions { display: flex; flex-wrap: wrap; gap: 8px; padding: 6px 0 2px; }\
 #ejf-menu .ejf-btn { background: #2c333a; color: #e6e6e6; border: 1px solid #3a434d; border-radius: 5px; padding: 6px 10px; cursor: pointer; font-size: 12px; }\
 #ejf-menu .ejf-btn:hover { background: #343c44; border-color: #4c9aff; }\
+#ejf-menu .ejf-btn:disabled { opacity: .5; cursor: default; }\
+#ejf-menu .ejf-btn:disabled:hover { background: #2c333a; border-color: #3a434d; }\
 #ejf-menu .ejf-num { width: 56px; flex: 0 0 auto; background: #2c333a; color: #e6e6e6; border: 1px solid #3a434d; border-radius: 5px; padding: 5px 8px; font-size: 12px; text-align: center; }\
 #ejf-menu .ejf-num:focus { outline: none; border-color: #4c9aff; }\
 #ejf-menu .ejf-menu-status { color: #9aa6b2; font-size: 11px; padding: 8px 0 0; }',
@@ -5968,6 +6137,25 @@ EJF_SD.menu = {
             $('<button class="ejf-btn"></button>').text(gpuOn ? 'Switch to CPU' : 'Switch to GPU')
                 .on('click', function () { toggleEmbedBackend(); }).appendTo($row);
             $ta.append($row);
+
+            // Hidden suggestions: user-dismissed issues (persisted in GM, survive script updates). Show the
+            // active count and let the user clear them all at once - each also auto-expires after its window.
+            var hiddenN = EJF_SD.hidden.count();
+            var $hidRow = $('<div class="ejf-menu-row"></div>');
+            $('<span class="lbl">Hidden suggestions</span>')
+                .append($('<span class="sub"></span>').text(hiddenN ? (hiddenN + ' currently hidden (auto-expire)') : 'None hidden'))
+                .appendTo($hidRow);
+            var $clrHidden = $('<button class="ejf-btn"></button>').text('Unhide all')
+                .on('click', function () {
+                    EJF_SD.hidden.clear();
+                    var k = EJF_SD.ui.currentKey;
+                    if (k && /^EBR-/.test(k)) { EJF_SD.ui.render(k); }
+                    else if (k && EJF_SD.ui._isDefectKey(k)) { EJF_SD.ui.renderReports(k); }
+                    refreshMenu();
+                });
+            if (!hiddenN) { $clrHidden.prop('disabled', true); }
+            $hidRow.append($clrHidden);
+            $ta.append($hidRow);
 
             // Live "what's indexed" status (defects + open reports) + when each local DB was last built,
             // filled in async.
@@ -6138,6 +6326,16 @@ EJF_SD.sched = {
     // one-time data-schema migration: re-fetch a local DB that predates a stored-field change. Runs before
     // the scheduler's startup tick (below) so its full re-fetch grabs the single-flight lock first.
     setTimeout(function () { try { EJF_SD.migrate.run(); } catch (e) { /* swallow */ } }, 4000);
+    // Keep the hidden set in sync across tabs: another tab hiding/unhiding an issue invalidates our cached map
+    // and re-renders the open view so a just-hidden suggestion drops out (and an unhidden one comes back).
+    if (typeof GM_addValueChangeListener === 'function') {
+        try {
+            GM_addValueChangeListener('sdHidden', function (name, oldV, newV, remote) {
+                EJF_SD.hidden._map = null;   // force a reload from storage on the next read
+                if (remote) { try { EJF_SD.ui._rerenderCurrent(); } catch (e) { /* ignore */ } }
+            });
+        } catch (e) { /* ignore */ }
+    }
     // start the periodic background catch-up sync
     EJF_SD.sched.start();
 })();
