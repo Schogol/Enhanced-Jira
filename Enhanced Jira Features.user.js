@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.24.1
+// @version     2.24.2
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -3323,8 +3323,9 @@ EJF_SD.responses = {
         $('<div class="ejf-resp-subhead">Opening &amp; closing</div>').appendTo($scroll);
         $('<div class="ejf-menu-status" style="padding:0 0 6px;">Added around every response on insert. Leave blank to skip.</div>').appendTo($scroll);
         var $affix = $('<div class="ejf-resp-affix"></div>').appendTo($scroll);
-        var $openerIn = $('<input type="text" class="ejf-resp-title" placeholder="Opening line — e.g. Greetings Capsuleer,">').val(EJF_SD.responses.loadOpener()).appendTo($affix);
-        var $closingIn = $('<input type="text" class="ejf-resp-title" placeholder="Closing line — e.g. Thank you and fly safe o7">').val(EJF_SD.responses.loadClosing()).appendTo($affix);
+        // Textareas (not single-line inputs) so the opener / closing can themselves span multiple lines.
+        var $openerIn = $('<textarea class="ejf-resp-body" rows="2" placeholder="Opening line — e.g. Greetings Capsuleer,"></textarea>').val(EJF_SD.responses.loadOpener()).appendTo($affix);
+        var $closingIn = $('<textarea class="ejf-resp-body" rows="2" placeholder="Closing line — e.g. Thank you and fly safe o7"></textarea>').val(EJF_SD.responses.loadClosing()).appendTo($affix);
         $('<div class="ejf-resp-subhead">Responses</div>').appendTo($scroll);
         var $groups = $('<div class="ejf-resp-groups"></div>').appendTo($scroll);
 
