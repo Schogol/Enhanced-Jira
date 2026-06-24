@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.18.0
+// @version     2.24.1
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -8,6 +8,7 @@
 // @match       https://fenriscreations.atlassian.net/jira*
 // @match       https://fenriscreations.atlassian.net/browse*
 // @match       https://fenriscreations.atlassian.net/issues*
+// @match       https://*.cdn.prod.atlassian-dev.net/*
 // @require     https://gist.github.com/raw/2625891/waitForKeyElements.js
 // @require     https://ajax.googleapis.com/ajax/libs/jquery/3.3.1/jquery.min.js
 // @grant       GM_addStyle
@@ -33,6 +34,17 @@ var rows, oc, lc, pdm, pdmdata, driverAge = "unknown", menu_settings, menu_parse
 
 // Current Date
 var today = new Date();
+
+
+// True when this script instance is running INSIDE the Zendesk Support Forge panel's cross-origin iframe
+// (host *.atlassian-dev.net) rather than the main Jira page. In that frame we ONLY run the canned-response
+// dropdown injector and skip every other feature (buttons / log parser / Triage Assistant / sync), since
+// none of their DOM or same-origin Jira REST calls apply there. The canned-response repository lives in GM
+// storage, which Tampermonkey shares across frames, so the settings menu (main frame) edits it and the
+// dropdown (this frame) reads it.
+var EJF_IS_FORGE_FRAME = (function () {
+    try { return /(^|\.)atlassian-dev\.net$/i.test(location.hostname); } catch (e) { return false; }
+})();
 
 
 // Array which contains the locally saved values for a couple of variables.
@@ -74,11 +86,22 @@ GM_addValueChangeListener("buttons", function(key, oldValue, newValue, remote) {
 for (let i = 0; i < savedVariables.length; i++) {
     savedVariables[i][1] = GM_getValue (savedVariables[i][0], "");
     if (savedVariables[i][1] === "") {
-        // Similar Defects (index 5) is a BETA feature - default it OFF so it stays opt-in: a fresh install
-        // won't silently start downloading the embedding model + building the local defect DB. Everything
-        // else defaults ON. (Existing users keep whatever they already set; this only affects unset values.)
-        GM_setValue (savedVariables[i][0], (i === 5) ? false : true);
+        // Every feature now defaults ON for a fresh install (the Triage Assistant graduated from its opt-in
+        // Beta - see the one-time enable below for existing installs that still have it stored as false).
+        GM_setValue (savedVariables[i][0], true);
         savedVariables[i][1] = GM_getValue (savedVariables[i][0], "");
+    }
+}
+
+
+// One-time: the Triage Assistant (index 5) shipped as an opt-in Beta defaulting OFF, so existing installs
+// have it persisted as false. It's now a default-on feature, so flip it ON exactly once - guarded by a flag
+// so that a LATER manual toggle-off still sticks (we don't re-enable on every load).
+if (typeof GM_getValue === 'function' && typeof GM_setValue === 'function') {
+    if (!GM_getValue('sdDefaultOn_v1', false)) {
+        GM_setValue(savedVariables[5][0], true);
+        savedVariables[5][1] = true;
+        GM_setValue('sdDefaultOn_v1', true);
     }
 }
 
@@ -97,9 +120,11 @@ if (savedVariables[2][1]) {
 // Single Tampermonkey menu entry. All feature toggles and Triage Assistant actions (sync / rebuild /
 // embedding backend) live in an in-page settings overlay (EJF_SD.menu) instead of a long flat list of GM
 // menu commands. The callback references EJF_SD lazily, so it's fine that the namespace is defined later.
-menu_settings = GM_registerMenuCommand("⚙ Enhanced Jira – Settings…", function () {
-    if (typeof EJF_SD !== 'undefined' && EJF_SD.menu) { EJF_SD.menu.open(); }
-});
+if (!EJF_IS_FORGE_FRAME) {
+    menu_settings = GM_registerMenuCommand("⚙ Enhanced Jira – Settings…", function () {
+        if (typeof EJF_SD !== 'undefined' && EJF_SD.menu) { EJF_SD.menu.open(); }
+    });
+}
 
 
 // Switch the embedding backend between GPU (WebGPU - fast but has been unstable on some GPUs/drivers) and
@@ -235,7 +260,7 @@ var ejfButtonObserver = new MutationObserver(function () {
         try { ejfHideNativeDates(); } catch (e) { /* ignore */ }   // ...and hide Jira's native bottom timestamps
     }, 200);
 });
-ejfButtonObserver.observe(document.body, { childList: true, subtree: true });
+if (!EJF_IS_FORGE_FRAME) { ejfButtonObserver.observe(document.body, { childList: true, subtree: true }); }
 
 
 // ---- Surface the issue's Created / Updated dates at the TOP of the header ----
@@ -3037,6 +3062,591 @@ EJF_SD.hidden = {
         var m = EJF_SD.hidden._load(), n = 0;
         for (var k in m) { if (Object.prototype.hasOwnProperty.call(m, k)) { n++; } }
         return n;
+    }
+};
+
+
+/* ---- canned ("default") responses repository (Zendesk Support panel) ----
+   A small repository of reusable reply texts, surfaced as a dropdown in the Zendesk Support activity panel -
+   which renders inside a cross-origin Forge iframe (see EJF_IS_FORGE_FRAME). Picking one REPLACES the comment
+   editor's content. Ships a built-in default set; the list is editable from the settings menu and persisted in
+   GM storage (shared across frames, survives script updates). */
+EJF_SD.responses = {
+    GM_KEY: 'ejfCannedResponses',
+    DEFAULTS: [
+        { title: 'Support Ticket - General', body: 'We do appreciate you taking the time to contact us. The information for this issue is likely best submitted as a support ticket. I have already assigned this issue to Customer Support. In the future, should you wish to do so, that can be done at the following location: https://support.eveonline.com/hc/requests/new' },
+        { title: 'Support Ticket - General (Alternative)', body: 'Thank you for your bug report. Unfortunately it appears that this issue is for our Customer Support department. Please resubmit your issue as a support ticket via the following link: https://support.eveonline.com/hc/requests/new' },
+        { title: 'Support Ticket - Account Related', body: 'The Bug Hunter team cannot access any payment or account-related data to help you with this issue. I have already assigned this issue to Customer Support. In the future, please use https://support.eveonline.com/hc/requests/new to file a customer support request instead of a bug report.' },
+        { title: 'Support Ticket - Stuck', body: 'The information for this issue is likely best submitted as a support ticket. I have already assigned this issue to Customer Support. In the future, should you wish to do so, that can be done at the following location: https://support.eveonline.com/hc/requests/new You can file a ticket under "Gameplay" and "Stuck".' },
+        { title: 'Support Ticket - Mission Reset', body: 'The information for this issue is likely best submitted as a support ticket. I have already assigned this issue to Customer Support. In the future, should you wish to do so, that can be done at the following location. https://support.eveonline.com/hc/requests/new You can file a ticket by navigating to the \'Game Play Support\' section, selecting the \'Agents, AIR Career, Events & Missions\' category, and finalizing your submission under \'Missions > Agent Mission in Progress\'.' },
+        { title: 'Support Ticket - Replace/Reimburse', body: 'Bug Hunters do not provide reimbursement or replacement for lost items. I have already assigned this issue to Customer Support. In the future, should you need to, you can submit a support ticket so that they may assist you: https://support.eveonline.com/hc/requests/new' },
+        { title: 'Support Ticket - Replace/Reimburse (Alternative)', body: 'Thank you for your bug report. Unfortunately, only Customer Support can handle reimbursements - please submit a support ticket through https://support.eveonline.com/hc/requests/new, so that a Customer Support representative can help you with it.' },
+        { title: 'Support Ticket - Investigate', body: 'Thank you for your bug report. While we investigate the underlying problem, I have passed this issue on to the Customer Support team. In the future, if you need to, contact Customer Support by submitting a ticket via the following link, so that a Customer Support representative can help you with it: https://support.eveonline.com/hc/requests/new' },
+        { title: 'Defect - Created', body: 'Thank you for your bug report. The information has been reviewed and passed on to developers for further investigation. While we are unable to provide a timeline of a fix, you are encouraged to watch the patch notes here: https://www.eveonline.com/news/t/patch-notes' },
+        { title: 'Defect - Exists', body: 'Thank you for your bug report. The developers are already aware of this issue. While we are unable to provide a timeline of a fix, you are encouraged to watch the patch notes here: https://www.eveonline.com/news/t/patch-notes' },
+        { title: 'Incomplete - General', body: 'We appreciate you taking the time to contact us, however there is simply not enough information in the report to proceed. If you continue to experience the issue and can reliably reproduce it, please submit a new report with the steps you took, screenshots, and LogLite files as these can help us. Here is a link that might assist you in gathering information to submit a new report: https://community.eveonline.com/support/test-servers/bug-reporting/' },
+        { title: 'Incomplete - Logs Needed', body: 'Thank you for your bug report! Unfortunately we need logs from your client which cover the time when this problem happened. Ideally, it would be best to send a bug report through the client (F12 - Report Bug) directly after reproducing the bug. If this is not possible, you can record logs with LogLite (see https://support.eveonline.com/hc/articles/5885024878236-LogLite-tool) and attach them manually to the bug report through the web site.' },
+        { title: 'Incomplete - Launcher Logs Needed', body: 'Thank you for your bug report! Unfortunately we need logs from your launcher to be able to see details about your problem. Please follow the instructions at https://support.eveonline.com/hc/articles/5885251968796-Launcher-logs and attach them to the bug report.' },
+        { title: 'Incomplete - Crash Dump Needed', body: 'Thank you for submitting a bug report. In order to investigate this further, could you please attach the crash dump file to the bug report? Please see instructions in the support article on how to retrieve this: https://community.eveonline.com/support/test-servers/reporting-crashes/' },
+        { title: 'Incomplete - Default Bug Report', body: 'Thank you for submitting a bug report. It seems, though, that the information in your bug report is actually the default example bug report. You need to resubmit your bug report as it pertains to YOUR bug. Please submit a new report with the steps you took, screenshots, and LogLite files as these can help us. Here is a link that might assist you in gathering information to submit a new report: https://community.eveonline.com/support/test-servers/bug-reporting/' },
+        { title: 'By Design - General', body: 'Thank you for submitting a bug report. We appreciate you contacting us, but the feature in question is functioning as designed.' },
+        { title: 'By Design - Downtime', body: 'Thank you for submitting a bug report. We appreciate you contacting us, but the feature in question is functioning as designed. Downtime can have a wide variety of effects across New Eden. In an attempt to help keep our players and their items safe, downtime is announced early and often prior to the event.' },
+        { title: 'Feature Request', body: 'It appears you are attempting to request a new feature be implemented into the game. Feedback is always appreciated from our player base, however, this is not something that Bug Hunters would handle. If you wish to have your idea heard and hopefully make its way into the game, I would direct you to the forums: https://forums.eveonline.com/c/technology-research/player-features-ideas/74 This forum in particular is where you may submit ideas for new features or improvements for EVE. Additionally, you may use the #feature-suggestions channel on the EVE Online Discord (https://www.eveonline.com/discord)' },
+        { title: 'Cannot Reproduce', body: 'Thank you for submitting a bug report. However, we were not able to reproduce the issue you brought to our attention. If you are still experiencing this issue and can reliably reproduce it, I\'d suggest including more information when you file a new report. Annotated screenshots of where the exact problem is occurring is always helpful.' },
+        { title: 'Shared Cache Issues', body: 'Based on the information you\'ve provided, it seems that there may be a problem with the shared cache of files which is used to run the EVE Client. You can verify the integrity of this cache by:\n- Opening the launcher\n- Clicking the menu icon in the upper right corner\n- Choosing the "shared cache" option under "Tools / Cache"\n- Waiting until the \'Verify\' button is enabled and clicking it\nThe launcher will evaluate the integrity of all of the cached files, and obtain correct and up-to-date versions of those files which are deemed to be corrupt or outdated. If you find that this does not resolve the issue, please let us know and provide as much information as possible regarding the behaviour you\'re seeing so that we might be able to help. Alternatively, if you experience any other behaviour that you suspect to be a bug, please submit a new bug report, again providing as much information as possible.' },
+        { title: 'Shared Cache Issues (Alternative)', body: 'It looks like your resource cache might be corrupted. Please open the settings screen in the launcher (icon in the upper right corner), and open the "Shared Cache" settings under "Tools / Cache". There click the "Verify" button. Further info can be found in this article: https://support.eveonline.com/hc/articles/5885307869468-Shared-Cache' },
+        { title: 'Clear Client Cache', body: 'It seems like one of your cache files might be corrupted. Please clear your client cache in the client through ESC - Reset Settings - Clear all Cache Files.' },
+        { title: 'Unable to Connect to Chat Server', body: 'According to your client logs the client is unable to connect to our chat server. In most cases this is caused by too restrictive firewall settings, but it can also be caused by other connectivity problems. Please check https://support.eveonline.com/hc/articles/5885820948252-Troubleshooting-in-game-chat for more details about this.' },
+        { title: 'Aura AI Issues', body: 'Thank you for submitting a bug report. The information has been reviewed and passed onto the developers for review. Whilst Aura guidance is still an experimental feature, we welcome all feedback on how to improve it so it can help new capsuleers.' },
+        { title: 'Russian Issues', body: 'Unfortunately due to current global politics, there are specific services that are not accessible for our Russian capsuleers. Whilst we wished this weren\'t the case, these services are outside the control of FC.' },
+        { title: 'Broken Anomalies', body: 'Unfortunately there is an issue with NPC waves not spawning correctly. Whilst the Developers are aware, we are unable to provide any timeline for a fix. After downtime the anomalies in the system will reset, resolving this issue.' },
+        { title: 'Killmails/Killmarks', body: 'Kill reports are for informational purposes, and processing them takes lowest priority. You might find that some killmails do not show the actual damage that was dealt or taken, or other issues such as not receiving one. In some cases if an involved player travels to a different solar system, docks or undocks, those players that previously engaged may also not appear on the report. This is not something that is manually updated by Bug Hunters, nor are we able to do so.' },
+        { title: 'Socket Closed', body: 'Thank you for submitting a bug report. It appears that your client has lost connection with the server causing the socket closed message. I would recommend reading the support article on this to assist you further: https://support.eveonline.com/hc/articles/5876820591772-Disconnects-Socket-closed' },
+        { title: 'Tutorial/NPE Operations', body: 'During the starter encounters, you should be able to reset yourself to the last checkpoint by clicking on the small question mark in operations panel. You can also attempt to undock/redock, or log in and out of your client. If for some reason you are unable to resolve the issue by doing any of the above, please follow up with the support department as they may be able to assist you further here: https://support.eveonline.com/hc/requests/new' },
+        { title: 'ESI Issues', body: 'Thank you for submitting a bug report. For reporting any ESI related issues, please instead use our official ESI Issues GitHub repository: https://github.com/esi/esi-issues or use the #3rd-party-dev-and-esi channel on the EVE Online Discord (https://www.eveonline.com/discord)' },
+        { title: 'Not EVE Related', body: 'Thank you for submitting a bug report. We appreciate you taking the time to contact us, however the issue in question is not supported by EVE Online directly or deals with outside factors/services beyond our control.' },
+        { title: 'Security Related', body: 'Thank you for your report, we appreciate your concern and will forward this information to the security team within Fenris Creations. If you have any further substantial evidence which supports your report, please add it to this ticket. Please note that the security team may not respond to this ticket unless additional information is required but you can rest assured that your report will be reviewed. Should you come across other suspicious behavior in the future, we would like to point you to two other communications channels. The customer support department as well as the REPLACE WITH TEAM NAME are not directly involved in detecting and policing Real Money Trading, abuse of macros, bots and other illegitimate third party programs, that responsibility lies with Team Security, a team of specialists responsible for enforcing this side of EVE. The following two channels are the most efficient way of bringing suspected abuse of this kind to their attention:\n- Please file a support ticket or\n- send a mail directly to security@fenriscreations.com.\nMake sure to include the names of the character(s) involved, time of the alleged illicit activity and any other pertinent details you possess. For all other reports of suspected third party program abuse, please utilize the "Report bot" function in the EVE game client. Here are the steps submit a bot report:\n- Right click on the character you wish to report and select show info.\n- Click the button in the upper-left corner of the character information screen to open the action menu.\n- Select "Report Bot".\nMore information on the bot report tool and further instructions on how to operate it can be found in the blog: https://www.eveonline.com/article/the-eve-security-taskforce-report-a-bot/ I will now move this ticket to the attention of the security team.\nThanks and fly safe,' }
+    ],
+
+    // ---- repository model: store ONLY the user's deltas, not a full snapshot ----
+    // GM holds an OVERLAY on top of DEFAULTS: { v:2, overrides:{<defaultTitle>:{title,body}}, deleted:[...],
+    // added:[{title,body}] }. A response the user NEVER touched is not stored, so it stays a live DEFAULT and
+    // picks up wording fixes from script updates. Only EDITED defaults (overrides), DELETED defaults, and
+    // user-ADDED responses are persisted. A legacy full-array value is migrated to this shape on first read.
+    _isArr: function (v) { return Object.prototype.toString.call(v) === '[object Array]'; },
+    _emptyOverlay: function () { return { overrides: {}, deleted: [], added: [] }; },
+
+    // Diff a legacy full snapshot (array of {title,body}) against DEFAULTS into an overlay. A title that
+    // matches a default with the SAME body is dropped (unedited -> tracks the default); a different body
+    // becomes an override; an unmatched title becomes an addition; a default missing from the array is a
+    // deletion. (A default whose wording changed in a script update will look "edited" here - Restore
+    // defaults clears the overlay if you want the fresh text.)
+    _legacyToOverlay: function (arr) {
+        var defs = EJF_SD.responses.DEFAULTS, dByTitle = {}, i;
+        for (i = 0; i < defs.length; i++) { dByTitle[defs[i].title] = defs[i]; }
+        var ov = EJF_SD.responses._emptyOverlay(), present = {};
+        for (i = 0; i < arr.length; i++) {
+            var r = arr[i] || {}, d = dByTitle[r.title];
+            if (d) {
+                present[r.title] = true;
+                if ((r.body || '') !== (d.body || '')) { ov.overrides[r.title] = { title: r.title, body: r.body || '' }; }
+            } else {
+                ov.added.push({ title: r.title || 'Untitled', body: r.body || '' });
+            }
+        }
+        for (i = 0; i < defs.length; i++) { if (!present[defs[i].title]) { ov.deleted.push(defs[i].title); } }
+        return ov;
+    },
+
+    // Parse the stored overlay (migrating + persisting a legacy array on first read). Always returns a
+    // well-formed { overrides, deleted, added }.
+    _overlay: function () {
+        var raw = null;
+        try { if (typeof GM_getValue === 'function') { raw = GM_getValue(EJF_SD.responses.GM_KEY, null); } } catch (e) { raw = null; }
+        if (!raw) { return EJF_SD.responses._emptyOverlay(); }
+        if (EJF_SD.responses._isArr(raw)) {                 // legacy full snapshot -> migrate once
+            var ov = EJF_SD.responses._legacyToOverlay(raw);
+            EJF_SD.responses._saveOverlay(ov);
+            return ov;
+        }
+        if (typeof raw === 'object') {
+            return {
+                overrides: (raw.overrides && typeof raw.overrides === 'object') ? raw.overrides : {},
+                deleted: EJF_SD.responses._isArr(raw.deleted) ? raw.deleted : [],
+                added: EJF_SD.responses._isArr(raw.added) ? raw.added : []
+            };
+        }
+        return EJF_SD.responses._emptyOverlay();
+    },
+
+    _saveOverlay: function (ov) {
+        try { if (typeof GM_setValue === 'function') { GM_setValue(EJF_SD.responses.GM_KEY, { v: 2, overrides: ov.overrides || {}, deleted: ov.deleted || [], added: ov.added || [] }); } } catch (e) { /* ignore */ }
+    },
+
+    // The effective list = DEFAULTS (minus deletions, with overrides applied) + user additions. Each item is
+    // annotated with `_orig` (the default title it derives from) so the editor's Save can tell an unedited
+    // default from an edit; added items have no `_orig`. New defaults from a script update appear automatically
+    // (they're in DEFAULTS, not deleted, not overridden).
+    load: function () {
+        var defs = EJF_SD.responses.DEFAULTS, ov = EJF_SD.responses._overlay(), i;
+        var del = {};
+        for (i = 0; i < ov.deleted.length; i++) { del[ov.deleted[i]] = true; }
+        var usedOverride = {}, out = [];
+        for (i = 0; i < defs.length; i++) {
+            var d = defs[i];
+            if (del[d.title]) { continue; }
+            var o = ov.overrides[d.title];
+            if (o) { usedOverride[d.title] = true; out.push({ title: o.title, body: o.body, _orig: d.title }); }
+            else { out.push({ title: d.title, body: d.body, _orig: d.title }); }
+        }
+        // Overrides whose default no longer exists (removed upstream) survive as custom responses.
+        for (var k in ov.overrides) {
+            if (!Object.prototype.hasOwnProperty.call(ov.overrides, k) || usedOverride[k] || del[k]) { continue; }
+            var stillDefault = false;
+            for (i = 0; i < defs.length; i++) { if (defs[i].title === k) { stillDefault = true; break; } }
+            if (!stillDefault) { out.push({ title: ov.overrides[k].title, body: ov.overrides[k].body }); }
+        }
+        for (i = 0; i < ov.added.length; i++) { out.push({ title: ov.added[i].title, body: ov.added[i].body }); }
+        return out;
+    },
+
+    // Persist ONLY the deltas from `rows` (the editor's current list, each row carrying `_orig`). An unedited
+    // default contributes nothing; an edited default -> override (keyed by its original default title); a row
+    // with no `_orig` -> an addition; a default with no surviving row -> a deletion.
+    save: function (rows) {
+        rows = rows || [];
+        var defs = EJF_SD.responses.DEFAULTS, dByTitle = {}, i;
+        for (i = 0; i < defs.length; i++) { dByTitle[defs[i].title] = defs[i]; }
+        var ov = EJF_SD.responses._emptyOverlay(), present = {};
+        for (i = 0; i < rows.length; i++) {
+            var r = rows[i] || {}, orig = (r._orig === undefined || r._orig === null) ? null : r._orig;
+            var d = (orig != null) ? dByTitle[orig] : null;
+            if (d) {
+                present[orig] = true;
+                if ((r.title || '') !== (d.title || '') || (r.body || '') !== (d.body || '')) {
+                    ov.overrides[orig] = { title: r.title || '', body: r.body || '' };
+                }
+            } else {
+                ov.added.push({ title: r.title || 'Untitled', body: r.body || '' });
+            }
+        }
+        for (i = 0; i < defs.length; i++) { if (!present[defs[i].title]) { ov.deleted.push(defs[i].title); } }
+        EJF_SD.responses._saveOverlay(ov);
+    },
+
+    // Restore the built-in defaults (clears the whole overlay so load() returns pure DEFAULTS).
+    reset: function () {
+        try { if (typeof GM_setValue === 'function') { GM_setValue(EJF_SD.responses.GM_KEY, null); } } catch (e) { /* ignore */ }
+    },
+
+    // Optional opening + closing lines the user configures once (e.g. "Greetings Capsuleer," /
+    // "Thank you and fly safe o7"). They are wrapped around EVERY picked response on insert, so the canned
+    // bodies stay greeting-free and reusable. Persisted in GM (shared across frames, survive script updates);
+    // either can be left blank to skip it.
+    OPENER_KEY: 'ejfRespOpener',
+    CLOSING_KEY: 'ejfRespClosing',
+    loadOpener: function () {
+        try { if (typeof GM_getValue === 'function') { return GM_getValue(EJF_SD.responses.OPENER_KEY, '') || ''; } } catch (e) { /* ignore */ }
+        return '';
+    },
+    loadClosing: function () {
+        try { if (typeof GM_getValue === 'function') { return GM_getValue(EJF_SD.responses.CLOSING_KEY, '') || ''; } } catch (e) { /* ignore */ }
+        return '';
+    },
+    saveAffixes: function (opener, closing) {
+        try {
+            if (typeof GM_setValue === 'function') {
+                GM_setValue(EJF_SD.responses.OPENER_KEY, opener || '');
+                GM_setValue(EJF_SD.responses.CLOSING_KEY, closing || '');
+            }
+        } catch (e) { /* ignore */ }
+    },
+
+    // Wrap `body` with the configured opener / closing, each on its own line (a single line break after the
+    // greeting and before the closing line; omitted when blank).
+    _compose: function (body) {
+        var opener = EJF_SD.responses.loadOpener(), closing = EJF_SD.responses.loadClosing();
+        var parts = [];
+        if (opener) { parts.push(opener); }
+        parts.push(body || '');
+        if (closing) { parts.push(closing); }
+        return parts.join('\n');
+    },
+
+    // Standalone, roomier editor for the canned responses, opened by the settings menu's "Customize
+    // responses" button (the menu itself just shows that button + Restore defaults now, so it stays compact).
+    // Reuses the settings-menu overlay chrome (#ejf-menu-overlay / #ejf-menu) widened via .ejf-menu-wide, and
+    // the same .ejf-resp-* row styling. Edits persist to GM (shared across frames, survive script updates).
+    _editorCssInjected: false,
+    _injectEditorCss: function () {
+        if (EJF_SD.responses._editorCssInjected) { return; }
+        // Flex column layout so the header + the action footer stay pinned while only the middle scrolls,
+        // plus collapsible section groups and collapsible response rows (body hidden until the row is opened).
+        try { GM_addStyle('#ejf-menu.ejf-menu-wide { width: 560px; max-width: 92vw; display: flex; flex-direction: column; overflow: hidden; }\
+#ejf-menu.ejf-menu-wide .ejf-menu-head { flex: 0 0 auto; }\
+#ejf-menu .ejf-resp-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 4px 14px 10px; }\
+#ejf-menu .ejf-resp-foot { flex: 0 0 auto; display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 14px; border-top: 1px solid #3a434d; background: #282d33; }\
+#ejf-menu .ejf-resp-subhead { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: #7a8694; margin: 12px 0 4px; }\
+#ejf-menu .ejf-resp-affix { display: flex; flex-direction: column; gap: 6px; padding: 2px 0 4px; }\
+#ejf-menu .ejf-resp-caret { color: #9aa6b2; font-size: 10px; width: 12px; flex: 0 0 auto; text-align: center; }\
+#ejf-menu .ejf-resp-group { border: 1px solid #2c333a; border-radius: 6px; margin-bottom: 8px; overflow: hidden; }\
+#ejf-menu .ejf-resp-group-head { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: #22272b; cursor: pointer; user-select: none; font-weight: 700; font-size: 12px; }\
+#ejf-menu .ejf-resp-group-head:hover { background: #262c31; }\
+#ejf-menu .ejf-resp-group-head .ejf-resp-gname { flex: 1 1 auto; }\
+#ejf-menu .ejf-resp-group-head .ejf-resp-gcount { color: #7a8694; font-weight: 400; font-size: 11px; }\
+#ejf-menu .ejf-resp-gadd { flex: 0 0 auto; font-size: 11px; font-weight: 400; color: #9aa6b2; background: #2c333a; border: 1px solid #3a434d; border-radius: 4px; padding: 2px 8px; cursor: pointer; }\
+#ejf-menu .ejf-resp-gadd:hover { color: #fff; border-color: #4c9aff; }\
+#ejf-menu .ejf-resp-gdel { flex: 0 0 auto; width: 22px; height: 22px; line-height: 1; font-size: 16px; color: #9aa6b2; background: transparent; border: 1px solid #3a434d; border-radius: 4px; cursor: pointer; }\
+#ejf-menu .ejf-resp-gdel:hover { color: #fff; background: #5a2a2a; border-color: #a85a5a; }\
+#ejf-menu .ejf-resp-group.collapsed .ejf-resp-group-body { display: none; }\
+#ejf-menu .ejf-resp-group-body { padding: 6px 8px; display: flex; flex-direction: column; gap: 6px; }\
+#ejf-menu .ejf-resp-item { display: block; position: static; padding: 0; margin: 0; gap: 0; border: 1px solid #2c333a; border-radius: 6px; overflow: hidden; }\
+#ejf-menu .ejf-resp-item-head { display: flex; align-items: center; gap: 6px; padding: 6px 6px 6px 8px; background: #14181b; cursor: pointer; }\
+#ejf-menu .ejf-resp-item .ejf-resp-title { flex: 1 1 auto; padding: 5px 8px; cursor: text; }\
+#ejf-menu .ejf-resp-del { position: static; width: 22px; height: 22px; flex: 0 0 auto; }\
+#ejf-menu .ejf-resp-item-body { padding: 6px 8px; }\
+#ejf-menu .ejf-resp-item.collapsed .ejf-resp-item-body { display: none; }\
+#ejf-menu .ejf-resp-item .ejf-resp-body { width: 100%; box-sizing: border-box; }'); } catch (e) { /* ignore */ }
+        EJF_SD.responses._editorCssInjected = true;
+    },
+
+    // Section name for a response, derived from its title prefix ("Support Ticket - General" -> "Support
+    // Ticket"); titles without a " - " separator fall into "Other". Used to group both the editor and the
+    // Zendesk dropdown (via <optgroup>). `_titleTail` is the remainder shown inside a section.
+    _sectionOf: function (title) {
+        var t = (title || '').trim();
+        var idx = t.indexOf(' - ');
+        return idx > 0 ? t.slice(0, idx).trim() : 'Other';
+    },
+    _titleTail: function (title) {
+        var t = (title || '').trim();
+        var idx = t.indexOf(' - ');
+        return idx > 0 ? t.slice(idx + 3).trim() : t;
+    },
+
+    openEditor: function () {
+        if (EJF_SD.menu && EJF_SD.menu.close) { EJF_SD.menu.close(); }   // close the settings menu if it's open
+        EJF_SD.menu._injectCss();
+        EJF_SD.responses._injectEditorCss();
+        var $overlay = $('<div id="ejf-menu-overlay"></div>');
+        var esc = function (e) { if (e.key === 'Escape') { closeEditor(); } };
+        function closeEditor() { $overlay.remove(); document.removeEventListener('keydown', esc); }
+        $overlay.on('click', function (e) { if (e.target === this) { closeEditor(); } });   // backdrop click
+        var $menu = $('<div id="ejf-menu" class="ejf-menu-wide"></div>').appendTo($overlay);
+        var $head = $('<div class="ejf-menu-head"><h2>Customize responses</h2></div>');
+        $('<span class="ejf-menu-x" title="Close (Esc)">×</span>').on('click', closeEditor).appendTo($head);
+        $menu.append($head);
+        // Scrollable middle region (header + footer stay pinned via the flex layout in _injectEditorCss).
+        var $scroll = $('<div class="ejf-resp-scroll"></div>').appendTo($menu);
+        $('<div class="ejf-menu-status">These appear in the dropdown in the Zendesk Support panel; picking one replaces the comment editor.</div>').appendTo($scroll);
+        // Opening / closing lines wrapped around EVERY inserted response (left blank = skipped).
+        $('<div class="ejf-resp-subhead">Opening &amp; closing</div>').appendTo($scroll);
+        $('<div class="ejf-menu-status" style="padding:0 0 6px;">Added around every response on insert. Leave blank to skip.</div>').appendTo($scroll);
+        var $affix = $('<div class="ejf-resp-affix"></div>').appendTo($scroll);
+        var $openerIn = $('<input type="text" class="ejf-resp-title" placeholder="Opening line — e.g. Greetings Capsuleer,">').val(EJF_SD.responses.loadOpener()).appendTo($affix);
+        var $closingIn = $('<input type="text" class="ejf-resp-title" placeholder="Closing line — e.g. Thank you and fly safe o7">').val(EJF_SD.responses.loadClosing()).appendTo($affix);
+        $('<div class="ejf-resp-subhead">Responses</div>').appendTo($scroll);
+        var $groups = $('<div class="ejf-resp-groups"></div>').appendTo($scroll);
+
+        // Re-count each section header from the rows it currently holds (after add / delete).
+        function updateCounts() {
+            $groups.children('.ejf-resp-group').each(function () {
+                var $g = $(this), n = $g.find('.ejf-resp-item').length;
+                $g.find('.ejf-resp-gcount').text(n + (n === 1 ? ' response' : ' responses'));
+            });
+        }
+
+        // A collapsible response row: only the title bar shows by default; clicking it (anywhere but the title
+        // input or the delete button) toggles the body textarea open for editing.
+        function respRow(item, expanded) {
+            var $row = $('<div class="ejf-resp-item' + (expanded ? '' : ' collapsed') + '"></div>');
+            if (item && item._orig != null) { $row.attr('data-orig', item._orig); }   // provenance: which default this row derives from (so Save can diff)
+            var $head = $('<div class="ejf-resp-item-head"></div>');
+            var $caret = $('<span class="ejf-resp-caret"></span>').text(expanded ? '▾' : '▸');
+            var $title = $('<input type="text" class="ejf-resp-title" placeholder="Title">').val((item && item.title) || '');
+            var $del = $('<button class="ejf-resp-del" title="Remove">×</button>');
+            $head.append($caret).append($title).append($del);
+            var $body = $('<div class="ejf-resp-item-body"></div>');
+            $('<textarea class="ejf-resp-body" rows="6" placeholder="Response text"></textarea>').val((item && item.body) || '').appendTo($body);
+            $row.append($head).append($body);
+            function toggle() { $caret.text($row.toggleClass('collapsed').hasClass('collapsed') ? '▸' : '▾'); }
+            $head.on('click', function (e) {
+                if ($(e.target).is('input') || $(e.target).closest('.ejf-resp-del').length) { return; }
+                toggle();
+            });
+            $del.on('click', function (e) { e.stopPropagation(); $row.remove(); updateCounts(); });
+            return $row;
+        }
+
+        // Find (or build) the collapsible section group for `name`, returning its body element. Each header
+        // carries a "+ Add" button that drops a new row straight into THAT section (its prefix prefilled into
+        // the title), so a response can be added to any section, not just "Other".
+        var groupBodies = {};
+        function ensureGroup(name) {
+            if (groupBodies[name]) { return groupBodies[name]; }
+            var $g = $('<div class="ejf-resp-group collapsed"></div>');   // sections start collapsed
+            var $gh = $('<div class="ejf-resp-group-head"></div>');
+            var $gcaret = $('<span class="ejf-resp-caret"></span>').text('▸');
+            var $gadd = $('<button class="ejf-resp-gadd" title="Add a response to this section">+ Add</button>');
+            var $gdel = $('<button class="ejf-resp-gdel" title="Delete this section and all its responses">×</button>');
+            $gh.append($gcaret).append($('<span class="ejf-resp-gname"></span>').text(name)).append($('<span class="ejf-resp-gcount"></span>')).append($gadd).append($gdel);
+            var $gb = $('<div class="ejf-resp-group-body"></div>');
+            $gh.on('click', function () { $gcaret.text($g.toggleClass('collapsed').hasClass('collapsed') ? '▸' : '▾'); });
+            // The "Other" bucket isn't a real prefix, so its new rows start title-less; named sections prefill
+            // "<name> - " so the saved title keeps the row in this section (sections are derived from the title).
+            $gadd.on('click', function (e) { e.stopPropagation(); addRowTo(name, name === 'Other' ? '' : (name + ' - ')); });
+            // Delete the whole section (and every response in it). Confirm only when it actually holds rows.
+            $gdel.on('click', function (e) {
+                e.stopPropagation();
+                var n = $gb.find('.ejf-resp-item').length;
+                if (n && !confirm('Delete the "' + name + '" section and its ' + n + ' response' + (n === 1 ? '' : 's') + '?')) { return; }
+                $g.remove();
+                delete groupBodies[name];
+            });
+            $g.append($gh).append($gb);
+            $groups.append($g);
+            groupBodies[name] = $gb;
+            return $gb;
+        }
+
+        // Add a fresh, expanded response row to section `name`, optionally prefilling its title, then expand
+        // the section and focus the title (cursor at the end of any prefilled prefix). Shared by every "+ Add"
+        // control (per-section headers, the footer "Add response", and "Add section").
+        function addRowTo(name, prefill) {
+            var $gb = ensureGroup(name);
+            $gb.closest('.ejf-resp-group').removeClass('collapsed')
+               .find('.ejf-resp-group-head .ejf-resp-caret').first().text('▾');
+            var $row = respRow(prefill ? { title: prefill, body: '' } : null, true);
+            $gb.append($row);
+            updateCounts();
+            $row[0].scrollIntoView({ block: 'nearest' });
+            var $t = $row.find('.ejf-resp-title').focus();
+            var el = $t[0];
+            if (el && el.setSelectionRange) { var L = (el.value || '').length; try { el.setSelectionRange(L, L); } catch (e) { /* ignore */ } }
+            return $row;
+        }
+
+        function fillRows(list) {
+            $groups.empty();
+            groupBodies = {};
+            (list || []).forEach(function (it) { ensureGroup(EJF_SD.responses._sectionOf(it.title)).append(respRow(it, false)); });
+            updateCounts();
+        }
+        fillRows(EJF_SD.responses.load());
+
+        // Pinned action footer (always visible regardless of scroll position).
+        var $foot = $('<div class="ejf-resp-foot"></div>').appendTo($menu);
+        $('<button class="ejf-btn">Add section</button>')
+            .on('click', function () {
+                var name = (prompt('New section name (e.g. "Support Ticket", "Defect"):', '') || '').trim();
+                if (!name) { return; }
+                if (/ - /.test(name)) { name = name.split(' - ')[0].trim(); }   // a section is just the prefix
+                if (!name) { return; }
+                // Add the first response straight into the new section (prefix prefilled so it sticks there).
+                addRowTo(name, name + ' - ');
+            }).appendTo($foot);
+        $('<button class="ejf-btn">Save</button>')
+            .on('click', function () {
+                var list = [];
+                $groups.find('.ejf-resp-item').each(function () {
+                    var $i = $(this);
+                    var t = ($i.find('.ejf-resp-title').val() || '').trim();
+                    var b = $i.find('.ejf-resp-body').val() || '';
+                    if (t || b.trim()) {
+                        var orig = $i.attr('data-orig');
+                        list.push({ title: t || 'Untitled', body: b, _orig: (orig === undefined ? null : orig) });
+                    }
+                });
+                EJF_SD.responses.save(list);
+                EJF_SD.responses.saveAffixes(($openerIn.val() || '').trim(), ($closingIn.val() || '').trim());
+                EJF_SD.ui.toast('Saved ' + list.length + ' canned response' + (list.length === 1 ? '' : 's') + '.');
+                closeEditor();
+            }).appendTo($foot);
+        $('<button class="ejf-btn">Restore defaults</button>')
+            .on('click', function () {
+                if (!confirm('Restore the built-in default responses? Your custom edits will be lost.')) { return; }
+                EJF_SD.responses.reset();
+                fillRows(EJF_SD.responses.load());
+            }).appendTo($foot);
+        $overlay.appendTo(document.body);
+        document.addEventListener('keydown', esc);
+    },
+
+    // Replace the open comment editor's content with `body`. The Zendesk panel uses an Atlassian ProseMirror
+    // editor (the single contenteditable=true instance; the comment-history editors are read-only). We focus
+    // it, select all, then execCommand('insertText') so ProseMirror's own input handling rebuilds the document
+    // (more reliable than poking its internal model). Returns false if no editable editor is present.
+    apply: function (body) {
+        // Scope the editor lookup to the Zendesk panel (the nearest ancestor of OUR dropdown that contains an
+        // editable ProseMirror). A global querySelector would otherwise match a DIFFERENT editor on the page
+        // (e.g. the JQL search box), which is why the text was landing in the wrong field.
+        var SEL = 'div.ProseMirror[contenteditable="true"], [role="textbox"][contenteditable="true"]';
+        var ed = null, anchor = document.getElementById('ejf-resp-col');
+        for (var node = anchor && anchor.parentNode; node && node.querySelector; node = node.parentNode) {
+            var cand = node.querySelector(SEL);
+            if (cand) { ed = cand; break; }   // nearest enclosing editor == the Zendesk panel's compose box
+        }
+        if (!ed) { ed = document.querySelector(SEL); }   // fallback (shouldn't normally be needed)
+        if (!ed) { return false; }
+        ed.focus();
+        try {
+            // ProseMirror collapses any "\n" passed straight to insertText, so we drive the block structure
+            // ourselves with insertParagraph: clear the editor, then re-insert each line as its own paragraph
+            // (a blank line "\n\n" becomes an empty paragraph, so the body's spacing is preserved verbatim).
+            //  - A line starting with "- " / "•" is a bullet-list item. We CANNOT make a NATIVE editor list
+            //    node from here: ProseMirror's "type '- ' -> bullet list" input rule fires ONLY on real
+            //    keyboard input, and programmatic execCommand('insertText') bypasses it entirely (verified -
+            //    inserting "- " just yields a literal dash, and a toolbar-button click would race the editor's
+            //    async DOM-sync). So each item is rendered with a leading "• " glyph, which reads as a bullet
+            //    list and is 100% reliable.
+            document.execCommand('selectAll', false, null);
+            document.execCommand('delete', false, null);
+            var lines = String(body == null ? '' : body).split('\n');
+            for (var i = 0; i < lines.length; i++) {
+                if (i > 0) { document.execCommand('insertParagraph', false, null); }
+                var line = lines[i];
+                var m = /^[-•]\s+/.exec(line);
+                var text = m ? ('• ' + line.slice(m[0].length)) : line;
+                if (text) { document.execCommand('insertText', false, text); }
+            }
+            return true;
+        } catch (e) { return false; }
+    },
+
+    // Populate (or repopulate) the dropdown's <option>s from the repository. Guarded by a signature so a
+    // re-inject during the user's interaction doesn't clobber an in-progress selection.
+    _fill: function (sel) {
+        var list = EJF_SD.responses.load();
+        var sig = list.map(function (r) { return r.title; }).join('');
+        if (sel.getAttribute('data-ejf-sig') !== sig) {
+        sel.setAttribute('data-ejf-sig', sig);
+        sel.innerHTML = '';
+        var ph = document.createElement('option');
+        ph.value = '';
+        ph.textContent = list.length ? 'Insert a response…' : 'No responses configured';
+        sel.appendChild(ph);
+        // Group into <optgroup>s by section (derived from the title prefix), showing the short tail inside.
+        var groups = {};
+        for (var i = 0; i < list.length; i++) {
+            var sec = EJF_SD.responses._sectionOf(list[i].title);
+            var grp = groups[sec];
+            if (!grp) { grp = groups[sec] = document.createElement('optgroup'); grp.label = sec; sel.appendChild(grp); }
+            var o = document.createElement('option');
+            o.value = String(i);
+            o.textContent = EJF_SD.responses._titleTail(list[i].title) || ('Response ' + (i + 1));
+            grp.appendChild(o);
+        }
+        sel.value = '';
+        }
+        EJF_SD.responses._setDisplay(list);
+    },
+
+    // Reset the (cloned react-select) display text back to the placeholder. The dropdown is an ACTION menu, so
+    // after each pick it returns to the placeholder rather than showing the last choice. No-op on the fallback
+    // path (a plain <select> shows its own option text).
+    _setDisplay: function (list) {
+        var v = document.querySelector('[data-ejf-respval]');
+        if (v) { v.textContent = (list || EJF_SD.responses.load()).length ? 'Insert a response…' : 'No responses configured'; }
+    },
+
+    // Switch the Zendesk composer to its "Add public reply" tab (it defaults to "Add internal note"). The
+    // composer is an Atlassian Tabs widget; each tab is a role="tab" element whose text is the label. We match
+    // the public-reply tab by text and click it unless it's already selected. Returns true if found.
+    _selectPublicReply: function () {
+        var tabs = document.querySelectorAll('[role="tab"]');
+        for (var i = 0; i < tabs.length; i++) {
+            if ((tabs[i].textContent || '').trim().toLowerCase() === 'add public reply') {
+                if (tabs[i].getAttribute('aria-selected') !== 'true') { tabs[i].click(); }
+                return true;
+            }
+        }
+        return false;
+    },
+
+    // Shared change handler for the overlay/fallback <select>: switch the composer to the public-reply tab,
+    // insert the picked response, then reset the dropdown to its placeholder. We select the tab FIRST because
+    // switching tabs swaps in the public-reply editor instance; a short delay lets React mount it before we
+    // write into it (the editor lookup in apply() then targets the now-active public-reply box).
+    _onPick: function () {
+        var sel = document.getElementById('ejf-resp-select');
+        if (!sel) { return; }
+        var i = parseInt(sel.value, 10);
+        var list = EJF_SD.responses.load();
+        if (!isNaN(i) && list[i]) {
+            var body = EJF_SD.responses._compose(list[i].body);   // wrap with the configured opener / closing
+            var switched = EJF_SD.responses._selectPublicReply();
+            setTimeout(function () { EJF_SD.responses.apply(body); }, switched ? 80 : 0);
+        }
+        sel.value = '';
+        EJF_SD.responses._setDisplay(list);
+    },
+
+    // True once a react-select column has finished rendering its chrome (the styled control box + the chevron
+    // indicator + a populated value). We MUST wait for this before cloning, otherwise we copy the loading
+    // skeleton (a borderless empty box) and the dropdown ends up looking blank.
+    _ready: function (srcCol) {
+        var control = srcCol.querySelector('[class*="-control"]');
+        var indic = srcCol.querySelector('[class*="ndicator"]');   // -IndicatorsContainer / -indicatorContainer
+        var val = srcCol.querySelector('[id$="-single-value"]');
+        return !!(control && indic && val && (val.textContent || '').trim());
+    },
+
+    // Build / refresh the dropdown in the Zendesk Support panel (the empty region to the right of the ticket
+    // selector). We CLONE the SUBDOMAIN selector, not the ticket selector: the subdomain dropdown renders and
+    // populates noticeably faster (the ticket list is fetched after it), so cloning it makes our dropdown
+    // appear sooner and far less likely to catch the source mid-load. Both columns share the same flex row,
+    // so the clone still lands to the right of the ticket selector. Idempotent: re-fills an existing dropdown,
+    // or builds one next to the source column.
+    inject: function () {
+        var srcLabel = document.querySelector('label[for="subdomain-select"]');
+        if (!srcLabel || !srcLabel.parentNode || !srcLabel.parentNode.parentNode) { return; }
+        var srcCol = srcLabel.parentNode;                  // the subdomain-select column (label + react-select)
+        var row = srcCol.parentNode;                       // flex row holding the subdomain + ticket columns
+        var sel = document.getElementById('ejf-resp-select');
+        if (!document.getElementById('ejf-resp-col')) {
+            if (!EJF_SD.responses._ready(srcCol)) { return; }   // wait for the source select to finish rendering
+            sel = EJF_SD.responses._build(srcCol, row);
+        }
+        if (sel) { EJF_SD.responses._fill(sel); }
+    },
+
+    // Build the dropdown column. Preferred path: CLONE the source react-select column (the subdomain selector)
+    // so the control looks pixel-identical to the native react-select dropdowns, then overlay a transparent
+    // native <select> on top for interaction (we can't drive react-select's React state, so we reuse only its
+    // chrome). Fallback: a plain styled <select> if the clone fails. Returns the <select> element (or null).
+    _build: function (srcCol, row) {
+        var sel = null, i;
+        try {
+            var col = srcCol.cloneNode(true);
+            col.id = 'ejf-resp-col';
+            col.style.marginLeft = '4px';
+            var lbl = col.querySelector('label');
+            if (lbl) { lbl.textContent = 'Insert default response'; lbl.removeAttribute('for'); }
+            // The react-select "single value" text element (tag it so _setDisplay can update it).
+            var valEl = col.querySelector('[id$="-single-value"]') || col.querySelector('[class*="-singleValue"]');
+            // The control wrapper (react-select container) - we overlay the native <select> on top of it.
+            var box = lbl ? lbl.nextElementSibling : col.querySelector('[class*="-container"]');
+            if (!box) { throw new Error('no control box in clone'); }
+            // Strip identifying attributes so the clone can't shadow Jira's / react-select's id/testid lookups,
+            // and remove the cloned react-select search input (it would otherwise steal focus / typing).
+            var nodes = col.querySelectorAll('*');
+            for (i = 0; i < nodes.length; i++) {
+                nodes[i].removeAttribute('data-testid');
+                nodes[i].removeAttribute('data-vc');
+                nodes[i].removeAttribute('data-component-selector');
+                if (nodes[i].id) { nodes[i].removeAttribute('id'); }
+            }
+            var inputs = col.querySelectorAll('input');
+            for (i = 0; i < inputs.length; i++) { if (inputs[i].parentNode) { inputs[i].parentNode.removeChild(inputs[i]); } }
+            if (valEl) { valEl.setAttribute('data-ejf-respval', '1'); valEl.textContent = 'Insert a response…'; }
+            box.style.position = 'relative';
+            sel = document.createElement('select');
+            sel.id = 'ejf-resp-select';
+            sel.style.cssText = 'position:absolute; top:0; left:0; width:100%; height:100%; margin:0; padding:0; border:0; background:transparent; opacity:0; cursor:pointer; z-index:2;';
+            sel.addEventListener('change', EJF_SD.responses._onPick);
+            box.appendChild(sel);
+            row.appendChild(col);
+            return sel;
+        } catch (e) {
+            // Fallback: a plain styled select that approximates the native look.
+            if (document.getElementById('ejf-resp-col')) { return document.getElementById('ejf-resp-select'); }
+            var fcol = document.createElement('div');
+            fcol.id = 'ejf-resp-col';
+            fcol.style.cssText = 'display:flex; flex-direction:column; margin-left:4px; min-width:220px; max-width:320px; box-sizing:border-box;';
+            var flbl = document.createElement('label');
+            flbl.textContent = 'Insert default response';
+            flbl.style.cssText = 'font-size:12px; font-weight:600; color:var(--ds-text-subtle,#8c9bab); margin-bottom:4px;';
+            fcol.appendChild(flbl);
+            sel = document.createElement('select');
+            sel.id = 'ejf-resp-select';
+            sel.style.cssText = 'height:40px; box-sizing:border-box; padding:0 8px; border-radius:3px;' +
+                ' border:1px solid var(--ds-border-input,#8590a2); background:var(--ds-surface,#22272b);' +
+                ' color:var(--ds-text,#c7d1db); font-size:14px; outline:none; cursor:pointer;';
+            sel.addEventListener('change', EJF_SD.responses._onPick);
+            fcol.appendChild(sel);
+            row.appendChild(fcol);
+            return sel;
+        }
     }
 };
 
@@ -6019,7 +6629,14 @@ EJF_SD.menu = {
 #ejf-menu .ejf-btn:disabled:hover { background: #2c333a; border-color: #3a434d; }\
 #ejf-menu .ejf-num { width: 56px; flex: 0 0 auto; background: #2c333a; color: #e6e6e6; border: 1px solid #3a434d; border-radius: 5px; padding: 5px 8px; font-size: 12px; text-align: center; }\
 #ejf-menu .ejf-num:focus { outline: none; border-color: #4c9aff; }\
-#ejf-menu .ejf-menu-status { color: #9aa6b2; font-size: 11px; padding: 8px 0 0; }',
+#ejf-menu .ejf-menu-status { color: #9aa6b2; font-size: 11px; padding: 8px 0 0; }\
+#ejf-menu .ejf-resp-list { display: flex; flex-direction: column; gap: 8px; padding: 6px 0; }\
+#ejf-menu .ejf-resp-item { display: flex; flex-direction: column; gap: 4px; border: 1px solid #2c333a; border-radius: 6px; padding: 8px; position: relative; }\
+#ejf-menu .ejf-resp-title { background: #14181b; color: #e6e6e6; border: 1px solid #3a434d; border-radius: 4px; padding: 5px 26px 5px 8px; font-size: 12px; font-weight: 600; }\
+#ejf-menu .ejf-resp-body { background: #14181b; color: #e6e6e6; border: 1px solid #3a434d; border-radius: 4px; padding: 5px 8px; font-size: 12px; resize: vertical; font-family: inherit; line-height: 1.4; }\
+#ejf-menu .ejf-resp-title:focus, #ejf-menu .ejf-resp-body:focus { outline: none; border-color: #4c9aff; }\
+#ejf-menu .ejf-resp-del { position: absolute; top: 6px; right: 6px; width: 20px; height: 20px; line-height: 1; background: transparent; color: #9aa6b2; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; }\
+#ejf-menu .ejf-resp-del:hover { background: #3a434d; color: #fff; }',
 
     _injectCss: function () {
         if (!EJF_SD.menu._cssInjected) { GM_addStyle(EJF_SD.menu.css); EJF_SD.menu._cssInjected = true; }
@@ -6073,8 +6690,21 @@ EJF_SD.menu = {
         $feat.append(EJF_SD.menu._toggleRow('Log Parser', !!savedVariables[1][1], toggleParser));
         $feat.append(EJF_SD.menu._toggleRow('Custom Scrollbar', !!savedVariables[2][1], toggleScrollbar));
         $feat.append(EJF_SD.menu._toggleRow('Extra Buttons', !!savedVariables[4][1], toggleButtons));
-        $feat.append(EJF_SD.menu._toggleRow('Triage Assistant (Beta)', !!savedVariables[5][1], toggleSimilarDefects));
+        $feat.append(EJF_SD.menu._toggleRow('Triage Assistant', !!savedVariables[5][1], toggleSimilarDefects));
         $p.append($feat);
+
+        // ---- Canned responses (Zendesk Support panel) ----
+        // A repository of reusable replies, shown as a dropdown in the Zendesk Support activity panel (picking
+        // one replaces the editor). The actual editing happens in a roomier standalone window
+        // (EJF_SD.responses.openEditor); here we just expose the entry point + a quick "Restore defaults".
+        // Edits persist in GM storage and reach the Forge-iframe dropdown live.
+        var $resp = $('<div class="ejf-menu-sect"></div>');
+        $('<h3>Canned responses</h3>').appendTo($resp);
+        $('<div class="ejf-menu-status">Shown as a dropdown in the Zendesk Support panel; picking one replaces the comment editor.</div>').appendTo($resp);
+        var $respActions = $('<div class="ejf-menu-actions"></div>').appendTo($resp);
+        $('<button class="ejf-btn">Customize responses</button>')
+            .on('click', function () { EJF_SD.responses.openEditor(); }).appendTo($respActions);
+        $p.append($resp);
 
         // ---- Triage Assistant (only when enabled) ----
         if (savedVariables[5][1]) {
@@ -6308,6 +6938,7 @@ EJF_SD.sched = {
 
 /* ---- init: watch the DOM and (re)inject the panel across Atlassian's React re-renders / SPA nav ---- */
 (function () {
+    if (EJF_IS_FORGE_FRAME) { return; }  // inside the Zendesk Forge iframe we only run the responses dropdown
     if (!window.indexedDB) { return; }   // feature unavailable in this environment
     var scheduled = false;
     var observer = new MutationObserver(function () {
@@ -6338,4 +6969,33 @@ EJF_SD.sched = {
     }
     // start the periodic background catch-up sync
     EJF_SD.sched.start();
+})();
+
+
+/* ---- canned responses: inject the dropdown into the Zendesk Support panel ---- */
+// Runs in EVERY frame (the main Jira page AND the Forge iframe), because the Zendesk Support panel can be
+// rendered EITHER as UI Kit 2 native components in the main page OR inside the cross-origin Forge iframe -
+// we don't assume which, so the injector simply feature-detects the ticket selector wherever it lives. It's
+// cheap: inject() early-exits unless #ticket-select is present, so it's a no-op in frames without the panel.
+(function () {
+    var scheduled = false;
+    function tick() { try { EJF_SD.responses.inject(); } catch (e) { /* ignore */ } }
+    // Re-inject across the panel's React re-renders / lazy tab load / ticket switches. The Zendesk tab isn't
+    // selected by default, so the panel mounts only once the user navigates to it - the observer catches that.
+    var obs = new MutationObserver(function () {
+        if (scheduled) { return; }
+        scheduled = true;
+        setTimeout(function () { scheduled = false; tick(); }, 250);
+    });
+    try { obs.observe(document.documentElement || document.body, { childList: true, subtree: true }); } catch (e) { /* ignore */ }
+    // Live-update the dropdown when the repository is edited from the settings menu (another frame).
+    if (typeof GM_addValueChangeListener === 'function') {
+        try {
+            GM_addValueChangeListener('ejfCannedResponses', function () {
+                var sel = document.getElementById('ejf-resp-select');
+                if (sel) { sel.removeAttribute('data-ejf-sig'); EJF_SD.responses._fill(sel); }
+            });
+        } catch (e) { /* ignore */ }
+    }
+    setTimeout(tick, 800);   // initial attempt in case the panel is already rendered
 })();
