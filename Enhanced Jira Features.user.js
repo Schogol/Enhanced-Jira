@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.24.2
+// @version     2.24.3
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -3502,19 +3502,24 @@ EJF_SD.responses = {
         if (sel.getAttribute('data-ejf-sig') !== sig) {
         sel.setAttribute('data-ejf-sig', sig);
         sel.innerHTML = '';
+        // Explicit dark colors on every option / optgroup so the native popup is readable in Chrome (which
+        // otherwise paints unstyled options on a white system background).
+        var OPT_CSS = 'background:#1d2125;color:#e6e6e6;';
         var ph = document.createElement('option');
         ph.value = '';
         ph.textContent = list.length ? 'Insert a response…' : 'No responses configured';
+        ph.style.cssText = OPT_CSS;
         sel.appendChild(ph);
         // Group into <optgroup>s by section (derived from the title prefix), showing the short tail inside.
         var groups = {};
         for (var i = 0; i < list.length; i++) {
             var sec = EJF_SD.responses._sectionOf(list[i].title);
             var grp = groups[sec];
-            if (!grp) { grp = groups[sec] = document.createElement('optgroup'); grp.label = sec; sel.appendChild(grp); }
+            if (!grp) { grp = groups[sec] = document.createElement('optgroup'); grp.label = sec; grp.style.cssText = OPT_CSS; sel.appendChild(grp); }
             var o = document.createElement('option');
             o.value = String(i);
             o.textContent = EJF_SD.responses._titleTail(list[i].title) || ('Response ' + (i + 1));
+            o.style.cssText = OPT_CSS;
             grp.appendChild(o);
         }
         sel.value = '';
@@ -3623,7 +3628,11 @@ EJF_SD.responses = {
             box.style.position = 'relative';
             sel = document.createElement('select');
             sel.id = 'ejf-resp-select';
-            sel.style.cssText = 'position:absolute; top:0; left:0; width:100%; height:100%; margin:0; padding:0; border:0; background:transparent; opacity:0; cursor:pointer; z-index:2;';
+            // The control box is opacity:0 (the cloned react-select chrome shows through), but Chrome draws
+            // the NATIVE option popup from the <select>'s OWN colors - a transparent background makes that
+            // popup render white. So give it a real dark background + color-scheme:dark; opacity:0 keeps the
+            // box itself invisible, while the popup picks up the dark palette.
+            sel.style.cssText = 'position:absolute; top:0; left:0; width:100%; height:100%; margin:0; padding:0; border:0; background:#1d2125; color:#e6e6e6; color-scheme:dark; opacity:0; cursor:pointer; z-index:2;';
             sel.addEventListener('change', EJF_SD.responses._onPick);
             box.appendChild(sel);
             row.appendChild(col);
@@ -3642,7 +3651,7 @@ EJF_SD.responses = {
             sel.id = 'ejf-resp-select';
             sel.style.cssText = 'height:40px; box-sizing:border-box; padding:0 8px; border-radius:3px;' +
                 ' border:1px solid var(--ds-border-input,#8590a2); background:var(--ds-surface,#22272b);' +
-                ' color:var(--ds-text,#c7d1db); font-size:14px; outline:none; cursor:pointer;';
+                ' color:var(--ds-text,#c7d1db); color-scheme:dark; font-size:14px; outline:none; cursor:pointer;';
             sel.addEventListener('change', EJF_SD.responses._onPick);
             fcol.appendChild(sel);
             row.appendChild(fcol);
