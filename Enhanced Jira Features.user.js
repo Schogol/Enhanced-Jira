@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.25.0
+// @version     2.26.0
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -1996,7 +1996,7 @@ var pdmHtml = `
  * ========================================================================================= */
 var EJF_SD = {
     HOST: 'https://fenriscreations.atlassian.net',
-    SCOPE: 'project in (EDR, EO)',                 // dataset definition (tweak here to change scope)
+    SCOPE: 'project in (EDR, EO, PLAT)',           // defect dataset (crawled + embedded); shown as similar-defect candidates on EBR pages
     EBR_SCOPE: 'project = EBR AND statusCategory != Done',  // open bug reports, for the EDR "matching reports" view
     FIELDS: ['summary', 'description', 'status', 'resolution', 'resolutiondate', 'created', 'components', 'updated', 'project'],
     DB_NAME: 'EJF_SimilarDefects',
@@ -2020,12 +2020,14 @@ var EJF_SD = {
     })(),
     MODEL_VERSION: 'gte-small-v3',                  // embedding model tag; bump to force a full re-embed
                                                     // (v1 = NaN from fp16; v2 = fp32; v3 = boilerplate-stripped text)
-    DATA_VERSION: 1                                 // stored-record SCHEMA version. Bump whenever a sync change
-                                                    // adds/changes a FIELD on stored records that a plain
-                                                    // incremental catch-up can't backfill (it only re-fetches
-                                                    // CHANGED issues, so old rows keep the old shape). On load
-                                                    // EJF_SD.migrate auto-re-fetches any dataset stamped below
-                                                    // this. (v1 = added the `created` field for the row date.)
+    DATA_VERSION: 2                                 // stored-record SCHEMA version. Bump whenever a sync change
+                                                    // adds/changes a FIELD on stored records - OR widens the crawl
+                                                    // SCOPE - that a plain incremental catch-up can't backfill (it
+                                                    // only re-fetches CHANGED issues, so old rows / newly-in-scope
+                                                    // projects are missed). On load EJF_SD.migrate auto-re-fetches
+                                                    // any dataset stamped below this. (v1 = added the `created`
+                                                    // field; v2 = added PLAT to SCOPE -> full refetch backfills
+                                                    // existing PLAT defects.)
 };
 
 
@@ -4009,7 +4011,7 @@ EJF_SD.sync = {
     // Wipe the local DB and rebuild from scratch (also used after a model-version change in Phase 2).
     rebuild: function () {
         if (EJF_SD.sync.running) { EJF_SD.ui.toast('A sync is already running…'); return Promise.resolve(); }
-        if (!confirm('Rebuild the local defect database from scratch? This re-fetches every EDR/EO issue.')) { return Promise.resolve(); }
+        if (!confirm('Rebuild the local defect database from scratch? This re-fetches every EDR/EO/PLAT issue.')) { return Promise.resolve(); }
         EJF_SD.sync.running = true;
         EJF_SD.ui.toast('Rebuilding defect database…');
         return EJF_SD.db.clearDefects()
@@ -6571,14 +6573,14 @@ EJF_SD.ui = {
         });
     },
 
-    // Keys that are in the synced DEFECT scope (EJF_SD.SCOPE = "project in (EDR, EO)"), so the local DB
-    // already holds them. Gates the defect-side catch-up sync (_maybeSyncForDefect), which only makes sense
-    // for issues we actually crawl.
-    _isDefectKey: function (key) { return /^(EDR|EO)-/.test(key || ''); },
+    // Keys that are in the synced DEFECT scope (EJF_SD.SCOPE = "project in (EDR, EO, PLAT)"), so the local DB
+    // holds + embeds them and they surface as candidates in the EBR "similar defects" view. Gates the
+    // defect-side catch-up sync (_maybeSyncForDefect), which only makes sense for issues we actually crawl.
+    _isDefectKey: function (key) { return /^(EDR|EO|PLAT)-/.test(key || ''); },
 
-    // Keys that get the "Matching bug reports" (reverse) view: defects (EDR/EO) AND platform issues (PLAT).
-    // The view only needs the OPEN-EBR index (already synced) ranked against the current issue's text, so a
-    // PLAT issue - which is NOT in the crawled defect scope - can still be shown similar bug reports.
+    // Keys that get the "Matching bug reports" (reverse) view. Same set as _isDefectKey now that PLAT is
+    // crawled - kept as a distinct predicate to document the "shows the reverse view" intent (vs. "is in the
+    // crawled scope").
     _isReportsKey: function (key) { return /^(EDR|EO|PLAT)-/.test(key || ''); },
 
     // Show/refresh the panel on EBR bug reports (similar defects) AND on EDR/EO/PLAT issues (matching
