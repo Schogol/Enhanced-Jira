@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.26.0
+// @version     2.27.0
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -854,6 +854,10 @@ function SwapUI() {
     // parser, the one layout that has the search input.
     if ($('#ejf-log-search').length) {
         var ejfApplyLogFilter = function () {
+            // Drop the previous Nx badges before measuring row text, so a stale "52×" can't pollute the search
+            // match; ejfRegroupLog() re-adds them from the new visibility at the end of this pass.
+            var pb = document.querySelectorAll('#tableContent .ejf-rep-badge');
+            for (var pi = 0; pi < pb.length; pi++) { if (pb[pi].parentNode) { pb[pi].parentNode.removeChild(pb[pi]); } }
             var q = ($('#ejf-log-search').val() || '').toLowerCase();
             var off = {};
             $('#gnav a.toggle').each(function () { off[$(this).attr('id')] = true; });
@@ -869,6 +873,9 @@ function SwapUI() {
                 var matches = !q || (this.textContent || '').toLowerCase().indexOf(q) >= 0;
                 this.style.display = (!hiddenByToggle && matches) ? 'table-row' : 'none';
             });
+            // Re-collapse identical runs against the visibility we just computed (hiding a type can make
+            // previously-separated duplicates adjacent, so the "Nx" grouping must be recalculated here).
+            ejfRegroupLog();
         };
         var ejfSearchTimer = null;
         $('#ejf-log-search').on('input', function () {
@@ -1307,11 +1314,155 @@ function ParseLogs() {
     document.getElementById("tableContent").style.display = "table";
 
  /**
+ * "Group Repeats": segment the rendered rows into line / exception-block units and collapse consecutive
+ * identical ones into a single row with an "Nx" badge. Built BEFORE the async signature pass (so signatures
+ * are read from pristine message text) and grouped once for the initial (unfiltered) view; ejfApplyLogFilter
+ * re-runs the collapse after every filter / toggle so the batching tracks what's currently visible.
+ */
+    ejfBuildLogGroups();
+    ejfRegroupLog();
+
+ /**
  * Feature D: flag log lines that match a known exception signature mined from the defect DB, linking each
  * back to its defect. Runs async (index is built from IndexedDB) and patches the rendered rows in place.
  */
     if (typeof EJF_SD !== 'undefined' && EJF_SD.logsig) { EJF_SD.logsig.applyToTable(); }
 };
+
+
+/* ---- "Group Repeats": collapse consecutive identical log lines / exception blocks (main Log Parser) ----
+ * A run of consecutive IDENTICAL events - either a single line, or a whole EXCEPTION #…EXCEPTION END block -
+ * is collapsed to its first occurrence with an "Nx" count badge. "Identical" compares facility + type +
+ * message with the TIMESTAMP column excluded, so the same thing logged repeatedly (each with a different
+ * time) still groups.
+ *
+ * Crucially the collapse is recomputed by ejfRegroupLog() AFTER every filter / toggle pass, not once at parse
+ * time: hiding a message type (e.g. Notices) can make two identical errors - previously separated by a notice
+ * - become visually adjacent and therefore groupable. So ejfBuildLogGroups() runs ONCE (stamping each row with
+ * a unit id + a timestamp-free signature), and ejfRegroupLog() re-derives the badges from the CURRENT
+ * visibility on demand. A hidden unit between two duplicates is skipped (it doesn't break the run), which is
+ * exactly what makes "hide notices -> the errors around them batch together" work.
+ *
+ * The collapsed follower rows stay hidden - the "Nx" badge is an informational count only, not a toggle.
+ * (The "Group Repeats" nav button is the way to see every raw line again.)
+ */
+
+// Segment the rendered rows into "units" (a single line, or a full exception block) and stamp each row with
+// its unit id (data-ejf-grp) + the unit's timestamp-free signature (data-ejf-gsig on the unit's first row).
+// Runs once, right after the table is filled and BEFORE applyToTable rewrites any message cell, so the
+// signature is computed from the pristine message text.
+function ejfBuildLogGroups() {
+    var tbody = document.querySelector('#tableContent tbody');
+    if (!tbody) { return; }
+    var rows = tbody.rows, i = 0, unit = 0;
+    function cellText(tr, idx) { var c = tr.cells[idx]; return c ? (c.textContent || '') : ''; }
+    // Normalize the volatile bits that differ between repeats of the SAME exception so they still group. The
+    // header line ("EXCEPTION #5 logged at 03/12/2025 15:23:55") carries a per-instance counter AND a date/
+    // time INSIDE the message column, so without this every block's signature is unique and identical
+    // exceptions never batch. We also collapse the STACKTRACE counter, the per-instance Stackhash, and
+    // object-repr hex addresses (0x…), all of which vary between otherwise-identical dumps. (The row's own
+    // Time column is already excluded from the signature.)
+    function normSig(msg) {
+        return msg
+            .replace(/(EXCEPTION|STACKTRACE)\s+#\d+/gi, '$1 #')   // per-instance exception / stacktrace counter
+            .replace(/\d{1,2}\/\d{1,2}\/\d{2,4}/g, '#')           // dates (DD/MM/YYYY or MM/DD/YYYY)
+            .replace(/\d{1,2}:\d{2}:\d{2}/g, '#')                 // times (HH:MM:SS)
+            .replace(/Stackhash\s*:\s*-?\d+/gi, 'Stackhash: #')   // per-instance stack hash
+            .replace(/0x[0-9a-fA-F]+/gi, '0x#');                  // object-repr / memory addresses
+    }
+    function sigOf(tr) { return cellText(tr, 1) + '\x1f' + cellText(tr, 2) + '\x1f' + normSig(cellText(tr, 3)); }   // facility|type|normalized message (time excluded)
+    while (i < rows.length) {
+        var start = i, sig;
+        if (cellText(rows[i], 3).indexOf('EXCEPTION #') !== -1) {
+            // Exception BLOCK: gather rows until EXCEPTION END (inclusive) or the next EXCEPTION # - the same
+            // segmentation EJF_SD.logsig uses - so a whole repeated dump collapses as one unit.
+            var parts = [sigOf(rows[i])];
+            i++;
+            for (; i < rows.length; i++) {
+                var mt = cellText(rows[i], 3);
+                if (mt.indexOf('EXCEPTION #') !== -1) { break; }
+                parts.push(sigOf(rows[i]));
+                if (mt.indexOf('EXCEPTION END') !== -1) { i++; break; }
+            }
+            // EVE emits an empty error line after every EXCEPTION END. Absorb that trailing blank line (or
+            // several) into THIS block's ROW RANGE - but deliberately NOT into its signature `parts` - so it
+            // doesn't sit between two identical blocks as its own unit and break the run (which is what stops
+            // consecutive repeated exceptions from grouping). Keeping it out of the signature also means a
+            // stray trailing space can't make two otherwise-identical blocks look different.
+            while (i < rows.length && cellText(rows[i], 3).trim() === '') { i++; }
+            sig = 'B:' + parts.join('\x1e');
+        } else {
+            sig = 'L:' + sigOf(rows[i]);          // single LINE
+            i++;
+        }
+        for (var r = start; r < i; r++) { rows[r].setAttribute('data-ejf-grp', unit); }
+        rows[start].setAttribute('data-ejf-gsig', sig);
+        unit++;
+    }
+}
+
+// Re-derive the "Nx" badges from the CURRENT row visibility. Walks units in order, skipping any whose rows
+// are all hidden (so a filtered-out unit does NOT break a run of duplicates around it), and collapses
+// consecutive units that share a signature: the followers are hidden and the leader gets a count badge.
+// Called at the end of ejfApplyLogFilter (after every toggle / search) and once from ParseLogs.
+function ejfRegroupLog() {
+    var tbody = document.querySelector('#tableContent tbody');
+    if (!tbody) { return; }
+    // Clear our previous badges idempotently (never touch applyToTable's [EDR-x] link - only our own spans).
+    var oldBadges = tbody.querySelectorAll('.ejf-rep-badge');
+    for (var b = 0; b < oldBadges.length; b++) { if (oldBadges[b].parentNode) { oldBadges[b].parentNode.removeChild(oldBadges[b]); } }
+    // Grouping disabled: the "Group Repeats" nav toggle carries .toggle when OFF. The rows already hold the
+    // filter's base visibility (ejfApplyLogFilter reset every row before calling us), so just leave them.
+    var btn = document.getElementById('ejf-group-toggle');
+    if (btn && btn.classList.contains('toggle')) { return; }
+
+    var rows = tbody.rows;
+    var runSig = null, runLeaderRow = null, runCount = 0, runFirstTime = '', runLastTime = '';
+
+    function timeOf(tr) { var c = tr.cells[0]; return (c && c.textContent) || ''; }
+    function stamp() {
+        if (runCount <= 1 || !runLeaderRow) { return; }
+        var msg = runLeaderRow.cells[runLeaderRow.cells.length - 1];
+        if (!msg) { return; }
+        var badge = document.createElement('span');
+        badge.className = 'ejf-rep-badge';
+        badge.textContent = runCount + '×';   // informational count only (not a toggle)
+        var span = (runFirstTime && runLastTime && runFirstTime !== runLastTime) ? (runFirstTime + ' → ' + runLastTime) : (runFirstTime || '');
+        badge.title = runCount + ' identical in a row' + (span ? ' · ' + span : '');
+        msg.insertBefore(badge, msg.firstChild);
+    }
+
+    var i = 0;
+    while (i < rows.length) {
+        // Collect this unit's rows (the consecutive run sharing one data-ejf-grp); its signature lives on the
+        // first row.
+        var g = rows[i].getAttribute('data-ejf-grp'), unitRows = [], sig = null;
+        while (i < rows.length && rows[i].getAttribute('data-ejf-grp') === g) {
+            if (sig === null) { sig = rows[i].getAttribute('data-ejf-gsig'); }
+            unitRows.push(rows[i]);
+            i++;
+        }
+        // Rows of this unit that the current filter/toggle state leaves visible.
+        var visible = [];
+        for (var v = 0; v < unitRows.length; v++) { if (unitRows[v].style.display !== 'none') { visible.push(unitRows[v]); } }
+        if (!visible.length) { continue; }   // whole unit filtered out -> skip; do NOT break the current run
+
+        if (sig !== null && sig === runSig) {
+            // A duplicate of the current run's leader -> hide it (stays hidden; the badge is just a count).
+            runCount++;
+            runLastTime = timeOf(visible[visible.length - 1]) || runLastTime;
+            for (var h = 0; h < unitRows.length; h++) { unitRows[h].style.display = 'none'; }
+        } else {
+            stamp();   // close the previous run
+            runSig = sig;
+            runLeaderRow = visible[0];
+            runCount = 1;
+            runFirstTime = timeOf(visible[0]);
+            runLastTime = timeOf(visible[visible.length - 1]);
+        }
+    }
+    stamp();   // close the final run
+}
 
 
 // CSS for all parsed Logs
@@ -1658,6 +1809,20 @@ var cssLogParser = `
     .sig-hit-loose {
       box-shadow: inset 4px 0 0 #6b7785 !important;
     }
+
+    .ejf-rep-badge {
+      display: inline-block;
+      margin-right: 6px;
+      padding: 0 6px;
+      border-radius: 8px;
+      background: #3a434d;
+      color: #ffd479;
+      font-size: 10px;
+      font-weight: 700;
+      line-height: 16px;
+      vertical-align: middle;
+      user-select: none;
+    }
 `
 
 
@@ -1684,6 +1849,8 @@ var html = `
                <a href="#" id = "onlyexception" class="">Only Exceptions</a>
             <li id="button">
                <a href="#" id = "showAll">Show All</a>
+            <li id="button">
+               <a href="#" id = "ejf-group-toggle" class="" title="Collapse consecutive identical lines / exceptions into one row with an Nx count. Recomputed as you filter, so hiding a message type re-batches whatever becomes adjacent.">Group Repeats</a>
             <li id="searchli">
                <input id="ejf-log-search" type="text" placeholder="Filter…" autocomplete="off">
          </ul>
