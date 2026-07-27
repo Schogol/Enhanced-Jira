@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.27.0
+// @version     2.27.1
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -3833,11 +3833,40 @@ EJF_SD.responses = {
 /* ---- storage layer: IndexedDB ---- */
 EJF_SD.db = {
     _db: null,
+    _frame: null,
+
+    // Atlassian's consent gate (the parse-gates-and-init-controls early-entry script) now WRAPS the page's
+    // window.indexedDB and rejects open() with "The database was blocked by consent preferences" unless the
+    // user has consented to the matching cookie category. Our cache is first-party FUNCTIONAL storage (no
+    // tracking), so we sidestep the wrapper by taking a PRISTINE IDBFactory from a freshly-created, same-origin
+    // about:blank iframe - a realm the gate script never executed in, so its indexedDB / IDBKeyRange are the
+    // untouched native APIs. Same origin => same database, so already-synced data is preserved. The iframe must
+    // stay attached for the lifetime of every DB connection (removing it would close the connection), so we
+    // create it once and cache it. Falls back to the (possibly gated) main-window APIs if the iframe trick fails.
+    _win: function () {
+        if (EJF_SD.db._frame && EJF_SD.db._frame.contentWindow && EJF_SD.db._frame.contentWindow.indexedDB) {
+            return EJF_SD.db._frame.contentWindow;
+        }
+        try {
+            var f = document.createElement('iframe');
+            f.style.display = 'none';
+            f.setAttribute('aria-hidden', 'true');
+            (document.documentElement || document.body).appendChild(f);
+            if (f.contentWindow && f.contentWindow.indexedDB) { EJF_SD.db._frame = f; return f.contentWindow; }
+            if (f.parentNode) { f.parentNode.removeChild(f); }
+        } catch (e) { /* fall through to the main window */ }
+        return window;
+    },
+    // Native IDBFactory + IDBKeyRange from the pristine iframe realm (see _win). Use these EVERYWHERE instead
+    // of window.indexedDB / IDBKeyRange, and keep the key-range from the SAME realm as the connection so a
+    // cross-realm IDBKeyRange isn't rejected.
+    _idb: function () { return EJF_SD.db._win().indexedDB || window.indexedDB; },
+    _keyRange: function () { return EJF_SD.db._win().IDBKeyRange || window.IDBKeyRange; },
 
     open: function () {
         if (EJF_SD.db._db) { return Promise.resolve(EJF_SD.db._db); }
         return new Promise(function (resolve, reject) {
-            var req = window.indexedDB.open(EJF_SD.DB_NAME, EJF_SD.DB_VERSION);
+            var req = EJF_SD.db._idb().open(EJF_SD.DB_NAME, EJF_SD.DB_VERSION);
             req.onupgradeneeded = function (e) {
                 var db = e.target.result;
                 if (!db.objectStoreNames.contains('defects')) {
@@ -3940,7 +3969,7 @@ EJF_SD.db = {
     countByProject: function (project) {
         return EJF_SD.db.open().then(function () {
             return new Promise(function (resolve, reject) {
-                var r = EJF_SD.db._store('defects', 'readonly').index('by_project').count(IDBKeyRange.only(project));
+                var r = EJF_SD.db._store('defects', 'readonly').index('by_project').count(EJF_SD.db._keyRange().only(project));
                 r.onsuccess = function () { resolve(r.result || 0); };
                 r.onerror = function (e) { reject(e.target.error); };
             });
