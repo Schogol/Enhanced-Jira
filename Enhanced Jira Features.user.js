@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.27.1
+// @version     2.30.0
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -9,8 +9,7 @@
 // @match       https://fenriscreations.atlassian.net/browse*
 // @match       https://fenriscreations.atlassian.net/issues*
 // @match       https://*.cdn.prod.atlassian-dev.net/*
-// @require     https://gist.github.com/raw/2625891/waitForKeyElements.js
-// @require     https://ajax.googleapis.com/ajax/libs/jquery/3.3.1/jquery.min.js
+// @require     https://ajax.googleapis.com/ajax/libs/jquery/3.7.1/jquery.min.js#sha256=/JqT3SQfawRcv/BIHPThkBvs0OEvtFFmqPF/lYI/Cxo=
 // @grant       GM_addStyle
 // @grant       GM_getValue
 // @grant       GM_setValue
@@ -27,13 +26,68 @@
 /* global $ */
 
 
+// waitForKeyElements(): utility that polls the (AJAXed) DOM for elements matching a jQuery selector and runs a
+// callback once per new element (marked via jQuery .data('alreadyFound') so each node fires only once). Vendored
+// INLINE (verbatim, by Brock Adams - gist BrockA/2625891) instead of the old `@require .../waitForKeyElements.js`:
+// that gist used GitHub's deprecated raw-URL scheme and was unpinned, so it was a fragile, mutable third-party
+// dependency that gated this script's ENTIRE init. Inlining it makes the script self-contained. Requires jQuery.
+function waitForKeyElements(selectorTxt, actionFunction, bWaitOnce, iframeSelector) {
+    var targetNodes, btargetsFound;
 
-// Creating various variables which we use later on
-var rows, oc, lc, pdm, pdmdata, driverAge = "unknown", menu_settings, menu_parser, menu_scrollbar, menu_buttons, menu_similarDefects, menu_sdSync, menu_sdRebuild, menu_sdBackend, menu_sdSyncEbr;
+    if (typeof iframeSelector == "undefined")
+        targetNodes = $(selectorTxt);
+    else
+        targetNodes = $(iframeSelector).contents().find(selectorTxt);
+
+    if (targetNodes && targetNodes.length > 0) {
+        btargetsFound = true;
+        // Found target node(s). Go through each and act if they are new.
+        targetNodes.each(function () {
+            var jThis = $(this);
+            var alreadyFound = jThis.data('alreadyFound') || false;
+
+            if (!alreadyFound) {
+                var cancelFound = actionFunction(jThis);
+                if (cancelFound)
+                    btargetsFound = false;
+                else
+                    jThis.data('alreadyFound', true);
+            }
+        });
+    }
+    else {
+        btargetsFound = false;
+    }
+
+    // Get the timer-control variable for this selector.
+    var controlObj = waitForKeyElements.controlObj || {};
+    var controlKey = selectorTxt.replace(/[^\w]/g, "_");
+    var timeControl = controlObj[controlKey];
+
+    // Now set or clear the timer as appropriate.
+    if (btargetsFound && bWaitOnce && timeControl) {
+        // The only condition where we need to clear the timer.
+        clearInterval(timeControl);
+        delete controlObj[controlKey];
+    }
+    else {
+        // Set a timer, if needed.
+        if (!timeControl) {
+            timeControl = setInterval(function () {
+                waitForKeyElements(selectorTxt, actionFunction, bWaitOnce, iframeSelector);
+            }, 300);
+            controlObj[controlKey] = timeControl;
+        }
+    }
+    waitForKeyElements.controlObj = controlObj;
+}
 
 
-// Current Date
-var today = new Date();
+// Shared globals for the log-file parser flow: the detection / click handlers and the deferred Parse* pass run
+// on separate ticks (setTimeout), so these carry state across that gap. `rows` = the raw file text;
+// `oc`/`lc`/`pdm` = which igbr.zip attachment was opened. (pdmdata / today / driverAge are now locals - the
+// driver age is written straight into #driverAge by renderRequirements; menu_settings was an unused handle.)
+var rows, oc, lc, pdm;
 
 
 // True when this script instance is running INSIDE the Zendesk Support Forge panel's cross-origin iframe
@@ -47,6 +101,18 @@ var EJF_IS_FORGE_FRAME = (function () {
 })();
 
 
+// Safe GM storage wrappers. Return `dflt` when the API isn't granted (some frames / managers) or on any
+// error, so callers don't repeat the `try { if (typeof GM_getValue === 'function') {…} } catch {}` guard.
+// gmSet is a no-op when unavailable.
+function gmGet(key, dflt) {
+    try { if (typeof GM_getValue === 'function') { return GM_getValue(key, dflt); } } catch (e) { /* ignore */ }
+    return dflt;
+}
+function gmSet(key, val) {
+    try { if (typeof GM_setValue === 'function') { GM_setValue(key, val); } } catch (e) { /* ignore */ }
+}
+
+
 // Array which contains the locally saved values for a couple of variables.
 // NOTE: index 3 ("dropdowns") is a RETIRED feature (Linked Issue Dropdowns, removed because Jira's markup
 // changed and it stopped working). The slot is kept as a placeholder so the later indices (4 = buttons,
@@ -54,17 +120,22 @@ var EJF_IS_FORGE_FRAME = (function () {
 var savedVariables = [["key",""], ["parser", ""], ["scrollbar", ""], ["dropdowns_retired", ""], ["buttons", ""], ["similarDefects", ""]];
 
 
+// Custom-scrollbar CSS, injected on load (when enabled) and by the scrollbar change-listener below. The
+// removal path matches on the leading "*::-webkit-scrollbar { width: 11px…}" rule, so keep that first rule
+// verbatim (and the rules run together, no separators, exactly as the old inline strings did).
+var SCROLLBAR_CSS =
+    '*::-webkit-scrollbar { width: 11px !important; height: 11px !important;}' +
+    '*::-webkit-scrollbar-thumb { border-radius: 10px !important; background: linear-gradient(left, #96A6BF, #63738C) !important;box-shadow: inset 0 0 1px 1px #828f9e !important;}' +
+    '.notion-scroller.horizontal { margin-bottom: 30px !important;}' +
+    '.notion-scroller.vertical { margin-bottom: 0px !important;}';
+
+
 // Listener which triggers when the locally saved "scrollbar" value is changed. If the new value is false we remove the custom scrollbar. If the new value is true we add the custom scrollbar.
 GM_addValueChangeListener("scrollbar", function(key, oldValue, newValue, remote) {
     if (!newValue) {
         $('style:contains("*::-webkit-scrollbar { width: 11px !important; height: 11px !important;}")').remove();
     } else {
-        GM_addStyle(
-            '*::-webkit-scrollbar { width: 11px !important; height: 11px !important;}\
-*::-webkit-scrollbar-thumb { border-radius: 10px !important; background: linear-gradient(left, #96A6BF, #63738C) !important;box-shadow: inset 0 0 1px 1px #828f9e !important;}\
-.notion-scroller.horizontal { margin-bottom: 30px !important;}\
-.notion-scroller.vertical { margin-bottom: 0px !important;}'
-        );
+        GM_addStyle(SCROLLBAR_CSS);
     }
 });
 
@@ -108,12 +179,7 @@ if (typeof GM_getValue === 'function' && typeof GM_setValue === 'function') {
 
 // Activate a custom scrollbar if the scrollbar value is set to true
 if (savedVariables[2][1]) {
-    GM_addStyle(
-`*::-webkit-scrollbar { width: 11px !important; height: 11px !important;}\
-*::-webkit-scrollbar-thumb { border-radius: 10px !important; background: linear-gradient(left, #96A6BF, #63738C) !important;box-shadow: inset 0 0 1px 1px #828f9e !important;}\
-.notion-scroller.horizontal { margin-bottom: 30px !important;}\
-.notion-scroller.vertical { margin-bottom: 0px !important;}`
-    );
+    GM_addStyle(SCROLLBAR_CSS);
 };
 
 
@@ -121,7 +187,7 @@ if (savedVariables[2][1]) {
 // embedding backend) live in an in-page settings overlay (EJF_SD.menu) instead of a long flat list of GM
 // menu commands. The callback references EJF_SD lazily, so it's fine that the namespace is defined later.
 if (!EJF_IS_FORGE_FRAME) {
-    menu_settings = GM_registerMenuCommand("⚙ Enhanced Jira – Settings…", function () {
+    GM_registerMenuCommand("⚙ Enhanced Jira – Settings…", function () {
         if (typeof EJF_SD !== 'undefined' && EJF_SD.menu) { EJF_SD.menu.open(); }
     });
 }
@@ -134,7 +200,7 @@ if (!EJF_IS_FORGE_FRAME) {
 // rebuilds cleanly on the chosen backend - embedding is resumable, so a reload never loses progress, and any
 // already-stored vectors stay valid (same model/version; q8 vs fp32 is just minor quantization noise).
 function toggleEmbedBackend() {
-    var gpuOn = (typeof GM_getValue !== 'function') || (GM_getValue('sdTryWebgpu', true) && !GM_getValue('sdForceCpu', false));
+    var gpuOn = gmGet('sdTryWebgpu', true) && !gmGet('sdForceCpu', false);
     if (gpuOn) {
         GM_setValue('sdTryWebgpu', false);   // back to CPU/WASM
         GM_setValue('sdForceCpu', false);
@@ -154,52 +220,13 @@ function refreshMenu() {
 }
 
 
-/*
-// This function could replace the following 4 functions if Tampermonkey accepted parameters in the GM_registerMenuCommand function
-
+// Flip savedVariables[i] between true/false, persist it, and re-render the settings overlay (if open) so its
+// switch reflects the new state. Shared core of every feature toggle: the in-page settings menu wires each
+// switch to toggleFeature(index) via EJF_SD.menu._toggleRow, and a feature that needs extra work on change
+// (e.g. the Triage Assistant tearing down / re-mounting its panel) passes an onAfter callback there.
 function toggleFeature(i) {
-    savedVariables[i][1] = savedVariables[i][1] ? false : true;
-    GM_setValue (savedVariables[i][0], savedVariables[i][1]);
-};
-*/
-
-
-// Function which toggles between true and false for the parser variable and saves it locally
-function toggleParser() {
-    savedVariables[1][1] = savedVariables[1][1] ? false : true;
-    GM_setValue (savedVariables[1][0], savedVariables[1][1]);
-    refreshMenu();
-};
-
-
-// Function which toggles between true and false for the scrollbar variable and saves it locally
-function toggleScrollbar() {
-    savedVariables[2][1] = savedVariables[2][1] ? false : true;
-    GM_setValue (savedVariables[2][0], savedVariables[2][1]);
-    refreshMenu();
-};
-
-
-// Function which toggles between true and false for the buttons variable and saves it locally
-function toggleButtons() {
-    savedVariables[4][1] = savedVariables[4][1] ? false : true;
-    GM_setValue (savedVariables[4][0], savedVariables[4][1]);
-    refreshMenu();
-};
-
-
-// Function which toggles the "Similar Defects" suggestions feature on / off and saves it locally.
-// When turned off we also remove the panel immediately.
-function toggleSimilarDefects() {
-    savedVariables[5][1] = savedVariables[5][1] ? false : true;
-    GM_setValue (savedVariables[5][0], savedVariables[5][1]);
-    if (!savedVariables[5][1]) {
-        $('#ejf-sd-panel').remove();
-        $('#ejf-side-group').remove();
-        if (typeof EJF_SD !== 'undefined') { EJF_SD.ui.currentKey = null; }
-    } else if (typeof EJF_SD !== 'undefined') {
-        EJF_SD.ui.ensure();
-    }
+    savedVariables[i][1] = !savedVariables[i][1];
+    GM_setValue(savedVariables[i][0], savedVariables[i][1]);
     refreshMenu();
 };
 
@@ -414,32 +441,43 @@ function ejfTranslateFree(text) {
 }
 
 
+// Standard $.ajax error handler for the action buttons: log the raw response, then alert `msg` (default: the
+// generic failure text) followed by the shared "check console / report to Schogol" tail. Returns the handler.
+function ejfAjaxError(msg) {
+    return function (data) {
+        console.log(JSON.stringify(data));
+        alert((msg || 'This failed for some reason.') + ' Check Console for errors and report issues to Schogol :).');
+    };
+}
+
 // Adds the different buttons to the "command-bar" and defines what they do
 function addButtons() {
     // Variable which contains the current Issue ID which we need
     var issueID = $('a[data-testid="issue.views.issue-base.foundation.breadcrumbs.current-issue.item"]').text();
 
-    // Grabbing the button and span class for the buttons (which constantly changes because react + atlassian ~_~)
-    let buttonClass = $('button[data-testid="issue-view-foundation.quick-add.quick-add-items-compact.apps-button-dropdown--trigger"]').attr('class');
-    let innerSpanClass = $('button[data-testid="issue-view-foundation.quick-add.quick-add-items-compact.apps-button-dropdown--trigger"]').find('span').eq(0).attr('class');
-    let iconSpanClass = $('button[data-testid="issue-view-foundation.quick-add.quick-add-items-compact.apps-button-dropdown--trigger"]').find('span').eq(1).attr('class');
-    let labelSpanClass = $('button[data-testid="issue-view-foundation.quick-add.quick-add-items-compact.apps-button-dropdown--trigger"]').find('span').eq(2).attr('class');
+    // The native quick-add trigger: we copy its (react-churned) classes to style our buttons like it, and
+    // insert ours right after it.
+    var TRIGGER_SEL = 'button[data-testid="issue-view-foundation.quick-add.quick-add-items-compact.apps-button-dropdown--trigger"]';
+    let buttonClass = $(TRIGGER_SEL).attr('class');
+    let innerSpanClass = $(TRIGGER_SEL).find('span').eq(0).attr('class');
 
-    // Jira cloud ID which we need for some of the POST requests we send
-    let ajscloudid = $('meta[name="ajs-cloud-id"]').attr('content');
-
+    // Build one command-bar button (styled to match the trigger) and insert it after the trigger, unless it's
+    // already present. A native <button> is keyboard-focusable in natural DOM order and takes its accessible
+    // name from the visible label, so no tabindex / aria-label is needed. Click handlers are wired below.
+    function addActionButton(id, label) {
+        if ($('#' + id).length) { return; }
+        var $btn = $(
+            '<button id="' + id + '" type="button" class="' + buttonClass + '" ' +
+            'style="margin-left: 8px; width: fit-content; padding: 6px 8px 6px 3px; white-space: nowrap; display: inline-flex; align-items: center;">' +
+            '<span class="' + innerSpanClass + '"></span>' +
+            '<span style="font-size: 13px;">' + label + '</span>' +
+            '</button>'
+        );
+        $(TRIGGER_SEL).after($btn);
+    }
 
     // Create Translate Button
-if ($('#translateButton').length === 0) {
-  var translateButton = $(
-    '<button id="translateButton" type="button" tabindex="1" class="' + buttonClass + '" ' +
-    'style="margin-left: 8px; width: fit-content; padding: 6px 8px 6px 3px; white-space: nowrap; display: inline-flex; align-items: center;">' +
-    '<span class="' + innerSpanClass + '"></span>' +
-    '<span style="font-size: 13px;">Translate</span>' +
-    '</button>'
-    );
-    $('button[data-testid="issue-view-foundation.quick-add.quick-add-items-compact.apps-button-dropdown--trigger"]').after(translateButton);
-    }
+    addActionButton('translateButton', 'Translate');
 
     // When the translate button is clicked we translate the Issue title + description blocks to English via
     // Google's FREE keyless gtx endpoint (ejfTranslateFree). One request per text, run in parallel, then we
@@ -490,16 +528,7 @@ if ($('#translateButton').length === 0) {
 
 
     // Create GM Button
-if ($('#GMButton').length === 0) {
-  var GMButton = $(
-    '<button id="GMButton" aria-label="GMButton" class="' + buttonClass + '" type="button" tabindex="1" ' +
-    'style="margin-left: 8px; width: fit-content; padding: 6px 8px 6px 3px; white-space: nowrap; display: inline-flex; align-items: center;">' +
-    '<span class="' + innerSpanClass + '"></span>' +
-    '<span style="font-size: 13px;">Assign to GM</span>' +
-    '</button>'
-    );
-    $('button[data-testid="issue-view-foundation.quick-add.quick-add-items-compact.apps-button-dropdown--trigger"]').after(GMButton);
-    }
+    addActionButton('GMButton', 'Assign to GM');
 
     // When the Assign to GM button is clicked we change the Team to "EO - Game Masters" and also visually change the field so the user sees that it worked.
     $("#GMButton").click(function () {
@@ -526,35 +555,20 @@ if ($('#GMButton').length === 0) {
                     },
 
                     // If we get an Error we annoy the user by telling them that it failed and to check their Dev Console for errors
-                    error: function(data){
-                        console.log(JSON.stringify(data));
-                        alert("Wasn't able to change Assignee field to 'Unassigned'. Check Console for errors and report issues to Schogol :).");
-                    }
+                    error: ejfAjaxError("Wasn't able to change Assignee field to 'Unassigned'.")
                 });
 
             },
 
             // If we get an Error then we annoy the user by telling them that it failed and to check their Dev Console for errors
-            error: function(data){
-                console.log(JSON.stringify(data));
-                alert("This failed for some reason. Check Console for errors and report issues to Schogol :).");
-            }
+            error: ejfAjaxError()
         })
     });
 
 
 
     // Create Convert To Defect Button
-if ($('#convertToDefectButton').length === 0) {
-  var convertToDefectButton = $(
-    '<button id="convertToDefectButton" aria-label="ConvertToDefect" class="' + buttonClass + '" type="button" tabindex="0" ' +
-    'style="margin-left: 8px; width: fit-content; padding: 6px 8px 6px 3px; white-space: nowrap; display: inline-flex; align-items: center;">' +
-    '<span class="' + innerSpanClass + '"></span>' +
-    '<span style="font-size: 13px;">Convert to Defect</span>' +
-    '</button>'
-    );
-    $('button[data-testid="issue-view-foundation.quick-add.quick-add-items-compact.apps-button-dropdown--trigger"]').after(convertToDefectButton);
-    }
+    addActionButton('convertToDefectButton', 'Convert to Defect');
     // When the Convert to Defect button is clicked we trigger the Automation which converts the EBR into an EDR issue
     $("#convertToDefectButton").click(function () {
         let ajscloudid = $('meta[name="ajs-cloud-id"]').attr('content');
@@ -581,47 +595,24 @@ if ($('#convertToDefectButton').length === 0) {
             },
 
             // If we get an Error then we annoy the user by telling them that it failed and to check their Dev Console for errors
-            error: function(data){
-                console.log(JSON.stringify(data));
-                alert("This failed for some reason. Check Console for errors and report issues to Schogol :).");
-            }
+            error: ejfAjaxError()
         })
             },
 
             // If we get an Error then we annoy the user by telling them that it failed and to check their Dev Console for errors
-            error: function(data){
-                console.log(JSON.stringify(data));
-                alert("This failed for some reason. Check Console for errors and report issues to Schogol :).");
-            }
+            error: ejfAjaxError()
         })
     });
 
 
     // Create close button
-if ($('#closeButton').length === 0) {
-  var closeButton = $(
-    '<button id="closeButton" aria-label="Close Button" class="' + buttonClass + '" type="button" tabindex="1" ' +
-    'style="margin-left: 8px; width: fit-content; padding: 6px 8px 6px 3px; white-space: nowrap; display: inline-flex; align-items: center;">' +
-    '<span class="' + innerSpanClass + '"></span>' +
-    '<span style="font-size: 13px;">Close</span>' +
-    '</button>'
-    );
-    $('button[data-testid="issue-view-foundation.quick-add.quick-add-items-compact.apps-button-dropdown--trigger"]').after(closeButton);
-    }
+    addActionButton('closeButton', 'Close');
     // When the Close button is clicked we change the status to Closed by simulating clicks on the relevant buttons. This is extremely janky right now because I cant figure out a better way to do this.
     $("#closeButton").click(function () {
         $("div[data-testid='issue.views.issue-base.foundation.status.status-field-wrapper']").find("button").click()
         setTimeout(function(){$("div[data-testid='issue.fields.status.common.ui.status-lozenge.3']").children().find("span:contains(Closed)").click();}, 100);
     });
 };
-
-
-// Adds the "toggleText()" function to jQuery which lets you easily toggle between two given texts
-$.fn.extend({
-    toggleText: function(a, b){
-        return this.text(this.text() == b ? a : b);
-    }
-});
 
 
 // When we detect the "title row" of a log parser file then we swap out the content of the log file with a parsed, more readable version of it with some extra features like buttons which allow you to toggle the visibility of certain types of events
@@ -663,22 +654,44 @@ var pdmSelector = 'span[data-item-title="true"]:contains(PDMData.txt)';
 waitForKeyElements(pdmSelector, addClickEvent3);
 
 
-//Once we click on the outstandingcalls.txt we set the oc variable to true and run the SwapUI function after 750ms (to give it some time to load)
-function addClickEvent() {
-    $("button:contains('outstandingcalls.txt')").on('click', function() {oc = true; setTimeout(SwapUI, 750)});
+// outstandingcalls.txt / lastcrashes.txt / PDMData.txt load their text ASYNCHRONOUSLY into the
+// <span data-testid="code-block"> after the file button is clicked. The old code just waited a fixed 750ms and
+// hoped the content had arrived - if the load was slower, SwapUI parsed empty/stale content and you were out
+// of luck. Instead, poll for THIS file's raw text to appear in the code-block and only then set the parser flag
+// + run SwapUI. A naive "content changed -> fire" poll corrupts, so it's guarded on four fronts:
+//   1. Generation token - a NEWER click (incl. a double-click of the same file) supersedes an earlier poller,
+//      so stale pollers can't fire.
+//   2. Empty file - the content never changes, so we simply time out and DON'T parse (rather than firing later
+//      on whatever unrelated content loads next). This is the reported bug: an empty outstandingcalls.txt left
+//      a poller running that then grabbed methodcalls' content / our own injected parser CSS.
+//   3. #tableContent present - our (or another file's) parser markup is currently mounted, so the raw file text
+//      isn't showing; keep waiting for the viewer to swap it back in.
+//   4. HEADER_SIG - a header-based file (log / processHealth / methodCalls) loaded instead; those are handled
+//      by waitForKeyElements+SwapUI, so we must not grab them as our oc/lc/pdm file.
+// `setFlag` marks which parser branch SwapUI takes (oc / lc / pdm).
+var ejfParserGen = 0;
+function ejfRunParserWhenLoaded(setFlag) {
+    var myGen = ++ejfParserGen;
+    var CB = "span[data-testid='code-block']";
+    var HEADER_SIG = /Time\tFacility\tType\tMessage|dateTime\tpyDateTime\tprocCpu|Time\tMethod\tDuration/;
+    var before = ($(CB).text() || '').trim();
+    var start = Date.now(), MAX = 8000, POLL = 100;
+    (function poll() {
+        if (myGen !== ejfParserGen) { return; }                 // superseded by a newer click
+        if (Date.now() - start > MAX) { return; }               // empty / never-loaded file -> don't parse
+        var $cb = $(CB), now = ($cb.text() || '').trim();
+        var ready = !document.getElementById('tableContent')    // no parser markup currently mounted
+            && $cb.length && now && now !== before              // new, non-empty raw content
+            && !HEADER_SIG.test(now);                           // ...and not a header-based file (not ours)
+        if (ready) { setFlag(); SwapUI(); return; }
+        setTimeout(poll, POLL);
+    })();
 }
 
-
-//Once we click on the lastcrashes.txt we set the lc variable to true and run the SwapUI function after 750ms (to give it some time to load)
-function addClickEvent2() {
-    $("button:contains('lastcrashes.txt')").on('click', function() {lc = true; setTimeout(SwapUI, 750)});
-}
-
-
-//Once we click on the PDMData.txt we set the pdm variable to true and run the SwapUI function after 750ms (to give it some time to load)
-function addClickEvent3() {
-    $("button:contains('PDMData.txt')").on('click', function() {pdm = true; setTimeout(SwapUI, 750)});
-}
+// Once one of these attachment buttons is clicked, parse the file as soon as its content has loaded.
+function addClickEvent()  { $("button:contains('outstandingcalls.txt')").on('click', function () { ejfRunParserWhenLoaded(function () { oc = true; }); }); }
+function addClickEvent2() { $("button:contains('lastcrashes.txt')").on('click', function () { ejfRunParserWhenLoaded(function () { lc = true; }); }); }
+function addClickEvent3() { $("button:contains('PDMData.txt')").on('click', function () { ejfRunParserWhenLoaded(function () { pdm = true; }); }); }
 
 
 // Reads the complete text of a file rendered by the new CodeMirror-based viewer.
@@ -700,7 +713,7 @@ function getCmDocText() {
 
     var pageCode =
         '(function(){var out=document.getElementById(' + JSON.stringify(NODE_ID) + ');try{' +
-        'var c=document.querySelector(".cm-content");' +
+        'var c=document.querySelector(".cm-content[data-ejf-cmsrc]")||document.querySelector(".cm-content");' +
         'var dv=c&&c.cmView;' +
         'var v=dv&&(dv.view||(dv.rootView&&dv.rootView.view)||dv.editorView);' +
         'out.textContent=(v&&v.state)?v.state.doc.toString():"";' +
@@ -718,16 +731,39 @@ function getCmDocText() {
 }
 
 
+// Shared code-block prep for the igbr.zip (<span data-testid="code-block">) parser branches: drop empty spans
+// + inline comment spans, then read the raw file text into the module-level `rows`. Returns `rows`.
+function readCodeBlock() {
+    $('code > span:empty').remove();
+    $('span[data-testid="code-block"]').find('span > span.comment').remove();
+    rows = $("span[data-testid='code-block']").text();
+    return rows;
+}
+
+// Prep the code-block, replace it with `viewHtml`, then kick off `parseFn` once the parser markup has mounted.
+// Used by the log / processHealth / methodCalls / outstandingCalls / lastCrashes branches of SwapUI.
+function mountParser(viewHtml, parseFn) {
+    readCodeBlock();
+    $("span[data-testid='code-block']").html(viewHtml);
+    setTimeout(parseFn, 250);
+}
+
+
 // Swap out the UI when looking at a log file and add the buttons to toggle message types at the top of the page
 function SwapUI() {
     // --- New CodeMirror-based viewer (files attached directly to the report) ---
     // Detect the file type from its (always-rendered) header row, pull the complete text straight out of
     // CodeMirror's state, drop our parser UI into the editor container, then reuse the existing parsers.
     // Files inside the igbr.zip still use the old <span> layout and are handled by the original code below.
-    if ($('.cm-content').length && !$("span[data-testid='code-block']").length && savedVariables[1][1]
-        && $(".cm-line:contains(Time\tFacility\tType\tMessage)")[0]) {
-        rows = getCmDocText();
-        $('.cm-editor').html(html);
+    // Scope everything to the ONE editor that holds the log header row: the page can contain OTHER CodeMirror
+    // editors (a ``` code block in the comment box is also a .cm-editor / .cm-content), and operating on all of
+    // them read the wrong (comment) text into `rows` AND injected the "Logfile Parser" UI into the comment box.
+    var $logEd = $(".cm-line:contains(Time\tFacility\tType\tMessage)").first().closest('.cm-editor');
+    if ($logEd.length && !$("span[data-testid='code-block']").length && savedVariables[1][1]) {
+        var $cm = $logEd.find('.cm-content').first().attr('data-ejf-cmsrc', '1');   // mark the exact source editor
+        rows = getCmDocText();                                                       // reads the marked .cm-content
+        $cm.removeAttr('data-ejf-cmsrc');
+        $logEd.html(html);
         // The parser's scrollable #table is position:absolute (top:85px; bottom:0), so it sizes itself
         // against the nearest positioned ancestor. In the old <span> viewer that ancestor filled the screen;
         // CodeMirror's .cm-editor is position:relative but only a sliver tall, which collapses #table and
@@ -741,80 +777,34 @@ function SwapUI() {
     }
 
     else if ($("span[data-testid='code-block']:contains(Time	Facility	Type	Message)")[0] && savedVariables[1][1]) {
-        $('code > span:empty').remove();
-        $('span[data-testid="code-block"]').find('span > span.comment').remove();
-        rows = $("span[data-testid='code-block']").text();
-        $("span[data-testid='code-block']").html(html);
-        setTimeout(ParseLogs, 250);
+        mountParser(html, ParseLogs);
     }
 
     else if ($("span[data-testid='code-block']:contains(dateTime	pyDateTime	procCpu	threadCpu	pyMem	virtualMem	taskletsProcessed	taskletsQueued	watchdog time	spf	serviceCalls	callsFromClient	bytesReceived	bytesSent	packetsReceived	packetsSent	sessionCount	tidiFactor)")[0] && savedVariables[1][1]) {
-        $('code > span:empty').remove();
-        $('span[data-testid="code-block"]').find('span > span.comment').remove();
-        rows = $("span[data-testid='code-block']").text();
-        $("span[data-testid='code-block']").html(phHtml);
-        setTimeout(ParsePhLogs, 250);
+        mountParser(phHtml, ParsePhLogs);
     }
 
     else if ($("span[data-testid='code-block']:contains(Time	Method	Duration [ms])")[0] && savedVariables[1][1]) {
-        $('code > span:empty').remove();
-        $('span[data-testid="code-block"]').find('span > span.comment').remove();
-        rows = $("span[data-testid='code-block']").text();
-        $("span[data-testid='code-block']").html(McHtml);
-        setTimeout(ParseMcLogs, 250);
+        mountParser(McHtml, ParseMcLogs);
     }
 
     else if (oc && savedVariables[1][1]) {
-        $('code > span:empty').remove();
-        $('span[data-testid="code-block"]').find('span > span.comment').remove();
-        rows = $("span[data-testid='code-block']").text();
-        $("span[data-testid='code-block']").html(ocHtml);
         oc = false;
-        setTimeout(ParseOcLogs, 250);
+        mountParser(ocHtml, ParseOcLogs);
     }
 
     else if (lc && savedVariables[1][1]) {
-        $('code > span:empty').remove();
-        $('span[data-testid="code-block"]').find('span > span.comment').remove();
-        rows = $("span[data-testid='code-block']").text();
-        $("span[data-testid='code-block']").html(lcHtml);
         lc = false;
-        setTimeout(ParseOcLogs, 250);
+        mountParser(lcHtml, ParseOcLogs);
     }
 
     else if (pdm && savedVariables[1][1]) {
-        $('code > span:empty').remove();
-        $('span[data-testid="code-block"]').find('span > span.comment').remove();
-        rows = $("span[data-testid='code-block']").text();
+        readCodeBlock();
         $("span[data-testid='code-block']").append(pdmHtml);
-        pdmdata = convertTextToObject(rows);
-
-        switch (pdmdata.DATA.OS.TYPE) {
-            case "Windows":
-                switch (true) {
-                    case ((Number(pdmdata.DATA.OS.BUILD_NUMBER) >= Number(recRequirements.OS.Windows.BuildNo)) && (pdmdata.DATA.MACHINE.CPU.VENDOR == "AuthenticAMD") && (Number(pdmdata.DATA.MACHINE.CPU.LOGICAL_CORE_COUNT) >= Number(recRequirements.CPU.AMD.Cores)) && (Number(pdmdata.DATA.MACHINE.CPU.FREQUENCY_MHZ) >= Number(recRequirements.CPU.AMD.Frequency)) && (Number(pdmdata.DATA.OS.GRAPHICS_APIS.D3D_HIGHEST_SUPPORT) >= Number(recRequirements.Graphics.D3D_SUPPORT)) && (Number(pdmdata.DATA.MACHINE.GPUS.GPU.VIDEO_MEMORY) >= Number(recRequirements.Graphics.Video_Memory)) && (Number(pdmdata.DATA.MACHINE.TOTAL_MEMORY) >= Number(recRequirements.RAM))) : $('#Requirements').html('This PC <u><b>does</b></u> meet the recommended requirements for EVE.'); break;
-                    case ((Number(pdmdata.DATA.OS.BUILD_NUMBER) >= Number(minRequirements.OS.Windows.BuildNo)) && (pdmdata.DATA.MACHINE.CPU.VENDOR == "AuthenticAMD") && (Number(pdmdata.DATA.MACHINE.CPU.LOGICAL_CORE_COUNT) >= Number(minRequirements.CPU.AMD.Cores)) && (Number(pdmdata.DATA.MACHINE.CPU.FREQUENCY_MHZ) >= Number(minRequirements.CPU.AMD.Frequency)) && (Number(pdmdata.DATA.OS.GRAPHICS_APIS.D3D_HIGHEST_SUPPORT) >= Number(minRequirements.Graphics.D3D_SUPPORT)) && (Number(pdmdata.DATA.MACHINE.GPUS.GPU.VIDEO_MEMORY) >= Number(minRequirements.Graphics.Video_Memory)) && (Number(pdmdata.DATA.MACHINE.TOTAL_MEMORY) >= Number(minRequirements.RAM))) : $('#Requirements').html('This PC <u><b>does</b></u> meet the minimum requirements for EVE.'); break;
-                    case ((Number(pdmdata.DATA.OS.BUILD_NUMBER) >= Number(recRequirements.OS.Windows.BuildNo)) && (pdmdata.DATA.MACHINE.CPU.VENDOR == "GenuineIntel") && (Number(pdmdata.DATA.MACHINE.CPU.LOGICAL_CORE_COUNT) >= Number(recRequirements.CPU.Intel.Cores)) && (Number(pdmdata.DATA.MACHINE.CPU.FREQUENCY_MHZ) >= Number(recRequirements.CPU.Intel.Frequency)) && (Number(pdmdata.DATA.OS.GRAPHICS_APIS.D3D_HIGHEST_SUPPORT) >= Number(recRequirements.Graphics.D3D_SUPPORT)) && (Number(pdmdata.DATA.MACHINE.GPUS.GPU.VIDEO_MEMORY) >= Number(recRequirements.Graphics.Video_Memory)) && (Number(pdmdata.DATA.MACHINE.TOTAL_MEMORY) >= Number(recRequirements.RAM))) : $('#Requirements').html('This PC <u><b>does</b></u> meet the recommended requirements for EVE.'); break;
-                    case ((Number(pdmdata.DATA.OS.BUILD_NUMBER) >= Number(minRequirements.OS.Windows.BuildNo)) && (pdmdata.DATA.MACHINE.CPU.VENDOR == "GenuineIntel") && (Number(pdmdata.DATA.MACHINE.CPU.LOGICAL_CORE_COUNT) >= Number(minRequirements.CPU.Intel.Cores)) && (Number(pdmdata.DATA.MACHINE.CPU.FREQUENCY_MHZ) >= Number(minRequirements.CPU.Intel.Frequency)) && (Number(pdmdata.DATA.OS.GRAPHICS_APIS.D3D_HIGHEST_SUPPORT) >= Number(minRequirements.Graphics.D3D_SUPPORT)) && (Number(pdmdata.DATA.MACHINE.GPUS.GPU.VIDEO_MEMORY) >= Number(minRequirements.Graphics.Video_Memory)) && (Number(pdmdata.DATA.MACHINE.TOTAL_MEMORY) >= Number(minRequirements.RAM))) : $('#Requirements').html('This PC <u><b>does</b></u> meet the minimum requirements for EVE.'); break;
-                    default: $('#Requirements').html('This PC <u><b>does not</u></b> meet the minimum requirements for EVE.');
-                }
-                break;
-            case "macOS":
-                switch (true) {
-                    case ((Number(pdmdata.DATA.OS.MAJOR_VERSION + "." + pdmdata.DATA.OS.MINOR_VERSION) >= Number(recRequirements.OS.Mac.MajorVersion + "." + recRequirements.OS.Mac.MinorVersion)) && (pdmdata.DATA.MACHINE.CPU.VENDOR == "GenuineIntel") && (Number(pdmdata.DATA.MACHINE.CPU.LOGICAL_CORE_COUNT) >= Number(recRequirements.CPU.Intel.Cores)) && (Number(pdmdata.DATA.MACHINE.CPU.FREQUENCY_MHZ) >= Number(recRequirements.CPU.Intel.Frequency)) && (Number(pdmdata.DATA.MACHINE.TOTAL_MEMORY) >= Number(recRequirements.RAM))) : $('#Requirements').html('This PC <u><b>does</b></u> meet the recommended requirements for EVE.'); break;
-                    case ((Number(pdmdata.DATA.OS.MAJOR_VERSION + "." + pdmdata.DATA.OS.MINOR_VERSION) >= Number(recRequirements.OS.Mac.MajorVersion + "." + recRequirements.OS.Mac.MinorVersion)) && (pdmdata.DATA.MACHINE.CPU.VENDOR == "Apple") && (Number(pdmdata.DATA.MACHINE.CPU.LOGICAL_CORE_COUNT) >= Number(recRequirements.CPU.Apple.Cores)) && (Number(pdmdata.DATA.MACHINE.TOTAL_MEMORY) >= Number(recRequirements.RAM))) : $('#Requirements').html('This PC <u><b>does</b></u> meet the recommended requirements for EVE.'); break;
-                    case ((Number(pdmdata.DATA.OS.MAJOR_VERSION + "." + pdmdata.DATA.OS.MINOR_VERSION) >= Number(minRequirements.OS.Mac.MajorVersion + "." + minRequirements.OS.Mac.MinorVersion)) && (pdmdata.DATA.MACHINE.CPU.VENDOR == "GenuineIntel") && (Number(pdmdata.DATA.MACHINE.CPU.LOGICAL_CORE_COUNT) >= Number(minRequirements.CPU.Intel.Cores)) && (Number(pdmdata.DATA.MACHINE.CPU.FREQUENCY_MHZ) >= Number(minRequirements.CPU.Intel.Frequency)) && (Number(pdmdata.DATA.MACHINE.TOTAL_MEMORY) >= Number(minRequirements.RAM))) : $('#Requirements').html('This PC <u><b>does</b></u> meet the minimum requirements for EVE.'); break;
-                    case ((Number(pdmdata.DATA.OS.MAJOR_VERSION + "." + pdmdata.DATA.OS.MINOR_VERSION) >= Number(minRequirements.OS.Mac.MajorVersion + "." + minRequirements.OS.Mac.MinorVersion)) && (pdmdata.DATA.MACHINE.CPU.VENDOR == "Apple") && (Number(pdmdata.DATA.MACHINE.CPU.LOGICAL_CORE_COUNT) >= Number(minRequirements.CPU.Apple.Cores)) && (Number(pdmdata.DATA.MACHINE.TOTAL_MEMORY) >= Number(minRequirements.RAM))) : $('#Requirements').html('This PC <u><b>does</b></u> meet the minimum requirements for EVE.'); break;
-                    default: $('#Requirements').html('This PC <u><b>does not</u></b> meet the minimum requirements for EVE.');
-                }
-                break;
-            default:
-                $('#Requirements').html('This PC <u><b>does not</b></u> meet the minimum requirements for EVE.<div>Reason: Unsupported Operating System</div>');
-        }
-        var driverDate = pdmdata.DATA.MACHINE.GPUS.GPU.DRIVER.DATE.split("-");
-        driverDate = Date.parse(driverDate[2]+"-"+driverDate[0]+"-"+driverDate[1]);
-        driverAge = Math.ceil((today - driverDate)/(1000 * 3600 *24));
-        $('#driverAge').html('The graphics driver is '+ driverAge +' days old.');
+        var pdmdata = convertTextToObject(rows);
+        // Judge the machine against EVE's system requirements and render a per-component breakdown into the
+        // Quick Info box (verdict + OS/CPU/RAM/GPU/DirectX rows + driver age). Guarded end-to-end.
+        try { renderRequirements(pdmdata); } catch (e) { $('#Requirements').text('Could not evaluate system requirements.'); }
         pdm = false;
     };
 
@@ -888,12 +878,26 @@ function SwapUI() {
 };
 
 
+// Normalize the raw log text (collapse tab runs + blank lines, flatten "***…***" logging errors, escape <)
+// and split into rows. Shared preamble of the four Parse* functions; assigns + returns the module `rows` array.
+function prepLogRows() {
+    rows = rows.replace(/(\t{2,})+/g, "\t").replace(/([\r\n]){2,}/g, "\r\n").replace(/([\r\n])[*]{3}(.*)(?=[*]{3})[*]{3}/g, "\r\n\t\t\tLogging error occurred").replace(/[\<]/g, function (c) { return "&lt;"; }).replace(/\n$/, "").split("\n");
+    return rows;
+}
+
+// Hide the loader and reveal the filled table. Shared epilogue of the four Parse* functions.
+function finishParserView() {
+    document.getElementById("loader").style.display = "none";
+    document.getElementById("tableContent").style.display = "table";
+}
+
+
 // Process the methodcalls logs and display them in a more readable state than the default
 function ParseMcLogs() {
     var averageDuration = 0;
     var count = 0;
     var peak = 0;
-    rows = rows.replace(/(\t{2,})+/g, "\t").replace(/([\r\n]){2,}/g, "\r\n").replace(/([\r\n])[*]{3}(.*)(?=[*]{3})[*]{3}/g, "\r\n\t\t\tLogging error occurred").replace(/[\<]/g, function(c) {return "&lt;";}).replace(/\n$/, "").split("\n");
+    prepLogRows();
 
  /**
  * Object to which we save the table
@@ -911,7 +915,7 @@ function ParseMcLogs() {
         var tableContent = document.getElementById('tableContent');
         var tableContentRowsLength = 0;
         var toIndex = tableContentRowsLength + rowQuantity;
-        for (var i = tableContentRowsLength, row, rowNumber, cellIndex, dateTime, method, duration, macho; i < toIndex; ++i) {
+        for (var i = tableContentRowsLength, row, cellIndex, dateTime, method, duration, macho; i < toIndex; ++i) {
             row = document.createElement('tr');
             row.className = 'row';
             cellIndex = -1;
@@ -973,14 +977,13 @@ function ParseMcLogs() {
  /**
  * Remove the loader and show the content
  */
-    document.getElementById("loader").style.display = "none";
-    document.getElementById("tableContent").style.display = "table";
+    finishParserView();
 };
 
 
 // Process the outstandingcalls logs and display them in a more readable state than the default
 function ParseOcLogs() {
-    rows = rows.replace(/(\t{2,})+/g, "\t").replace(/([\r\n]){2,}/g, "\r\n").replace(/([\r\n])[*]{3}(.*)(?=[*]{3})[*]{3}/g, "\r\n\t\t\tLogging error occurred").replace(/[\<]/g, function(c) {return "&lt;";}).replace(/\n$/, "").split("\n");
+    prepLogRows();
 
  /**
  * Object to which we save the table
@@ -998,7 +1001,7 @@ function ParseOcLogs() {
         var tableContent = document.getElementById('tableContent');
         var tableContentRowsLength = 0;
         var toIndex = tableContentRowsLength + rowQuantity;
-        for (var i = tableContentRowsLength, row, rowNumber, cellIndex, dateTime, method; i < toIndex; ++i) {
+        for (var i = tableContentRowsLength, row, cellIndex, dateTime, method; i < toIndex; ++i) {
             if (table[i][0] == "") {
                 break;
             }
@@ -1029,14 +1032,13 @@ function ParseOcLogs() {
  /**
  * Remove the loader and show the content
  */
-    document.getElementById("loader").style.display = "none";
-    document.getElementById("tableContent").style.display = "table";
+    finishParserView();
 };
 
 
 // Process the processHealth logs and display them in a more readable state than the default
 function ParsePhLogs() {
-    rows = rows.replace(/(\t{2,})+/g, "\t").replace(/([\r\n]){2,}/g, "\r\n").replace(/([\r\n])[*]{3}(.*)(?=[*]{3})[*]{3}/g, "\r\n\t\t\tLogging error occurred").replace(/[\<]/g, function(c) {return "&lt;";}).replace(/\n$/, "").split("\n");
+    prepLogRows();
 
  /**
  * Object to which we save the table
@@ -1054,7 +1056,7 @@ function ParsePhLogs() {
         var tableContent = document.getElementById('tableContent');
         var tableContentRowsLength = 0;
         var toIndex = tableContentRowsLength + rowQuantity;
-        for (var i = tableContentRowsLength, row, rowNumber, cellIndex, dateTime, pyDateTime, procCpu, threadCpu, pyMem, virtualMem, taskletsProcessed, taskletsQueued, watchdogTime, spf, serviceCalls, callsFromClient, bytesReceived, bytesSent, packetsReceived, packetsSent, sessionCount, tidiFactor; i < toIndex; ++i) {
+        for (var i = tableContentRowsLength, row, cellIndex, dateTime, pyDateTime, procCpu, threadCpu, pyMem, virtualMem, taskletsProcessed, taskletsQueued, watchdogTime, spf, serviceCalls, callsFromClient, bytesReceived, bytesSent, packetsReceived, packetsSent, sessionCount, tidiFactor; i < toIndex; ++i) {
             row = document.createElement('tr');
             row.className = 'row';
             cellIndex = -1;
@@ -1151,15 +1153,14 @@ function ParsePhLogs() {
  /**
  * Remove the loader and show the content
  */
-    document.getElementById("loader").style.display = "none";
-    document.getElementById("tableContent").style.display = "table";
+    finishParserView();
 };
 
 
 
 // Process the logs and display them in a more readable state than the default
 function ParseLogs() {
-    rows = rows.replace(/(\t{2,})+/g, "\t").replace(/([\r\n]){2,}/g, "\r\n").replace(/([\r\n])[*]{3}(.*)(?=[*]{3})[*]{3}/g, "\r\n\t\t\tLogging error occurred").replace(/[\<]/g, function(c) {return "&lt;";}).replace(/\n$/, "").split("\n");
+    prepLogRows();
 
  /**
  * Object to which we save the table
@@ -1177,7 +1178,7 @@ function ParseLogs() {
         var tableContent = document.getElementById('tableContent');
         var tableContentRowsLength = 0;
         var toIndex = tableContentRowsLength + rowQuantity;
-        for (var i = tableContentRowsLength, row, rowNumber, cellIndex, timeCell, facilityCell, typeCell, messageCell, clickHandler; i < toIndex; ++i) {
+        for (var i = tableContentRowsLength, row, cellIndex, timeCell, facilityCell, typeCell, messageCell, clickHandler; i < toIndex; ++i) {
             row = document.createElement('tr');
             row.className = 'row';
             cellIndex = -1;
@@ -1310,8 +1311,7 @@ function ParseLogs() {
  /**
  * Remove the loader and show the content
  */
-    document.getElementById("loader").style.display = "none";
-    document.getElementById("tableContent").style.display = "table";
+    finishParserView();
 
  /**
  * "Group Repeats": segment the rendered rows into line / exception-block units and collapse consecutive
@@ -1826,14 +1826,51 @@ var cssLogParser = `
 `
 
 
-// Variable which contains the UI of the Log Parser
-var html = `
+// FontAwesome stylesheet, shared by every parser view.
+var FA_LINK = '<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">';
+
+// Build a log-parser view: the shared <style> + FontAwesome + #body/#table/#tableContent/#loader shell around
+// a given <h1> `title` and <thead> `columns` (raw <th> markup). opts.extraCss is appended after the base css
+// (the main Log Parser layers cssLogParser on top); opts.header is HTML injected above #body (the filter nav
+// on the main parser, the macho stats on Method Calls). One shell for all five, so the table structure and the
+// FontAwesome link are single-sourced.
+function parserShell(title, columns, opts) {
+    opts = opts || {};
+    return `
 <style>
-`+ css + cssLogParser +`
+`+ css + (opts.extraCss || '') +`
 </style>
 
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+`+ FA_LINK +`
 <body>
+`+ (opts.header || '') +`
+   <div id="body">
+      <header>
+         <h1>`+ title +`</h1>
+      </header>
+      <div id="table" tabindex="0">
+         <table id="tableContent" style="display:none;" class="fixedHead">
+            <div id="loader"></div>
+            <thead>
+               <tr>
+`+ columns +`
+            </thead>
+            <tbody></tbody>
+         </table>
+      </div>
+   </div>
+`;
+}
+
+
+// Variable which contains the UI of the Log Parser
+var html = parserShell('Logfile Parser', `
+                  <th scope="col">Time
+                  <th scope="col">Facility
+                  <th scope="col">Type
+                  <th scope="col">Message`, {
+    extraCss: cssLogParser,
+    header: `
    <header id="gheader">
       <nav id="gpanel">
          <ul id="gnav">
@@ -1855,46 +1892,13 @@ var html = `
                <input id="ejf-log-search" type="text" placeholder="Filter…" autocomplete="off">
          </ul>
       </nav>
-   </header>
-   <div id="body">
-      <header>
-         <h1>Logfile Parser</h1>
-      </header>
-      <div id="table" tabindex="0">
-         <table id="tableContent" style="display:none;" class="fixedHead">
-         <div id="loader"></div>
-         <thead>
-               <tr>
-                  <th scope="col">Time
-                  <th scope="col">Facility
-                  <th scope="col">Type
-                  <th scope="col">Message
-         </thead>
-         <tbody></tbody>
-         </table>
-      </div>
-   </div>
-`;
+   </header>`
+});
 
 
 
 // Variable which contains the UI of the Process Health parser
-var phHtml = `
-<style>
-`+ css +`
-</style>
-
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-<body>
-   <div id="body">
-      <header>
-         <h1>Process Health</h1>
-      </header>
-      <div id="table" tabindex="0">
-         <table id="tableContent" style="display:none;" class="fixedHead">
-            <div id="loader"></div>
-            <thead>
-               <tr>
+var phHtml = parserShell('Process Health', `
                   <th scope="col">dateTime <i class="fa-regular fa-circle-question" title="System date / time converted into UTC"></i>
                   <th scope="col">pyDateTime
                   <th scope="col">procCpu <i class="fa-regular fa-circle-question" title="CPU usage in % of one CPU core"></i>
@@ -1912,23 +1916,15 @@ var phHtml = `
                   <th scope="col">packetsReceived <i class="fa-regular fa-circle-question" title="Packets recieved from the EVE Server (Not including chat, imageserver and other services)"></i>
                   <th scope="col">packetsSent <i class="fa-regular fa-circle-question" title="Bytes sent to the EVE Server (Not including chat, imageserver and other services)"></i>
                   <th scope="col">sessionCount <i class="fa-regular fa-circle-question" title="Should always be 1"></i>
-                  <th scope="col">tidiFactor <i class="fa-regular fa-circle-question" title="Time Dilation - 1.0 = No TiDi"></i>
-            </thead>
-            <tbody></tbody>
-         </table>
-      </div>
-   </div>
-`;
+                  <th scope="col">tidiFactor <i class="fa-regular fa-circle-question" title="Time Dilation - 1.0 = No TiDi"></i>`);
 
 
 // Variable which contains the UI of the Method Calls parser
-var McHtml = `
-<style>
-`+ css +`
-</style>
-
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-<body>
+var McHtml = parserShell('Method Calls', `
+                  <th scope="col">Time <i class="fa-regular fa-circle-question" title="System date / time converted into UTC"></i>
+                  <th scope="col">Method <i class="fa-regular fa-circle-question" title="Python method which was called"></i>
+                  <th scope="col">Duration in ms <i class="fa-regular fa-circle-question" title="How long it took to complete the method call"></i>`, {
+    header: `
   <header id="gheader">
       <nav id="gpanel">
          <ul id="gnav">
@@ -1937,144 +1933,227 @@ var McHtml = `
                <div id="peakMacho"> Peak machoNet::GetTime duration:</div>
          </ul>
       </nav>
-   </header>
-   <div id="body">
-      <header>
-         <h1>Method Calls</h1>
-      </header>
-      <div id="table" tabindex="0">
-         <table id="tableContent" style="display:none;" class="fixedHead">
-            <div id="loader"></div>
-            <thead>
-               <tr>
-                  <th scope="col">Time <i class="fa-regular fa-circle-question" title="System date / time converted into UTC"></i>
-                  <th scope="col">Method <i class="fa-regular fa-circle-question" title="Python method which was called"></i>
-                  <th scope="col">Duration in ms <i class="fa-regular fa-circle-question" title="How long it took to complete the method call"></i>
-            </thead>
-            <tbody></tbody>
-         </table>
-      </div>
-   </div>
-`;
+   </header>`
+});
 
 
 // Variable which contains the UI of the Outstanding Calls parser
-var ocHtml = `
-<style>
-`+ css +`
-</style>
-
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-<body>
-   <div id="body">
-      <header>
-         <h1>Outstanding Calls</h1>
-      </header>
-      <div id="table" tabindex="0">
-         <table id="tableContent" style="display:none;" class="fixedHead">
-            <div id="loader"></div>
-            <thead>
-               <tr>
+var ocHtml = parserShell('Outstanding Calls', `
                   <th scope="col">Time <i class="fa-regular fa-circle-question" title="System date / time converted into UTC"></i>
-                  <th scope="col">Method <i class="fa-regular fa-circle-question" title="Python method which was called but is not yet finished"></i>
-            </thead>
-            <tbody></tbody>
-         </table>
-      </div>
-   </div>
-`;
+                  <th scope="col">Method <i class="fa-regular fa-circle-question" title="Python method which was called but is not yet finished"></i>`);
 
 
 // Variable which contains the UI of the Last Crashes parser
-var lcHtml = `
-<style>
-`+ css +`
-</style>
-
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-<body>
-   <div id="body">
-      <header>
-         <h1>Last Crashes</h1>
-      </header>
-      <div id="table" tabindex="0">
-         <table id="tableContent" style="display:none;" class="fixedHead">
-            <div id="loader"></div>
-            <thead>
-               <tr>
+var lcHtml = parserShell('Last Crashes', `
                   <th scope="col">Time <i class="fa-regular fa-circle-question" title="System date / time converted into UTC"></i>
-                  <th scope="col">Crash ID
-            </thead>
-            <tbody></tbody>
-         </table>
-      </div>
-   </div>
-`;
+                  <th scope="col">Crash ID`);
 
 
-// Rough minimum requirements for EVE
-var minRequirements = {
-    OS: {
-        Windows: {
-            BuildNo: "7600"
-        },
-        Mac: {
-            MajorVersion: "10",
-            MinorVersion: "14"
-        }
+/* ---- EVE system-requirements check (Quick Info on PDMData.txt) ----
+ * Data-driven replacement for the old hardcoded min/rec objects + the 8-case switch(true). The floors are
+ * transcribed from the official article (bump `verified` when you refresh them). Each component is judged
+ * independently against a { min, rec } pair; the overall verdict is the WORST component, so the Quick Info box
+ * can show WHICH part falls short instead of a bare pass/fail. Every getter is guarded, so a missing or
+ * array-shaped PDM field yields an "n/a" row rather than NaN-poisoning the verdict or throwing (the old code
+ * broke on hybrid-GPU laptops, where MACHINE.GPUS.GPU is an array). CPU/GPU are judged by the numeric proxies
+ * PDMData actually reports (threads, frequency, VRAM) - we can't match specific CPU/GPU model names.
+ */
+var _MiB = 1048576, _GiB = 1073741824;
+var EVE_REQ = {
+    source: 'https://support.eveonline.com/hc/en-us/articles/5885219196828-System-Requirements',
+    verified: '2026-08-08',
+    // Windows: min = Win10 / dual-core @2.0GHz / 4GB / 1GB VRAM / DX11(FL11);  rec = Win11 / i7-7700|R7-1700
+    // @3.6GHz / 16GB / 4GB VRAM. (Cores/frequency are a rough proxy for the named recommended CPUs.)
+    windows: {
+        osBuild:     { min: 10240, rec: 22000, minName: 'Windows 10', recName: 'Windows 11' },
+        cpuMinCores: 2, cpuMinMhz: 2000, cpuRecCores: 8,   // rec judged by THREAD count, not base clock (see reqCpuTier)
+        ram:         { min: 4 * _GiB, rec: 16 * _GiB },
+        vram:        { min: 1024 * _MiB, rec: 4 * _GiB },
+        dx:          { min: 11, rec: 11 }
     },
-    CPU: {
-        Intel: {
-            Cores: "2",
-            Frequency: "2000"
-        },
-        Apple: {
-            Cores: "8"
-        },
-        AMD: {
-            Cores: "2",
-            Frequency: "2000"
-        }
-    },
-    Graphics: {
-        D3D_SUPPORT: "11",
-        Video_Memory: "1073741824"
-    },
-    RAM: "4294967296"
+    // macOS: min = Monterey(12) / i5 @2.5GHz or Apple M1 / 4GB;  rec = Tahoe(26) / i7 @3.8GHz or M1 Pro / 16GB
+    // / 8GB VRAM. The minimum Mac GPUs (Intel HD 4000 / Apple iGPU) have no stated VRAM floor.
+    macos: {
+        osMajor:        { min: 12, rec: 26, minName: 'macOS Monterey (12)', recName: 'macOS Tahoe (26)' },
+        cpuMinIntelMhz: 2500, cpuRecIntelCores: 8,   // Intel: i5 @2.5 base min; i7 (>=8 threads) rec
+        appleCores:     { min: 8, rec: 10 },          // M1 ~8 cores (min), M1 Pro ~10 (rec)
+        ram:            { min: 4 * _GiB, rec: 16 * _GiB },
+        vram:           { min: 0, rec: 8 * _GiB }
+    }
 };
 
+// Tier of a numeric `val` against a { min, rec } spec: 'rec' when >= rec, 'min' when >= min, else 'fail';
+// missing / non-numeric -> 'na'. `tol` (0..1) relaxes both thresholds (RAM/VRAM report a little under nominal
+// - hardware-reserved / iGPU-stolen - so a genuine 16GB box shouldn't fail a 16GB bar).
+function reqTier(val, spec, tol) {
+    var v = Number(val);
+    if (val == null || val === '' || isNaN(v)) { return 'na'; }
+    var f = 1 - (tol || 0);
+    if (v >= spec.rec * f) { return 'rec'; }
+    if (v >= spec.min * f) { return 'min'; }
+    return 'fail';
+}
 
-// Rough recommended requirements for EVE
-var recRequirements = {
-    OS: {
-        Windows: {
-            BuildNo: "10240"
-        },
-        Mac: {
-            MajorVersion: "12",
-            MinorVersion: "0",
-            Bitness: "x64"
-        }
-    },
-    CPU: {
-        Intel: {
-            Cores: "4",
-            Frequency: "3600"
-        },
-        Apple: {
-            Cores: "10"
-        },
-        AMD: {
-            Cores: "8",
-            Frequency: "3000"
-        }
-    },
-    Graphics: {
-        D3D_SUPPORT: "11",
-        Video_Memory: "8289934592"
-    },
-    RAM: "17179869184"
-};
+// Worst tier across a list (fail < min < rec); 'na' entries are ignored. Also computes the OVERALL verdict
+// (the worst component). Returns 'na' only when every entry is 'na'.
+function worstTier(tiers) {
+    var order = { fail: 0, min: 1, rec: 2 }, w = null;
+    for (var i = 0; i < tiers.length; i++) {
+        var t = tiers[i];
+        if (t === 'na') { continue; }
+        if (w === null || order[t] < order[w]) { w = t; }
+    }
+    return w || 'na';
+}
+
+// CPU tier. Base frequency (PDM's FREQUENCY_MHZ) is a POOR recommended-tier signal: modern many-core CPUs
+// report a low BASE clock (e.g. the i9-13900HX = 32 threads @ 2.2 GHz base, boosting past 5 GHz), so a
+// freq-based rec bar wrongly demotes them. So RECOMMENDED is judged by logical-core (thread) count - the named
+// recommended CPUs (i7-7700, Ryzen 7 1700) are all >= 8 threads - and frequency is used only as a MINIMUM
+// floor. Apple Silicon is judged purely on core count.
+function reqCpuTier(platform, vendor, cores, mhz) {
+    var c = Number(cores), m = Number(mhz);
+    var haveC = !isNaN(c) && c > 0, haveM = !isNaN(m) && m > 0;
+    if (!haveC && !haveM) { return 'na'; }
+    if (platform === 'mac' && /apple/i.test(vendor)) { return reqTier(c, EVE_REQ.macos.appleCores); }
+    var recCores = (platform === 'mac') ? EVE_REQ.macos.cpuRecIntelCores : EVE_REQ.windows.cpuRecCores;
+    var minMhz   = (platform === 'mac') ? EVE_REQ.macos.cpuMinIntelMhz  : EVE_REQ.windows.cpuMinMhz;
+    var minCores = (platform === 'mac') ? 2 : EVE_REQ.windows.cpuMinCores;
+    if (haveC && c >= recCores) { return 'rec'; }                                   // enough threads -> recommended
+    if ((!haveC || c >= minCores) && (!haveM || m >= minMhz)) { return 'min'; }     // dual-core+ and >= min base clock
+    return 'fail';
+}
+
+// PDM lists a single GPU as an object and multiple GPUs as an array. The GPU EVE actually uses is the one with
+// the most VRAM (the discrete card on a hybrid laptop), so judge/report that one.
+function pdmGpus(machine) {
+    var g = machine && machine.GPUS && machine.GPUS.GPU;
+    if (!g) { return []; }
+    return Array.isArray(g) ? g : [g];
+}
+function pdmBestGpu(machine) {
+    var list = pdmGpus(machine), best = null, bestV = -1;
+    for (var i = 0; i < list.length; i++) {
+        var v = Number(list[i].VIDEO_MEMORY);
+        if (!isNaN(v) && v > bestV) { bestV = v; best = list[i]; }
+    }
+    return best || list[0] || null;
+}
+function pdmGpuName(gpu) {
+    if (!gpu) { return ''; }
+    return gpu.NAME || gpu.MODEL || gpu.DESCRIPTION || gpu.DEVICE || gpu.RENDERER || '';
+}
+
+function fmtGB(bytes) {
+    var b = Number(bytes);
+    if (isNaN(b) || b <= 0) { return '?'; }
+    var gb = b / _GiB;
+    return (Math.abs(gb - Math.round(gb)) < 0.1 ? Math.round(gb) : Math.round(gb * 10) / 10) + ' GB';
+}
+function fmtGHz(mhz) {
+    var m = Number(mhz);
+    if (isNaN(m) || m <= 0) { return '?'; }
+    return (Math.round(m / 100) / 10) + ' GHz';
+}
+function reqEscape(s) {
+    return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+    });
+}
+
+// ---- detail-string builders (the right-hand "actual value (need)" column) ----
+function reqCpuDetail(vendor, cores, mhz) {
+    var v = /amd/i.test(vendor) ? 'AMD' : (/intel/i.test(vendor) ? 'Intel' : (/apple/i.test(vendor) ? 'Apple' : (vendor || 'CPU')));
+    var parts = [v];
+    if (!isNaN(cores) && cores > 0) { parts.push(cores + (cores === 1 ? ' thread' : ' threads')); }
+    if (!isNaN(mhz) && mhz > 0) { parts.push('@ ' + fmtGHz(mhz) + ' base'); }
+    return parts.join(' · ');
+}
+function reqSizeDetail(bytes, spec, suffix) {
+    var t = reqTier(bytes, spec, 0.03), s = fmtGB(bytes) + (suffix || '');
+    if (t === 'fail') { s += ' — min ' + fmtGB(spec.min); }
+    else if (t === 'min') { s += ' (rec ' + fmtGB(spec.rec) + ')'; }
+    return s;
+}
+function reqGpuDetail(gpu, spec) {
+    if (!gpu) { return 'no GPU reported'; }
+    var name = pdmGpuName(gpu), vram = Number(gpu.VIDEO_MEMORY), out = name;
+    if (!isNaN(vram) && vram > 0) { out = (name ? name + ' · ' : '') + reqSizeDetail(vram, spec, ' VRAM'); }
+    return out || 'GPU';
+}
+function reqDriverInfo(gpu) {
+    var out = { days: null, note: '' };
+    var raw = gpu && gpu.DRIVER && gpu.DRIVER.DATE;
+    if (!raw) { return out; }
+    var p = String(raw).split('-');                 // PDM driver date is "MM-DD-YYYY"
+    if (p.length !== 3) { return out; }
+    var t = Date.parse(p[2] + '-' + p[0] + '-' + p[1]);
+    if (isNaN(t)) { return out; }
+    out.days = Math.ceil((new Date() - t) / (1000 * 3600 * 24));
+    out.note = 'The graphics driver is ' + out.days + ' days old.' + (out.days > 365 ? ' ⚠ Consider updating.' : '');
+    return out;
+}
+
+// Evaluate a parsed PDMData object against EVE_REQ -> { overall, rows:[{label, tier, detail, floor?}], driver }.
+function evalRequirements(pdm) {
+    var data = (pdm && pdm.DATA) || {}, os = data.OS || {}, machine = data.MACHINE || {}, cpu = machine.CPU || {};
+    var type = os.TYPE || '', vendor = cpu.VENDOR || '';
+    var cores = Number(cpu.LOGICAL_CORE_COUNT), mhz = Number(cpu.FREQUENCY_MHZ);
+    var gpu = pdmBestGpu(machine), rows = [];
+
+    if (/win/i.test(type)) {
+        var W = EVE_REQ.windows, build = Number(os.BUILD_NUMBER);
+        var osName = isNaN(build) ? 'Windows ?' : (build >= W.osBuild.rec ? W.osBuild.recName : (build >= W.osBuild.min ? W.osBuild.minName : 'Windows (older)'));
+        rows.push({ label: 'OS', tier: reqTier(build, W.osBuild), detail: osName + (isNaN(build) ? '' : ' · build ' + build) });
+        rows.push({ label: 'CPU', tier: reqCpuTier('win', vendor, cores, mhz), detail: reqCpuDetail(vendor, cores, mhz) });
+        rows.push({ label: 'RAM', tier: reqTier(machine.TOTAL_MEMORY, W.ram, 0.03), detail: reqSizeDetail(machine.TOTAL_MEMORY, W.ram) });
+        rows.push({ label: 'GPU', tier: reqTier(gpu ? gpu.VIDEO_MEMORY : NaN, W.vram, 0.03), detail: reqGpuDetail(gpu, W.vram) });
+        var dx = Number(os.GRAPHICS_APIS && os.GRAPHICS_APIS.D3D_HIGHEST_SUPPORT);
+        rows.push({ label: 'DirectX', tier: reqTier(dx, W.dx), floor: true, detail: isNaN(dx) ? '?' : ('DirectX ' + dx + (dx < W.dx.min ? ' — need 11' : '')) });
+    } else if (/mac/i.test(type)) {
+        var M = EVE_REQ.macos, major = Number(os.MAJOR_VERSION);
+        var mName = isNaN(major) ? 'macOS ?' : ('macOS ' + major + (os.MINOR_VERSION ? '.' + os.MINOR_VERSION : ''));
+        rows.push({ label: 'OS', tier: reqTier(major, M.osMajor), detail: mName });
+        var macCpuDetail = /apple/i.test(vendor) ? ('Apple Silicon' + (isNaN(cores) ? '' : ' · ' + cores + ' cores')) : reqCpuDetail(vendor, cores, mhz);
+        rows.push({ label: 'CPU', tier: reqCpuTier('mac', vendor, cores, mhz), detail: macCpuDetail });
+        rows.push({ label: 'RAM', tier: reqTier(machine.TOTAL_MEMORY, M.ram, 0.03), detail: reqSizeDetail(machine.TOTAL_MEMORY, M.ram) });
+        var mv = gpu ? Number(gpu.VIDEO_MEMORY) : NaN;
+        if (!isNaN(mv) && mv > 0) { rows.push({ label: 'GPU', tier: reqTier(mv, M.vram, 0.03), detail: reqGpuDetail(gpu, M.vram) }); }
+        else { rows.push({ label: 'GPU', tier: 'na', detail: pdmGpuName(gpu) || 'integrated' }); }
+    } else {
+        rows.push({ label: 'OS', tier: 'fail', detail: 'Unsupported / unknown OS' + (type ? ' (' + type + ')' : '') });
+    }
+
+    return { overall: worstTier(rows.map(function (r) { return r.tier; })), rows: rows, driver: reqDriverInfo(gpu) };
+}
+
+// Render the verdict + per-component breakdown into #Requirements and the driver-age line into #driverAge.
+function renderRequirements(pdm) {
+    var res = evalRequirements(pdm);
+    var ICON = { rec: '✓', min: '✓', fail: '✗', na: '–' };
+    var COL  = { rec: '#7fdca4', min: '#ffd479', fail: '#ff8f8f', na: '#9aa6b2' };
+    var HEAD = { rec: 'meets the <b>recommended</b> requirements', min: 'meets the <b>minimum</b> (but not recommended) requirements',
+                 fail: '<b>does not</b> meet the minimum requirements', na: 'could not be evaluated' };
+    var html = '<div style="font-weight:700; margin-bottom:6px; color:' + (COL[res.overall] || COL.na) + ';">This PC ' + HEAD[res.overall] + ' for EVE.</div>' +
+        '<table style="border-collapse:collapse; font-size:13px; line-height:1.5;">';
+    res.rows.forEach(function (r) {
+        var badge = (!r.floor && (r.tier === 'rec' || r.tier === 'min'))
+            ? ' <span style="font-size:9px; text-transform:uppercase; letter-spacing:.04em; color:' + COL[r.tier] + ';">' + r.tier + '</span>' : '';
+        html += '<tr>' +
+            '<td style="padding:0 8px 0 0; color:' + COL[r.tier] + '; font-weight:700; vertical-align:top;">' + ICON[r.tier] + '</td>' +
+            '<td style="padding:0 10px 0 0; color:#cfd6dd; vertical-align:top; white-space:nowrap;">' + r.label + badge + '</td>' +
+            '<td style="padding:0; color:#e6e6e6;">' + reqEscape(r.detail) + '</td>' +
+            '</tr>';
+    });
+    html += '</table>';
+    $('#Requirements').html(html);
+
+    if (res.driver.days != null) {
+        $('#driverAge').text(res.driver.note);
+    } else {
+        $('#driverAge').text('Graphics driver date unavailable.');
+    }
+}
 
 
 // Function to convert the PDMData.txt into a javascript object
@@ -2142,7 +2221,7 @@ var pdmHtml = `
 </style>
 <div class="floating-div">
   <div><h2>Quick Info:</h2></div>
-  <div id="driverAge">The graphics driver is `+ driverAge +` days old.</div>
+  <div id="driverAge"></div>
   <div id="Requirements"></div>
 </div>
 `
@@ -2177,12 +2256,8 @@ var EJF_SD = {
     // EJF_SD.rank.CAND so the fusion candidate pool is never the limiting factor). Read live at query time,
     // so changing it from the menu re-renders with the new count without a reload.
     TOP_N: (function () {
-        try {
-            if (typeof GM_getValue === 'function') {
-                var v = parseInt(GM_getValue('sdTopN', 8), 10);
-                if (!isNaN(v) && v >= 1 && v <= 30) { return v; }
-            }
-        } catch (e) { /* ignore */ }
+        var v = parseInt(gmGet('sdTopN', 8), 10);
+        if (!isNaN(v) && v >= 1 && v <= 30) { return v; }
         return 8;
     })(),
     MODEL_VERSION: 'gte-small-v3',                  // embedding model tag; bump to force a full re-embed
@@ -2351,13 +2426,6 @@ EJF_SD.logsig = {
         return EJF_SD.logsig._building;
     },
 
-    // The canonical (newest, since members are sorted newest-first) defect for a signature - back-compat for
-    // the log -> defect matchers, which map a signature to a single defect key.
-    canonical: function (sig) {
-        var c = EJF_SD.logsig._index && EJF_SD.logsig._index.sigMap[sig];
-        return (c && c.members.length) ? c.members[0].key : null;
-    },
-
     // Every OTHER defect that shares a signature with `key` (deduped across all of the key's signatures),
     // each with its status/resolution. Drives the inline "Same exception" section on a defect. [] when none.
     siblingsForKey: function (key) {
@@ -2465,21 +2533,11 @@ EJF_SD.logsig = {
     // The standalone "Exception clusters" overview: every signature shared by >=2 defects, newest defect
     // first, each expandable to its members. Reuses the settings-menu overlay chrome (#ejf-menu-overlay / #ejf-menu).
     openClustersView: function () {
-        if (EJF_SD.menu && EJF_SD.menu.close) { EJF_SD.menu.close(); }   // close the settings menu if it's open
-        EJF_SD.menu._injectCss();
         EJF_SD.logsig._injectClusterCss();
-        var $overlay = $('<div id="ejf-menu-overlay"></div>');
-        var esc = function (e) { if (e.key === 'Escape') { closeView(); } };
-        function closeView() { $overlay.remove(); document.removeEventListener('keydown', esc); }
-        $overlay.on('click', function (e) { if (e.target === this) { closeView(); } });   // backdrop click
-        var $menu = $('<div id="ejf-menu"></div>').appendTo($overlay);
-        var $head = $('<div class="ejf-menu-head"><h2>Exception clusters</h2></div>');
-        $('<span class="ejf-menu-x" title="Close (Esc)">×</span>').on('click', closeView).appendTo($head);
-        $menu.append($head);
-        var $sect = $('<div class="ejf-menu-sect"></div>').appendTo($menu);
+        var ov = EJF_SD.menu._openOverlay({ title: 'Exception clusters' });
+        var $overlay = ov.$overlay;
+        var $sect = $('<div class="ejf-menu-sect"></div>').appendTo(ov.$menu);
         $('<div class="ejf-menu-status">Loading clusters…</div>').appendTo($sect);
-        $overlay.appendTo(document.body);
-        document.addEventListener('keydown', esc);
         EJF_SD.logsig.clusters().then(function (clusters) {
             if (!document.body.contains($overlay[0])) { return; }   // closed before the build finished
             $sect.empty();
@@ -2802,7 +2860,7 @@ EJF_SD.logsig = {
         EJF_SD.logsig._panelIdx = {};
 
         var collapsed = false;
-        try { if (typeof GM_getValue === 'function') { collapsed = !!GM_getValue(EJF_SD.logsig.COLLAPSE_KEY, false); } } catch (e) { collapsed = false; }
+        collapsed = !!gmGet(EJF_SD.logsig.COLLAPSE_KEY, false);
         panel.className = collapsed ? 'collapsed' : '';
 
         var head = document.createElement('div');
@@ -2914,7 +2972,7 @@ EJF_SD.logsig = {
             ev.stopPropagation();
             var isCollapsed = panel.classList.toggle('collapsed');
             collapse.textContent = isCollapsed ? '+' : '–';
-            try { if (typeof GM_setValue === 'function') { GM_setValue(EJF_SD.logsig.COLLAPSE_KEY, isCollapsed); } } catch (e) { /* ignore */ }
+            gmSet(EJF_SD.logsig.COLLAPSE_KEY, isCollapsed);
             EJF_SD.logsig._fitVertical(panel);   // on expand, grow upward if there's no room below
         });
 
@@ -2948,7 +3006,7 @@ EJF_SD.logsig = {
     // Restore a saved {left, top}, clamped on-screen (same approach as the Similar Defects panel).
     _applyPos: function (panel) {
         var pos = null;
-        try { if (typeof GM_getValue === 'function') { pos = GM_getValue(EJF_SD.logsig.POS_KEY, null); } } catch (e) { pos = null; }
+        pos = gmGet(EJF_SD.logsig.POS_KEY, null);
         if (!pos || typeof pos.left !== 'number' || typeof pos.top !== 'number') { return; }
         var w = panel.offsetWidth || 300, h = panel.offsetHeight || 60;
         var left = Math.min(Math.max(0, pos.left), Math.max(0, window.innerWidth - w));
@@ -3018,7 +3076,7 @@ EJF_SD.logsig = {
             document.removeEventListener('mouseup', onUp, true);
             var rect = panel.getBoundingClientRect();
             var top = (typeof panel._ejfTop === 'number') ? panel._ejfTop : Math.round(rect.top);
-            try { if (typeof GM_setValue === 'function') { GM_setValue(EJF_SD.logsig.POS_KEY, { left: Math.round(rect.left), top: top }); } } catch (e) { /* ignore */ }
+            gmSet(EJF_SD.logsig.POS_KEY, { left: Math.round(rect.left), top: top });
             EJF_SD.logsig._fitVertical(panel);
         }
         head.addEventListener('mousedown', function (e) {
@@ -3179,14 +3237,14 @@ EJF_SD.hidden = {
     _load: function () {
         if (EJF_SD.hidden._map) { return EJF_SD.hidden._map; }
         var m = {};
-        try { if (typeof GM_getValue === 'function') { m = GM_getValue(EJF_SD.hidden.KEY, {}) || {}; } } catch (e) { m = {}; }
+        m = gmGet(EJF_SD.hidden.KEY, {}) || {};
         if (!m || typeof m !== 'object') { m = {}; }
         EJF_SD.hidden._map = m;
         return m;
     },
 
     _persist: function () {
-        try { if (typeof GM_setValue === 'function') { GM_setValue(EJF_SD.hidden.KEY, EJF_SD.hidden._map || {}); } } catch (e) { /* ignore */ }
+        gmSet(EJF_SD.hidden.KEY, EJF_SD.hidden._map || {});
     },
 
     // Drop expired entries from the in-memory map; returns true if anything was removed.
@@ -3213,11 +3271,6 @@ EJF_SD.hidden = {
         m[key] = Date.now() + d * 24 * 60 * 60 * 1000;
         EJF_SD.hidden._prune();
         EJF_SD.hidden._persist();
-    },
-
-    unhide: function (key) {
-        var m = EJF_SD.hidden._load();
-        if (m[key]) { delete m[key]; EJF_SD.hidden._persist(); }
     },
 
     clear: function () {
@@ -3311,7 +3364,7 @@ EJF_SD.responses = {
     // well-formed { overrides, deleted, added }.
     _overlay: function () {
         var raw = null;
-        try { if (typeof GM_getValue === 'function') { raw = GM_getValue(EJF_SD.responses.GM_KEY, null); } } catch (e) { raw = null; }
+        raw = gmGet(EJF_SD.responses.GM_KEY, null);
         if (!raw) { return EJF_SD.responses._emptyOverlay(); }
         if (EJF_SD.responses._isArr(raw)) {                 // legacy full snapshot -> migrate once
             var ov = EJF_SD.responses._legacyToOverlay(raw);
@@ -3329,7 +3382,7 @@ EJF_SD.responses = {
     },
 
     _saveOverlay: function (ov) {
-        try { if (typeof GM_setValue === 'function') { GM_setValue(EJF_SD.responses.GM_KEY, { v: 2, overrides: ov.overrides || {}, deleted: ov.deleted || [], added: ov.added || [] }); } } catch (e) { /* ignore */ }
+        gmSet(EJF_SD.responses.GM_KEY, { v: 2, overrides: ov.overrides || {}, deleted: ov.deleted || [], added: ov.added || [] });
     },
 
     // The effective list = DEFAULTS (minus deletions, with overrides applied) + user additions. Each item is
@@ -3385,7 +3438,7 @@ EJF_SD.responses = {
 
     // Restore the built-in defaults (clears the whole overlay so load() returns pure DEFAULTS).
     reset: function () {
-        try { if (typeof GM_setValue === 'function') { GM_setValue(EJF_SD.responses.GM_KEY, null); } } catch (e) { /* ignore */ }
+        gmSet(EJF_SD.responses.GM_KEY, null);
     },
 
     // Optional opening + closing lines the user configures once (e.g. "Greetings Capsuleer," /
@@ -3394,21 +3447,11 @@ EJF_SD.responses = {
     // either can be left blank to skip it.
     OPENER_KEY: 'ejfRespOpener',
     CLOSING_KEY: 'ejfRespClosing',
-    loadOpener: function () {
-        try { if (typeof GM_getValue === 'function') { return GM_getValue(EJF_SD.responses.OPENER_KEY, '') || ''; } } catch (e) { /* ignore */ }
-        return '';
-    },
-    loadClosing: function () {
-        try { if (typeof GM_getValue === 'function') { return GM_getValue(EJF_SD.responses.CLOSING_KEY, '') || ''; } } catch (e) { /* ignore */ }
-        return '';
-    },
+    loadOpener: function () { return gmGet(EJF_SD.responses.OPENER_KEY, '') || ''; },
+    loadClosing: function () { return gmGet(EJF_SD.responses.CLOSING_KEY, '') || ''; },
     saveAffixes: function (opener, closing) {
-        try {
-            if (typeof GM_setValue === 'function') {
-                GM_setValue(EJF_SD.responses.OPENER_KEY, opener || '');
-                GM_setValue(EJF_SD.responses.CLOSING_KEY, closing || '');
-            }
-        } catch (e) { /* ignore */ }
+        gmSet(EJF_SD.responses.OPENER_KEY, opener || '');
+        gmSet(EJF_SD.responses.CLOSING_KEY, closing || '');
     },
 
     // Wrap `body` with the configured opener / closing, each on its own line (a single line break after the
@@ -3474,17 +3517,9 @@ EJF_SD.responses = {
     },
 
     openEditor: function () {
-        if (EJF_SD.menu && EJF_SD.menu.close) { EJF_SD.menu.close(); }   // close the settings menu if it's open
-        EJF_SD.menu._injectCss();
         EJF_SD.responses._injectEditorCss();
-        var $overlay = $('<div id="ejf-menu-overlay"></div>');
-        var esc = function (e) { if (e.key === 'Escape') { closeEditor(); } };
-        function closeEditor() { $overlay.remove(); document.removeEventListener('keydown', esc); }
-        $overlay.on('click', function (e) { if (e.target === this) { closeEditor(); } });   // backdrop click
-        var $menu = $('<div id="ejf-menu" class="ejf-menu-wide"></div>').appendTo($overlay);
-        var $head = $('<div class="ejf-menu-head"><h2>Customize responses</h2></div>');
-        $('<span class="ejf-menu-x" title="Close (Esc)">×</span>').on('click', closeEditor).appendTo($head);
-        $menu.append($head);
+        var ov = EJF_SD.menu._openOverlay({ title: 'Customize responses', wide: true });
+        var $menu = ov.$menu, closeEditor = ov.close;
         // Scrollable middle region (header + footer stay pinned via the flex layout in _injectEditorCss).
         var $scroll = $('<div class="ejf-resp-scroll"></div>').appendTo($menu);
         $('<div class="ejf-menu-status">These appear in the dropdown in the Zendesk Support panel; picking one replaces the comment editor.</div>').appendTo($scroll);
@@ -3618,8 +3653,6 @@ EJF_SD.responses = {
                 EJF_SD.responses.reset();
                 fillRows(EJF_SD.responses.load());
             }).appendTo($foot);
-        $overlay.appendTo(document.body);
-        document.addEventListener('keydown', esc);
     },
 
     // Replace the open comment editor's content with `body`. The Zendesk panel uses an Atlassian ProseMirror
@@ -3888,48 +3921,40 @@ EJF_SD.db = {
         return EJF_SD.db._db.transaction(name, mode).objectStore(name);
     },
 
-    bulkPut: function (recs) {
+    // Open the DB, run a single IDBRequest built by mkReq(objectStore), and resolve mapRes(request.result)
+    // (or undefined when mapRes is omitted). Collapses the identical open->Promise->onsuccess/onerror shape
+    // shared by getDefect / allDefects / countDefects / countByProject / getMeta / setMeta.
+    _req: function (name, mode, mkReq, mapRes) {
+        return EJF_SD.db.open().then(function () {
+            return new Promise(function (resolve, reject) {
+                var r = mkReq(EJF_SD.db._store(name, mode));
+                r.onsuccess = function () { resolve(mapRes ? mapRes(r.result) : undefined); };
+                r.onerror = function (e) { reject(e.target.error); };
+            });
+        });
+    },
+
+    // Open the DB and run one readwrite transaction that applies `apply(store, item)` to every item, resolving
+    // with the item count once the transaction commits. Shared by bulkPut / deleteDefects (empty -> resolve 0).
+    _bulkTx: function (items, apply) {
         return EJF_SD.db.open().then(function (db) {
             return new Promise(function (resolve, reject) {
-                if (!recs.length) { resolve(0); return; }
-                var tx = db.transaction('defects', 'readwrite');
-                var store = tx.objectStore('defects');
-                for (var i = 0; i < recs.length; i++) { store.put(recs[i]); }
-                tx.oncomplete = function () { resolve(recs.length); };
+                if (!items || !items.length) { resolve(0); return; }
+                var tx = db.transaction('defects', 'readwrite'), store = tx.objectStore('defects');
+                for (var i = 0; i < items.length; i++) { apply(store, items[i]); }
+                tx.oncomplete = function () { resolve(items.length); };
                 tx.onerror = function (e) { reject(e.target.error); };
             });
         });
     },
 
-    getDefect: function (key) {
-        return EJF_SD.db.open().then(function () {
-            return new Promise(function (resolve, reject) {
-                var r = EJF_SD.db._store('defects', 'readonly').get(key);
-                r.onsuccess = function () { resolve(r.result || null); };
-                r.onerror = function (e) { reject(e.target.error); };
-            });
-        });
-    },
+    bulkPut: function (recs) { return EJF_SD.db._bulkTx(recs, function (store, rec) { store.put(rec); }); },
 
-    allDefects: function () {
-        return EJF_SD.db.open().then(function () {
-            return new Promise(function (resolve, reject) {
-                var r = EJF_SD.db._store('defects', 'readonly').getAll();
-                r.onsuccess = function () { resolve(r.result || []); };
-                r.onerror = function (e) { reject(e.target.error); };
-            });
-        });
-    },
+    getDefect: function (key) { return EJF_SD.db._req('defects', 'readonly', function (s) { return s.get(key); }, function (v) { return v || null; }); },
 
-    countDefects: function () {
-        return EJF_SD.db.open().then(function () {
-            return new Promise(function (resolve, reject) {
-                var r = EJF_SD.db._store('defects', 'readonly').count();
-                r.onsuccess = function () { resolve(r.result || 0); };
-                r.onerror = function (e) { reject(e.target.error); };
-            });
-        });
-    },
+    allDefects: function () { return EJF_SD.db._req('defects', 'readonly', function (s) { return s.getAll(); }, function (v) { return v || []; }); },
+
+    countDefects: function () { return EJF_SD.db._req('defects', 'readonly', function (s) { return s.count(); }, function (v) { return v || 0; }); },
 
     // Clear the DEFECT records (EDR/EO) only, preserving any stored open bug reports (EBR). Used by the
     // "Rebuild defect database" action, which must not wipe the separately-synced bug-report dataset.
@@ -3952,28 +3977,11 @@ EJF_SD.db = {
     },
 
     // Delete records by key (used by the EBR incremental sync to drop reports that have since closed).
-    deleteDefects: function (keys) {
-        return EJF_SD.db.open().then(function (db) {
-            return new Promise(function (resolve, reject) {
-                if (!keys || !keys.length) { resolve(0); return; }
-                var tx = db.transaction('defects', 'readwrite');
-                var store = tx.objectStore('defects');
-                for (var i = 0; i < keys.length; i++) { store.delete(keys[i]); }
-                tx.oncomplete = function () { resolve(keys.length); };
-                tx.onerror = function (e) { reject(e.target.error); };
-            });
-        });
-    },
+    deleteDefects: function (keys) { return EJF_SD.db._bulkTx(keys, function (store, key) { store.delete(key); }); },
 
     // Count stored records whose project key === project (e.g. 'EBR'), via the by_project index.
     countByProject: function (project) {
-        return EJF_SD.db.open().then(function () {
-            return new Promise(function (resolve, reject) {
-                var r = EJF_SD.db._store('defects', 'readonly').index('by_project').count(EJF_SD.db._keyRange().only(project));
-                r.onsuccess = function () { resolve(r.result || 0); };
-                r.onerror = function (e) { reject(e.target.error); };
-            });
-        });
+        return EJF_SD.db._req('defects', 'readonly', function (s) { return s.index('by_project').count(EJF_SD.db._keyRange().only(project)); }, function (v) { return v || 0; });
     },
 
     countEbr: function () { return EJF_SD.db.countByProject('EBR'); },
@@ -3987,25 +3995,9 @@ EJF_SD.db = {
         });
     },
 
-    getMeta: function (k) {
-        return EJF_SD.db.open().then(function () {
-            return new Promise(function (resolve, reject) {
-                var r = EJF_SD.db._store('meta', 'readonly').get(k);
-                r.onsuccess = function () { resolve(r.result ? r.result.v : null); };
-                r.onerror = function (e) { reject(e.target.error); };
-            });
-        });
-    },
+    getMeta: function (k) { return EJF_SD.db._req('meta', 'readonly', function (s) { return s.get(k); }, function (v) { return v ? v.v : null; }); },
 
-    setMeta: function (k, v) {
-        return EJF_SD.db.open().then(function () {
-            return new Promise(function (resolve, reject) {
-                var r = EJF_SD.db._store('meta', 'readwrite').put({ k: k, v: v });
-                r.onsuccess = function () { resolve(); };
-                r.onerror = function (e) { reject(e.target.error); };
-            });
-        });
-    }
+    setMeta: function (k, v) { return EJF_SD.db._req('meta', 'readwrite', function (s) { return s.put({ k: k, v: v }); }); }
 };
 
 
@@ -4037,12 +4029,6 @@ EJF_SD.sync = {
                 });
             })(EJF_SD.MAX_RETRIES);
         });
-    },
-
-    approximateCount: function () {
-        return EJF_SD.sync._apiPost('/rest/api/3/search/approximate-count', { jql: EJF_SD.SCOPE })
-            .then(function (r) { return (r.data && typeof r.data.count === 'number') ? r.data.count : null; })
-            .catch(function () { return null; });
     },
 
     // Map a raw Jira issue (v2 shape) into a stored defect record.
@@ -4444,66 +4430,33 @@ EJF_SD.rank = {
         return true;
     },
 
+    // Single-flight cache wrapper shared by all four index builders: return the cached index when present and
+    // not dirty; coalesce concurrent builds onto one in-flight promise; otherwise rebuild from allDefects() via
+    // build(records), clearing the dirty flag on success and the in-flight slot on both paths. State lives in
+    // the named rank properties passed as string keys (e.g. '_index' / '_dirty' / '_building').
+    _ensureCached: function (indexKey, dirtyKey, buildingKey, build) {
+        var R = EJF_SD.rank;
+        if (R[indexKey] && !R[dirtyKey]) { return Promise.resolve(R[indexKey]); }
+        if (R[buildingKey]) { return R[buildingKey]; }
+        R[buildingKey] = EJF_SD.db.allDefects().then(function (records) {
+            R[indexKey] = build(records);
+            R[dirtyKey] = false;
+            R[buildingKey] = null;
+            return R[indexKey];
+        }).catch(function (e) { R[buildingKey] = null; throw e; });
+        return R[buildingKey];
+    },
+
     _ensureIndex: function () {
-        if (EJF_SD.rank._index && !EJF_SD.rank._dirty) { return Promise.resolve(EJF_SD.rank._index); }
-        if (EJF_SD.rank._building) { return EJF_SD.rank._building; }
-        EJF_SD.rank._building = EJF_SD.db.allDefects().then(function (records) {
-            var df = {}, docs = [], totalLen = 0;
-            for (var i = 0; i < records.length; i++) {
-                var rec = records[i];
-                if (rec.project === 'EBR') { continue; }   // bug reports live in the same store but are ranked separately
-                var toks = EJF_SD.rank._tokenize(EJF_SD.util.cleanForCompare(rec.summary, rec.description));
-                var tf = {}, seen = {};
-                for (var j = 0; j < toks.length; j++) {
-                    var tk = toks[j];
-                    tf[tk] = (tf[tk] || 0) + 1;
-                    if (!seen[tk]) { df[tk] = (df[tk] || 0) + 1; seen[tk] = true; }
-                }
-                totalLen += toks.length;
-                docs.push({ key: rec.key, project: rec.project, summary: rec.summary, status: rec.status, resolution: rec.resolution, resolutiondate: rec.resolutiondate, tf: tf, len: toks.length, hay: ((rec.key || '') + ' ' + (rec.summary || '') + ' ' + (rec.description || '')).toLowerCase() });
-            }
-            EJF_SD.rank._index = { N: docs.length, avgdl: docs.length ? (totalLen / docs.length) : 0, df: df, docs: docs };
-            EJF_SD.rank._dirty = false;
-            EJF_SD.rank._building = null;
-            return EJF_SD.rank._index;
-        }).catch(function (e) { EJF_SD.rank._building = null; throw e; });
-        return EJF_SD.rank._building;
+        return EJF_SD.rank._ensureCached('_index', '_dirty', '_building', function (records) {
+            return EJF_SD.rank._buildKeywordIndex(records, function (rec) { return rec.project !== 'EBR'; });
+        });
     },
 
     // Rank stored defects against the query text. Returns up to `limit` (default TOP_N) scored results.
     suggest: function (text, excludeKey, limit, filterTerms) {
         return EJF_SD.rank._ensureIndex().then(function (idx) {
-            if (!idx || !idx.N) { return []; }
-            var qTokens = EJF_SD.rank._tokenize(text);
-            var qSet = {};
-            for (var i = 0; i < qTokens.length; i++) { qSet[qTokens[i]] = true; }
-            var terms = Object.keys(qSet);
-            if (!terms.length) { return []; }
-            var k1 = EJF_SD.rank.K1, b = EJF_SD.rank.B, avgdl = idx.avgdl || 1;
-            // precompute idf per query term
-            var idf = {};
-            for (var t = 0; t < terms.length; t++) {
-                var n = idx.df[terms[t]] || 0;
-                idf[terms[t]] = Math.log(1 + (idx.N - n + 0.5) / (n + 0.5));
-            }
-            var scored = [];
-            for (var d = 0; d < idx.docs.length; d++) {
-                var doc = idx.docs[d];
-                if (excludeKey && doc.key === excludeKey) { continue; }
-                if (EJF_SD.hidden.isHidden(doc.key)) { continue; }   // user-hidden suggestion (temporary, persisted across updates)
-                if (filterTerms && filterTerms.length && !EJF_SD.rank._matchTerms(doc.hay, filterTerms)) { continue; }   // filter box: restrict the whole corpus
-                var score = 0;
-                for (var q = 0; q < terms.length; q++) {
-                    var tf = doc.tf[terms[q]];
-                    if (!tf) { continue; }
-                    var denom = tf + k1 * (1 - b + b * (doc.len / avgdl));
-                    score += idf[terms[q]] * (tf * (k1 + 1)) / denom;
-                }
-                if (score > 0) { scored.push({ key: doc.key, project: doc.project, summary: doc.summary, status: doc.status, resolution: doc.resolution, resolutiondate: doc.resolutiondate, score: score }); }
-                else if (filterTerms && filterTerms.length) { scored.push({ key: doc.key, project: doc.project, summary: doc.summary, status: doc.status, resolution: doc.resolution, resolutiondate: doc.resolutiondate, score: 0 }); }   // filter match with no issue-text overlap - still a candidate
-            }
-            scored.sort(function (a, c) { return c.score - a.score; });
-            return scored.slice(0, limit || EJF_SD.TOP_N);
+            return EJF_SD.rank._bm25Score(idx, text, excludeKey, limit, filterTerms);
         });
     },
 
@@ -4511,71 +4464,80 @@ EJF_SD.rank = {
     // shape and tokenizer as the defect index; closed reports are skipped defensively (the EBR sync prunes
     // them, but a stale record could linger between syncs).
     _ensureEbrIndex: function () {
-        if (EJF_SD.rank._ebrIndex && !EJF_SD.rank._dirtyEbr) { return Promise.resolve(EJF_SD.rank._ebrIndex); }
-        if (EJF_SD.rank._buildingEbr) { return EJF_SD.rank._buildingEbr; }
-        EJF_SD.rank._buildingEbr = EJF_SD.db.allDefects().then(function (records) {
-            var df = {}, docs = [], totalLen = 0;
-            for (var i = 0; i < records.length; i++) {
-                var rec = records[i];
-                if (rec.project !== 'EBR') { continue; }
-                if (EJF_SD.util.isClosedStatus(rec.status)) { continue; }   // open reports only (by status, not resolution)
-                var toks = EJF_SD.rank._tokenize(EJF_SD.util.cleanForCompare(rec.summary, rec.description));
-                var tf = {}, seen = {};
-                for (var j = 0; j < toks.length; j++) {
-                    var tk = toks[j];
-                    tf[tk] = (tf[tk] || 0) + 1;
-                    if (!seen[tk]) { df[tk] = (df[tk] || 0) + 1; seen[tk] = true; }
-                }
-                totalLen += toks.length;
-                docs.push({ key: rec.key, project: rec.project, summary: rec.summary, status: rec.status, resolution: rec.resolution, resolutiondate: rec.resolutiondate, tf: tf, len: toks.length, hay: ((rec.key || '') + ' ' + (rec.summary || '') + ' ' + (rec.description || '')).toLowerCase() });
-            }
-            EJF_SD.rank._ebrIndex = { N: docs.length, avgdl: docs.length ? (totalLen / docs.length) : 0, df: df, docs: docs };
-            EJF_SD.rank._dirtyEbr = false;
-            EJF_SD.rank._buildingEbr = null;
-            return EJF_SD.rank._ebrIndex;
-        }).catch(function (e) { EJF_SD.rank._buildingEbr = null; throw e; });
-        return EJF_SD.rank._buildingEbr;
+        return EJF_SD.rank._ensureCached('_ebrIndex', '_dirtyEbr', '_buildingEbr', function (records) {
+            return EJF_SD.rank._buildKeywordIndex(records, function (rec) { return rec.project === 'EBR' && !EJF_SD.util.isClosedStatus(rec.status); });
+        });
     },
 
     // Rank OPEN bug reports against the query text (a defect's text). Returns up to `limit` scored results,
     // each with a display `pct` relative to the top score. Mirrors `suggest` but over the EBR index.
     suggestEbr: function (text, excludeKey, limit, filterTerms) {
         return EJF_SD.rank._ensureEbrIndex().then(function (idx) {
-            if (!idx || !idx.N) { return []; }
-            var qTokens = EJF_SD.rank._tokenize(text);
-            var qSet = {};
-            for (var i = 0; i < qTokens.length; i++) { qSet[qTokens[i]] = true; }
-            var terms = Object.keys(qSet);
-            if (!terms.length) { return []; }
-            var k1 = EJF_SD.rank.K1, b = EJF_SD.rank.B, avgdl = idx.avgdl || 1;
-            var idf = {};
-            for (var t = 0; t < terms.length; t++) {
-                var n = idx.df[terms[t]] || 0;
-                idf[terms[t]] = Math.log(1 + (idx.N - n + 0.5) / (n + 0.5));
-            }
-            var scored = [];
-            for (var d = 0; d < idx.docs.length; d++) {
-                var doc = idx.docs[d];
-                if (excludeKey && doc.key === excludeKey) { continue; }
-                if (EJF_SD.hidden.isHidden(doc.key)) { continue; }   // user-hidden suggestion (temporary, persisted across updates)
-                if (filterTerms && filterTerms.length && !EJF_SD.rank._matchTerms(doc.hay, filterTerms)) { continue; }   // filter box: restrict the whole corpus
-                var score = 0;
-                for (var q = 0; q < terms.length; q++) {
-                    var tf = doc.tf[terms[q]];
-                    if (!tf) { continue; }
-                    var denom = tf + k1 * (1 - b + b * (doc.len / avgdl));
-                    score += idf[terms[q]] * (tf * (k1 + 1)) / denom;
-                }
-                if (score > 0) { scored.push({ key: doc.key, project: doc.project, summary: doc.summary, status: doc.status, resolution: doc.resolution, resolutiondate: doc.resolutiondate, score: score }); }
-                else if (filterTerms && filterTerms.length) { scored.push({ key: doc.key, project: doc.project, summary: doc.summary, status: doc.status, resolution: doc.resolution, resolutiondate: doc.resolutiondate, score: 0 }); }   // filter match with no issue-text overlap - still a candidate
-            }
-            scored.sort(function (a, c) { return c.score - a.score; });
-            scored = scored.slice(0, limit || EJF_SD.TOP_N);
+            var scored = EJF_SD.rank._bm25Score(idx, text, excludeKey, limit, filterTerms);
             var top = (scored[0] && scored[0].score) || 0;
             for (var p = 0; p < scored.length; p++) { scored[p].pct = top > 0 ? Math.round(scored[p].score / top * 100) : 0; }
             return scored;
         });
     }
+};
+
+// Shared body of the two keyword indexes (_ensureIndex / _ensureEbrIndex). `keep(rec)` selects which records
+// go in (defects = non-EBR; open reports = EBR & not closed). Returns { N, avgdl, df, docs } - identical shape
+// and tokenizer for both, so BM25 ranks the same over either corpus.
+EJF_SD.rank._buildKeywordIndex = function (records, keep) {
+    var df = {}, docs = [], totalLen = 0;
+    for (var i = 0; i < records.length; i++) {
+        var rec = records[i];
+        if (!keep(rec)) { continue; }
+        var toks = EJF_SD.rank._tokenize(EJF_SD.util.cleanForCompare(rec.summary, rec.description));
+        var tf = {}, seen = {};
+        for (var j = 0; j < toks.length; j++) {
+            var tk = toks[j];
+            tf[tk] = (tf[tk] || 0) + 1;
+            if (!seen[tk]) { df[tk] = (df[tk] || 0) + 1; seen[tk] = true; }
+        }
+        totalLen += toks.length;
+        docs.push({ key: rec.key, project: rec.project, summary: rec.summary, status: rec.status, resolution: rec.resolution, resolutiondate: rec.resolutiondate, created: rec.created, tf: tf, len: toks.length, hay: ((rec.key || '') + ' ' + (rec.summary || '') + ' ' + (rec.description || '')).toLowerCase() });
+    }
+    return { N: docs.length, avgdl: docs.length ? (totalLen / docs.length) : 0, df: df, docs: docs };
+};
+
+// Shared BM25 scoring loop for suggest / suggestEbr. Tokenizes the query, computes idf over `idx`, then scores
+// every doc that passes the exclude-key / hidden / filter-box / session-filter gates. Returns up to `limit`
+// results sorted best-first (no display pct - suggestEbr layers its own top-relative pct on the result). A
+// filter-box match with no query-term overlap is still kept as a score-0 candidate (matches the original).
+EJF_SD.rank._bm25Score = function (idx, text, excludeKey, limit, filterTerms) {
+    if (!idx || !idx.N) { return []; }
+    var qTokens = EJF_SD.rank._tokenize(text);
+    var qSet = {};
+    for (var i = 0; i < qTokens.length; i++) { qSet[qTokens[i]] = true; }
+    var terms = Object.keys(qSet);
+    if (!terms.length) { return []; }
+    var k1 = EJF_SD.rank.K1, b = EJF_SD.rank.B, avgdl = idx.avgdl || 1;
+    var idf = {};
+    for (var t = 0; t < terms.length; t++) {
+        var n = idx.df[terms[t]] || 0;
+        idf[terms[t]] = Math.log(1 + (idx.N - n + 0.5) / (n + 0.5));
+    }
+    var scored = [];
+    for (var d = 0; d < idx.docs.length; d++) {
+        var doc = idx.docs[d];
+        if (excludeKey && doc.key === excludeKey) { continue; }
+        if (EJF_SD.hidden.isHidden(doc.key)) { continue; }   // user-hidden suggestion (temporary, persisted across updates)
+        if (filterTerms && filterTerms.length && !EJF_SD.rank._matchTerms(doc.hay, filterTerms)) { continue; }   // filter box: restrict the whole corpus
+        if (!EJF_SD.ui.passesFilter(doc)) { continue; }   // session filters (status / recency)
+        var score = 0;
+        for (var q = 0; q < terms.length; q++) {
+            var tf = doc.tf[terms[q]];
+            if (!tf) { continue; }
+            var denom = tf + k1 * (1 - b + b * (doc.len / avgdl));
+            score += idf[terms[q]] * (tf * (k1 + 1)) / denom;
+        }
+        if (score > 0) { scored.push({ key: doc.key, project: doc.project, summary: doc.summary, status: doc.status, resolution: doc.resolution, resolutiondate: doc.resolutiondate, score: score }); }
+        else if (filterTerms && filterTerms.length) { scored.push({ key: doc.key, project: doc.project, summary: doc.summary, status: doc.status, resolution: doc.resolution, resolutiondate: doc.resolutiondate, score: 0 }); }   // filter match with no issue-text overlap - still a candidate
+    }
+    scored.sort(function (a, c) { return c.score - a.score; });
+    return scored.slice(0, limit || EJF_SD.TOP_N);
 };
 
 
@@ -4641,10 +4603,8 @@ EJF_SD.embed = {
                 // the menu toggle is the ONLY thing that switches backend - a GPU failure does NOT auto-fall
                 // back to CPU (it retries on GPU, then pauses). `sdForceCpu` is still honored if the menu sets
                 // it, but the embed/query paths no longer set it themselves.
-                var forceCpu = EJF_SD.embed._cpuFallback ||
-                    (typeof GM_getValue === 'function' && GM_getValue('sdForceCpu', false));
-                var tryGpu = !forceCpu &&
-                    (typeof GM_getValue !== 'function' || GM_getValue('sdTryWebgpu', true));
+                var forceCpu = EJF_SD.embed._cpuFallback || gmGet('sdForceCpu', false);
+                var tryGpu = !forceCpu && gmGet('sdTryWebgpu', true);
                 var attempts = tryGpu
                     ? [{ device: 'webgpu', dtype: 'fp32' }, { device: 'wasm', dtype: 'q8' }]
                     : [{ device: 'wasm', dtype: 'q8' }];
@@ -4695,14 +4655,10 @@ EJF_SD.embed = {
         return EJF_SD.embed._loading;
     },
 
-    // Embed a single text -> normalized Float32Array(384).
+    // Embed a single text -> normalized Float32Array(384). Delegates to embedBatch, whose single-item path is
+    // the identical plain-string call (same input clamping + shape).
     embedOne: function (text) {
-        return EJF_SD.embed.load().then(function (pipe) {
-            var input = (text || ' ').slice(0, EJF_SD.embed.MAX_CHARS) || ' ';
-            return pipe(input, { pooling: 'mean', normalize: true }).then(function (out) {
-                return new Float32Array(out.data);
-            });
-        });
+        return EJF_SD.embed.embedBatch([text]).then(function (vecs) { return vecs[0]; });
     },
 
     // Embed an array of texts -> array of normalized Float32Array(384).
@@ -4837,25 +4793,26 @@ EJF_SD.rank._vecIndex = null;     // cached array of { key, project, summary, st
 EJF_SD.rank._dirtyVec = true;     // rebuild the in-memory vector cache on next semantic query
 EJF_SD.rank._buildingVec = null;
 
-// Build (and cache) the in-memory list of vectors for the current model version.
-EJF_SD.rank._ensureVecIndex = function () {
-    if (EJF_SD.rank._vecIndex && !EJF_SD.rank._dirtyVec) { return Promise.resolve(EJF_SD.rank._vecIndex); }
-    if (EJF_SD.rank._buildingVec) { return EJF_SD.rank._buildingVec; }
-    EJF_SD.rank._buildingVec = EJF_SD.db.allDefects().then(function (recs) {
-        var docs = [];
-        for (var i = 0; i < recs.length; i++) {
-            var r = recs[i];
-            if (r.project === 'EBR') { continue; }   // bug reports are keyword-ranked only, not part of the defect vector index
-            if (r.embedding && r.embeddingModelVersion === EJF_SD.MODEL_VERSION) {
-                docs.push({ key: r.key, project: r.project, summary: r.summary, status: r.status, resolution: r.resolution, resolutiondate: r.resolutiondate, vec: r.embedding, hay: ((r.key || '') + ' ' + (r.summary || '') + ' ' + (r.description || '')).toLowerCase() });
-            }
+// Shared body of the two vector indexes (_ensureVecIndex / _ensureEbrVecIndex): the current-model embedded
+// docs, filtered by `keep` (defects = non-EBR; open reports = EBR & not closed). resolutiondate is carried
+// uniformly (unused on the EBR side, harmless).
+EJF_SD.rank._buildVecIndex = function (records, keep) {
+    var docs = [];
+    for (var i = 0; i < records.length; i++) {
+        var r = records[i];
+        if (!keep(r)) { continue; }
+        if (r.embedding && r.embeddingModelVersion === EJF_SD.MODEL_VERSION) {
+            docs.push({ key: r.key, project: r.project, summary: r.summary, status: r.status, resolution: r.resolution, resolutiondate: r.resolutiondate, created: r.created, vec: r.embedding, hay: ((r.key || '') + ' ' + (r.summary || '') + ' ' + (r.description || '')).toLowerCase() });
         }
-        EJF_SD.rank._vecIndex = docs;
-        EJF_SD.rank._dirtyVec = false;
-        EJF_SD.rank._buildingVec = null;
-        return docs;
-    }).catch(function (e) { EJF_SD.rank._buildingVec = null; throw e; });
-    return EJF_SD.rank._buildingVec;
+    }
+    return docs;
+};
+
+// Build (and cache) the in-memory list of DEFECT vectors for the current model version.
+EJF_SD.rank._ensureVecIndex = function () {
+    return EJF_SD.rank._ensureCached('_vecIndex', '_dirtyVec', '_buildingVec', function (recs) {
+        return EJF_SD.rank._buildVecIndex(recs, function (r) { return r.project !== 'EBR'; });
+    });
 };
 
 // Cosine similarity of two normalized vectors == dot product.
@@ -4867,6 +4824,34 @@ EJF_SD.rank._dot = function (a, b) {
 
 EJF_SD.rank.CAND = 50;     // candidates pulled from each retriever before fusion
 EJF_SD.rank.RRF_K = 60;    // Reciprocal-Rank-Fusion constant (standard default)
+
+// Fuse a semantic candidate list and a BM25 candidate list into the final TOP_N results via Reciprocal Rank
+// Fusion. RRF decides WHICH results make the cut (so strong keyword hits aren't lost even when their cosine
+// is middling); the kept rows are then presented sorted by the displayed cosine % so the panel reads high to
+// low. `demote` (optional, defect side only) is applied to each fused row before the cut, age-demoting stale
+// closed matches (it lowers both rrf and pct, so they fall in the cut AND read lower). Returns the TOP_N array.
+EJF_SD.rank._fuse = function (sem, bm, demote) {
+    var K = EJF_SD.rank.RRF_K;
+    var rrf = {}, meta = {}, cosByKey = {};
+    var semTop = sem.slice(0, EJF_SD.rank.CAND);
+    for (var i = 0; i < semTop.length; i++) { rrf[semTop[i].key] = (rrf[semTop[i].key] || 0) + 1 / (K + i); meta[semTop[i].key] = semTop[i]; }
+    for (var j = 0; j < bm.length; j++) { rrf[bm[j].key] = (rrf[bm[j].key] || 0) + 1 / (K + j); if (!meta[bm[j].key]) { meta[bm[j].key] = bm[j]; } }
+    for (var c = 0; c < sem.length; c++) { cosByKey[sem[c].key] = sem[c].score; }   // cosine for display (all docs)
+    var out = Object.keys(rrf).map(function (k) {
+        var m = meta[k];
+        var hasCos = (cosByKey[k] !== undefined && isFinite(cosByKey[k]));
+        return {
+            key: k, project: m.project, summary: m.summary, status: m.status, resolution: m.resolution,
+            resolutiondate: m.resolutiondate,
+            rrf: rrf[k], pct: hasCos ? Math.round(Math.max(0, Math.min(1, cosByKey[k])) * 100) : 0
+        };
+    });
+    if (demote) { for (var s = 0; s < out.length; s++) { demote(out[s]); } }
+    out.sort(function (a, c2) { return c2.rrf - a.rrf; });
+    var topN = out.slice(0, EJF_SD.TOP_N);
+    topN.sort(function (a, c2) { return c2.pct - a.pct; });
+    return topN;
+};
 
 // Embed the query text, caching the most recent (text -> vector) so filter-box keystrokes (which re-rank the
 // SAME issue text against a changing filter) don't re-run the transformer every time - only the filter +
@@ -4880,26 +4865,30 @@ EJF_SD.rank._embedQuery = function (text) {
     });
 };
 
-// Cosine-score every stored vector against the query vector, sorted best-first. Returns [] if none embedded.
-// `filterTerms` (from the filter box) restricts scoring to docs whose key+title+description contains them all.
-EJF_SD.rank._semanticScored = function (qv, excludeKey, filterTerms) {
-    return EJF_SD.rank._ensureVecIndex().then(function (docs) {
+// Cosine-score every doc from `indexGetter()` (a Promise of a vec index) against the query vector, applying
+// the exclude / hidden / filter-box / session-filter gates, sorted best-first. [] if none embedded. Shared by
+// the defect and open-EBR semantic scorers (identical loop; resolutiondate is carried uniformly - unused on
+// the EBR side, harmless). `filterTerms` restricts to docs whose key+title+description contains them all.
+EJF_SD.rank._cosineScored = function (indexGetter, qv, excludeKey, filterTerms) {
+    return indexGetter().then(function (docs) {
         var scored = [];
         for (var d = 0; d < docs.length; d++) {
             if (excludeKey && docs[d].key === excludeKey) { continue; }
             if (EJF_SD.hidden.isHidden(docs[d].key)) { continue; }   // user-hidden suggestion (temporary, persisted across updates)
             if (filterTerms && filterTerms.length && !EJF_SD.rank._matchTerms(docs[d].hay, filterTerms)) { continue; }
+            if (!EJF_SD.ui.passesFilter(docs[d])) { continue; }   // session filters (status / recency)
             var sc = EJF_SD.rank._dot(qv, docs[d].vec);
             if (!isFinite(sc)) { continue; }   // defensively drop any corrupt (NaN/Inf) vector
-            scored.push({
-                key: docs[d].key, project: docs[d].project, summary: docs[d].summary,
-                status: docs[d].status, resolution: docs[d].resolution, resolutiondate: docs[d].resolutiondate,
-                score: sc
-            });
+            scored.push({ key: docs[d].key, project: docs[d].project, summary: docs[d].summary, status: docs[d].status, resolution: docs[d].resolution, resolutiondate: docs[d].resolutiondate, score: sc });
         }
         scored.sort(function (a, c) { return c.score - a.score; });
         return scored;
     });
+};
+
+// Cosine-score the DEFECT vectors against the query. [] if none embedded.
+EJF_SD.rank._semanticScored = function (qv, excludeKey, filterTerms) {
+    return EJF_SD.rank._cosineScored(EJF_SD.rank._ensureVecIndex, qv, excludeKey, filterTerms);
 };
 
 /* ---- EBR semantic ranking (stage 2): cosine over OPEN bug-report embeddings ---- */
@@ -4910,40 +4899,56 @@ EJF_SD.rank._buildingEbrVec = null;
 // In-memory vector list over OPEN bug reports (project EBR) with a current-version embedding. Mirrors
 // _ensureVecIndex but keeps only open EBRs (closed ones aren't ranked and lose their slot).
 EJF_SD.rank._ensureEbrVecIndex = function () {
-    if (EJF_SD.rank._ebrVecIndex && !EJF_SD.rank._dirtyEbrVec) { return Promise.resolve(EJF_SD.rank._ebrVecIndex); }
-    if (EJF_SD.rank._buildingEbrVec) { return EJF_SD.rank._buildingEbrVec; }
-    EJF_SD.rank._buildingEbrVec = EJF_SD.db.allDefects().then(function (recs) {
-        var docs = [];
-        for (var i = 0; i < recs.length; i++) {
-            var r = recs[i];
-            if (r.project !== 'EBR') { continue; }
-            if (EJF_SD.util.isClosedStatus(r.status)) { continue; }   // open reports only (by status, not resolution)
-            if (r.embedding && r.embeddingModelVersion === EJF_SD.MODEL_VERSION) {
-                docs.push({ key: r.key, project: r.project, summary: r.summary, status: r.status, resolution: r.resolution, vec: r.embedding, hay: ((r.key || '') + ' ' + (r.summary || '') + ' ' + (r.description || '')).toLowerCase() });
-            }
-        }
-        EJF_SD.rank._ebrVecIndex = docs;
-        EJF_SD.rank._dirtyEbrVec = false;
-        EJF_SD.rank._buildingEbrVec = null;
-        return docs;
-    }).catch(function (e) { EJF_SD.rank._buildingEbrVec = null; throw e; });
-    return EJF_SD.rank._buildingEbrVec;
+    return EJF_SD.rank._ensureCached('_ebrVecIndex', '_dirtyEbrVec', '_buildingEbrVec', function (recs) {
+        return EJF_SD.rank._buildVecIndex(recs, function (r) { return r.project === 'EBR' && !EJF_SD.util.isClosedStatus(r.status); });
+    });
 };
 
-// Cosine-score every stored OPEN-EBR vector against the query vector, sorted best-first. [] if none embedded.
+// Cosine-score the OPEN-EBR vectors against the query. [] if none embedded.
 EJF_SD.rank._semanticScoredEbr = function (qv, excludeKey, filterTerms) {
-    return EJF_SD.rank._ensureEbrVecIndex().then(function (docs) {
-        var scored = [];
-        for (var d = 0; d < docs.length; d++) {
-            if (excludeKey && docs[d].key === excludeKey) { continue; }
-            if (EJF_SD.hidden.isHidden(docs[d].key)) { continue; }   // user-hidden suggestion (temporary, persisted across updates)
-            if (filterTerms && filterTerms.length && !EJF_SD.rank._matchTerms(docs[d].hay, filterTerms)) { continue; }
-            var sc = EJF_SD.rank._dot(qv, docs[d].vec);
-            if (!isFinite(sc)) { continue; }
-            scored.push({ key: docs[d].key, project: docs[d].project, summary: docs[d].summary, status: docs[d].status, resolution: docs[d].resolution, score: sc });
-        }
-        scored.sort(function (a, c) { return c.score - a.score; });
-        return scored;
+    return EJF_SD.rank._cosineScored(EJF_SD.rank._ensureEbrVecIndex, qv, excludeKey, filterTerms);
+};
+
+// Shared HYBRID body for suggestBest / suggestEbrBest: embed the query, cosine-score via semFn, fall back to
+// keyword when nothing is embedded (or the filter excluded all), else pull the BM25 candidates via bmFn and
+// RRF-fuse (with optional `demote`, defect side only). A query-time embed failure (e.g. a WebGPU device loss)
+// drops the possibly-dead pipeline - we do NOT auto-switch backend, that's the user's menu choice - and shows
+// keyword results for now.
+EJF_SD.rank._hybridResults = function (text, key, filterTerms, semFn, bmFn, keywordOnly, demote) {
+    return EJF_SD.rank._embedQuery(text).then(function (qv) {
+        return semFn(qv, key, filterTerms).then(function (sem) {
+            if (!sem.length) { return keywordOnly(); }
+            return bmFn(text, key, EJF_SD.rank.CAND, filterTerms).then(function (bm) {
+                return { mode: 'Hybrid', results: EJF_SD.rank._fuse(sem, bm, demote) };
+            });
+        });
+    }).catch(function () {
+        EJF_SD.embed._resetPipe();
+        return keywordOnly();
+    });
+};
+
+// Shared mode-selection tail: honor a forced Keyword override, go straight to hybrid() when the model is ready,
+// keyword() when it's permanently unavailable, else kick off the warm-up and give the model a brief window
+// (WARM_WAIT_MS) - resolving to hybrid() if it loads in time (skipping the keyword->hybrid flicker), else
+// keyword() now (prepare()'s later re-render upgrades it once the model is ready).
+EJF_SD.rank._pickMode = function (forceMode, keywordOnly, hybrid) {
+    if (forceMode === 'Keyword') { return keywordOnly(); }
+    if (EJF_SD.embed.ready) { return hybrid(); }
+    if (EJF_SD.embed.unavailable) { return keywordOnly(); }
+    EJF_SD.embed.prepare();
+    return new Promise(function (resolve) {
+        var settled = false;
+        var timer = setTimeout(function () { if (settled) { return; } settled = true; resolve(keywordOnly()); }, EJF_SD.embed.WARM_WAIT_MS);
+        EJF_SD.embed.load().then(function () {
+            if (settled) { return; }
+            settled = true; clearTimeout(timer);
+            resolve(hybrid());
+        }, function () {
+            if (settled) { return; }
+            settled = true; clearTimeout(timer);
+            resolve(keywordOnly());
+        });
     });
 };
 
@@ -4979,75 +4984,11 @@ EJF_SD.rank.suggestBest = function (text, key, brCreated, forceMode, filterTerms
             return { mode: 'Keyword', results: list };
         });
     }
-    // Build the HYBRID (semantic + keyword) result set. Called once the embedding model is ready.
+    // HYBRID (semantic + keyword, RRF-fused) over the DEFECT indexes, with stale-match demotion.
     function hybrid() {
-        return EJF_SD.rank._embedQuery(text).then(function (qv) {
-        return EJF_SD.rank._semanticScored(qv, key, filterTerms).then(function (sem) {
-            if (!sem.length) { return keywordOnly(); }   // nothing embedded yet (or filter excluded all)
-            return EJF_SD.rank.suggest(text, key, EJF_SD.rank.CAND, filterTerms).then(function (bm) {
-                var K = EJF_SD.rank.RRF_K;
-                var rrf = {}, meta = {}, cosByKey = {};
-                var semTop = sem.slice(0, EJF_SD.rank.CAND);
-                for (var i = 0; i < semTop.length; i++) { rrf[semTop[i].key] = (rrf[semTop[i].key] || 0) + 1 / (K + i); meta[semTop[i].key] = semTop[i]; }
-                for (var j = 0; j < bm.length; j++) { rrf[bm[j].key] = (rrf[bm[j].key] || 0) + 1 / (K + j); if (!meta[bm[j].key]) { meta[bm[j].key] = bm[j]; } }
-                for (var c = 0; c < sem.length; c++) { cosByKey[sem[c].key] = sem[c].score; }   // cosine for display (all docs)
-                var out = Object.keys(rrf).map(function (k) {
-                    var m = meta[k];
-                    var hasCos = (cosByKey[k] !== undefined && isFinite(cosByKey[k]));
-                    return {
-                        key: k, project: m.project, summary: m.summary, status: m.status, resolution: m.resolution,
-                        resolutiondate: m.resolutiondate,
-                        rrf: rrf[k], pct: hasCos ? Math.round(Math.max(0, Math.min(1, cosByKey[k])) * 100) : 0
-                    };
-                });
-                for (var s = 0; s < out.length; s++) { demote(out[s]); }   // Feature A: age-demote stale closed matches
-                // RRF decides WHICH results make the cut (so strong keyword hits aren't lost even when their
-                // cosine is middling) - then present those top-N sorted by the displayed similarity % so the
-                // panel reads high-to-low, matching what the user sees. (Demotion above lowers both rrf and pct
-                // for stale matches, so they fall in the cut AND read lower.)
-                out.sort(function (a, c2) { return c2.rrf - a.rrf; });
-                var topN = out.slice(0, EJF_SD.TOP_N);
-                topN.sort(function (a, c2) { return c2.pct - a.pct; });
-                return { mode: 'Hybrid', results: topN };
-            });
-        });
-        }).catch(function () {
-            // A query-time embed failed (e.g. a WebGPU device loss while viewing a report). We do NOT
-            // auto-switch to CPU - that's the user's choice via the menu. Just drop the (possibly dead)
-            // pipeline so the next query rebuilds on the same backend, and show keyword results for now.
-            EJF_SD.embed._resetPipe();
-            return keywordOnly();
-        });
+        return EJF_SD.rank._hybridResults(text, key, filterTerms, EJF_SD.rank._semanticScored, EJF_SD.rank.suggest, keywordOnly, demote);
     }
-
-    // User forced keyword ranking this session (clicked the badge) -> skip the model entirely.
-    if (forceMode === 'Keyword') { return keywordOnly(); }
-    // Model already loaded -> straight to Hybrid. Permanently unavailable -> Keyword only.
-    if (EJF_SD.embed.ready) { return hybrid(); }
-    if (EJF_SD.embed.unavailable) { return keywordOnly(); }
-
-    // Not ready yet: start the background warm-up + embed pass, then give the model a brief window to finish
-    // loading. If it loads in time (fast when the weights are cached), render Hybrid directly and skip the
-    // keyword->hybrid flicker; if it's slow (uncached / first download), show Keyword now and let prepare()'s
-    // re-render upgrade us once the model is ready.
-    EJF_SD.embed.prepare();
-    return new Promise(function (resolve) {
-        var settled = false;
-        var timer = setTimeout(function () {
-            if (settled) { return; }
-            settled = true;
-            resolve(keywordOnly());
-        }, EJF_SD.embed.WARM_WAIT_MS);
-        EJF_SD.embed.load().then(function () {
-            if (settled) { return; }
-            settled = true; clearTimeout(timer);
-            resolve(hybrid());
-        }, function () {
-            if (settled) { return; }
-            settled = true; clearTimeout(timer);
-            resolve(keywordOnly());
-        });
-    });
+    return EJF_SD.rank._pickMode(forceMode, keywordOnly, hybrid);
 };
 
 // EDR (defect) -> matching OPEN bug reports, best available ranking. Same hybrid (semantic + BM25, fused
@@ -5060,56 +5001,11 @@ EJF_SD.rank.suggestEbrBest = function (text, key, forceMode, filterTerms) {
             return { mode: 'Keyword', results: list };
         });
     }
+    // HYBRID over the OPEN-EBR indexes; no stale-demotion (open reports have no fix date).
     function hybrid() {
-        return EJF_SD.rank._embedQuery(text).then(function (qv) {
-        return EJF_SD.rank._semanticScoredEbr(qv, key, filterTerms).then(function (sem) {
-            if (!sem.length) { return keywordOnly(); }   // nothing embedded yet (or filter excluded all)
-            return EJF_SD.rank.suggestEbr(text, key, EJF_SD.rank.CAND, filterTerms).then(function (bm) {
-                var K = EJF_SD.rank.RRF_K;
-                var rrf = {}, meta = {}, cosByKey = {};
-                var semTop = sem.slice(0, EJF_SD.rank.CAND);
-                for (var i = 0; i < semTop.length; i++) { rrf[semTop[i].key] = (rrf[semTop[i].key] || 0) + 1 / (K + i); meta[semTop[i].key] = semTop[i]; }
-                for (var j = 0; j < bm.length; j++) { rrf[bm[j].key] = (rrf[bm[j].key] || 0) + 1 / (K + j); if (!meta[bm[j].key]) { meta[bm[j].key] = bm[j]; } }
-                for (var c = 0; c < sem.length; c++) { cosByKey[sem[c].key] = sem[c].score; }
-                var out = Object.keys(rrf).map(function (k) {
-                    var m = meta[k];
-                    var hasCos = (cosByKey[k] !== undefined && isFinite(cosByKey[k]));
-                    return {
-                        key: k, project: m.project, summary: m.summary, status: m.status, resolution: m.resolution,
-                        rrf: rrf[k], pct: hasCos ? Math.round(Math.max(0, Math.min(1, cosByKey[k])) * 100) : 0
-                    };
-                });
-                // RRF decides the cut; present sorted by the displayed similarity % (matches suggestBest).
-                out.sort(function (a, c2) { return c2.rrf - a.rrf; });
-                var topN = out.slice(0, EJF_SD.TOP_N);
-                topN.sort(function (a, c2) { return c2.pct - a.pct; });
-                return { mode: 'Hybrid', results: topN };
-            });
-        });
-        }).catch(function () {
-            EJF_SD.embed._resetPipe();   // drop a possibly-dead pipeline; show keyword results for now
-            return keywordOnly();
-        });
+        return EJF_SD.rank._hybridResults(text, key, filterTerms, EJF_SD.rank._semanticScoredEbr, EJF_SD.rank.suggestEbr, keywordOnly);
     }
-
-    if (forceMode === 'Keyword') { return keywordOnly(); }   // user forced keyword ranking this session
-    if (EJF_SD.embed.ready) { return hybrid(); }
-    if (EJF_SD.embed.unavailable) { return keywordOnly(); }
-    // Not ready yet: kick off the warm-up + embed pass, then briefly wait for the model (fast when cached).
-    EJF_SD.embed.prepare();
-    return new Promise(function (resolve) {
-        var settled = false;
-        var timer = setTimeout(function () { if (settled) { return; } settled = true; resolve(keywordOnly()); }, EJF_SD.embed.WARM_WAIT_MS);
-        EJF_SD.embed.load().then(function () {
-            if (settled) { return; }
-            settled = true; clearTimeout(timer);
-            resolve(hybrid());
-        }, function () {
-            if (settled) { return; }
-            settled = true; clearTimeout(timer);
-            resolve(keywordOnly());
-        });
-    });
+    return EJF_SD.rank._pickMode(forceMode, keywordOnly, hybrid);
 };
 
 
@@ -5142,7 +5038,7 @@ EJF_SD.link = {
     // key is versioned because an earlier build cached only the name and could link the wrong way round.)
     dupInfo: function () {
         if (EJF_SD.link._info) { return Promise.resolve(EJF_SD.link._info); }
-        var cached = (typeof GM_getValue === 'function') ? GM_getValue('sdDupLink_v2', null) : null;
+        var cached = gmGet('sdDupLink_v2', null);
         if (cached && cached.name) { EJF_SD.link._info = cached; return Promise.resolve(cached); }
         return new Promise(function (resolve) {
             $.ajax({ url: EJF_SD.HOST + '/rest/api/3/issueLinkType', dataType: 'json' })
@@ -5156,7 +5052,7 @@ EJF_SD.link = {
                     }
                     if (!info) { info = { name: 'Duplicate', ebrSide: 'outward' }; }   // sensible default
                     EJF_SD.link._info = info;
-                    try { if (typeof GM_setValue === 'function') { GM_setValue('sdDupLink_v2', info); } } catch (e) { /* ignore */ }
+                    gmSet('sdDupLink_v2', info);
                     resolve(info);
                 })
                 .fail(function () { resolve({ name: 'Duplicate', ebrSide: 'outward' }); });
@@ -5320,6 +5216,25 @@ EJF_SD.ui = {
 #ejf-sd-hidemenu .ejf-sd-hidemenu-label { color: #9aa6b2; font-size: 10px; padding: 2px 6px 6px; white-space: nowrap; }\
 #ejf-sd-hidemenu .ejf-sd-hidemenu-btn { display: block; width: 100%; text-align: left; background: transparent; color: #e6e6e6; border: none; border-radius: 4px; padding: 6px 8px; cursor: pointer; font-size: 12px; }\
 #ejf-sd-hidemenu .ejf-sd-hidemenu-btn:hover { background: #2c333a; }\
+#ejf-sd-filterbtn { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; border-radius: 6px; color: #9aa6b2; cursor: pointer; user-select: none; position: relative; flex: 0 0 auto; }\
+#ejf-sd-filterbtn:hover { color: #e6e6e6; background: #3a434d; }\
+#ejf-sd-filterbtn.active { color: #4c9aff; }\
+#ejf-sd-filterbtn.active::after { content: ""; position: absolute; top: 1px; right: 1px; width: 5px; height: 5px; border-radius: 50%; background: #4c9aff; }\
+#ejf-sd-filtermenu { position: fixed; z-index: 10002; background: #14181b; color: #e6e6e6; border: 1px solid #3a434d; border-radius: 6px; box-shadow: 0 6px 24px rgba(0,0,0,.55); padding: 10px; font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif; font-size: 12px; min-width: 190px; }\
+#ejf-sd-filtermenu .ejf-fm-label { color: #9aa6b2; font-size: 10px; text-transform: uppercase; letter-spacing: .04em; margin: 2px 0 5px; }\
+#ejf-sd-filtermenu .ejf-fm-seg { display: flex; margin-bottom: 10px; border: 1px solid #3a434d; border-radius: 6px; overflow: hidden; }\
+#ejf-sd-filtermenu .ejf-fm-segbtn { flex: 1; background: transparent; color: #cfd6dd; border: none; border-right: 1px solid #3a434d; padding: 5px 6px; cursor: pointer; font-size: 12px; }\
+#ejf-sd-filtermenu .ejf-fm-segbtn:last-child { border-right: none; }\
+#ejf-sd-filtermenu .ejf-fm-segbtn:hover { background: #2c333a; }\
+#ejf-sd-filtermenu .ejf-fm-segbtn.on { background: #4c9aff; color: #fff; font-weight: 700; }\
+#ejf-sd-filtermenu .ejf-fm-created { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }\
+#ejf-sd-filtermenu .ejf-fm-num { width: 54px; background: #0f1316; color: #e6e6e6; border: 1px solid #3a434d; border-radius: 4px; padding: 4px 6px; font-size: 12px; outline: none; }\
+#ejf-sd-filtermenu .ejf-fm-num:focus { border-color: #4c9aff; }\
+#ejf-sd-filtermenu .ejf-fm-unit { color: #9aa6b2; margin-right: 2px; }\
+#ejf-sd-filtermenu .ejf-fm-chip { background: #2c333a; color: #cfd6dd; border: 1px solid #3a434d; border-radius: 10px; padding: 2px 8px; cursor: pointer; font-size: 11px; }\
+#ejf-sd-filtermenu .ejf-fm-chip:hover { border-color: #4c9aff; color: #fff; }\
+#ejf-sd-filtermenu .ejf-fm-reset { display: block; width: 100%; margin-top: 10px; background: transparent; color: #9aa6b2; border: 1px solid #3a434d; border-radius: 5px; padding: 5px; cursor: pointer; font-size: 11px; }\
+#ejf-sd-filtermenu .ejf-fm-reset:hover { color: #fff; border-color: #4c9aff; }\
 .ejf-sd-list li.ejf-sd-stale { opacity: .6; }\
 .ejf-sd-sum { margin-top: 2px; color: #e6e6e6; overflow-wrap: anywhere; word-break: break-word; }\
 .ejf-sd-meta { margin-top: 2px; color: #7a8694; font-size: 10px; overflow-wrap: anywhere; word-break: break-word; }\
@@ -5387,6 +5302,10 @@ EJF_SD.ui = {
 .ejf-side-subhead { display: flex; align-items: center; gap: 8px; margin: 2px 0 4px; }\
 .ejf-side-subhead #ejf-sd-title { flex: 1; font-weight: 600; font-size: 12px; color: var(--ds-text-subtle, #44546f); }\
 #ejf-side-group #ejf-sd-mode { font-size: 10px; background: var(--ds-background-neutral, #091e420f); color: var(--ds-text-subtle, #44546f); padding: 1px 6px; border-radius: 8px; }\
+#ejf-side-group #ejf-sd-filterbtn { color: var(--ds-text-subtle, #44546f); }\
+#ejf-side-group #ejf-sd-filterbtn:hover { color: var(--ds-text, #172b4d); background: var(--ds-background-neutral, #091e420f); }\
+#ejf-side-group #ejf-sd-filterbtn.active { color: var(--ds-link, #0c66e4); }\
+#ejf-side-group #ejf-sd-filterbtn.active::after { background: var(--ds-link, #0c66e4); }\
 #ejf-side-group #ejf-sd-filter { background: var(--ds-surface, #fff); color: var(--ds-text, #172b4d); border-color: var(--ds-border-input, #8590a2); }\
 #ejf-side-group #ejf-sd-filter:focus { border-color: var(--ds-border-focused, #388bff); }\
 #ejf-side-group #ejf-sd-status { padding: 4px 0; border-bottom: none; color: var(--ds-text-subtlest, #626f86); }\
@@ -5448,6 +5367,12 @@ EJF_SD.ui = {
         if (EJF_SD.ui._filterWired) { return; }   // one set of delegated handlers survives chrome re-mounts
         EJF_SD.ui._filterWired = true;
         $(document).on('click', '#ejf-sd-mode', function () { EJF_SD.ui._cycleMode(); });
+        // Funnel button: toggle the filter popover (delegated so it survives the chrome re-mounting).
+        $(document).on('click', '#ejf-sd-filterbtn', function (e) {
+            e.preventDefault(); e.stopPropagation();
+            if (document.getElementById('ejf-sd-filtermenu')) { EJF_SD.ui._closeFilterMenu(); }
+            else { EJF_SD.ui._showFilterMenu(this); }
+        });
         // Debounced re-query as the user types. (We previously tried to keep Jira from flagging the page as
         // having "unsubmitted changes" - it warns on reload because the filter input lives inside its issue
         // view - but the detection runs ahead of anything we can intercept, so we just accept the warning.)
@@ -5483,6 +5408,144 @@ EJF_SD.ui = {
             EJF_SD.ui.modeOverride = (shown.indexOf('hybrid') >= 0) ? 'Keyword' : 'Hybrid';
         }
         EJF_SD.ui._rerenderCurrent();
+    },
+
+    // ---- session filters (funnel popover): Status (Open/Fixed/All) + Created-within-N-days ----
+    // Deliberately IN-MEMORY only, like modeOverride: a reload resets them. `passesFilter` is called as a
+    // per-candidate predicate inside every ranking loop (BM25 + semantic, defect + report), so filtered docs
+    // are dropped BEFORE the TOP_N cut - you always get a full N of matching results, not N-minus-the-filtered.
+    filters: { status: 'all', createdDays: 0 },   // status: 'all'|'open'|'fixed'; createdDays: 0 = off
+
+    // True iff a candidate passes the current session filters. Status applies to DEFECT candidates only (open
+    // bug reports are open by definition, so it's a no-op on the reports view even if 'fixed' is left set).
+    // Created-within applies to any candidate carrying a `created` date.
+    passesFilter: function (doc) {
+        var f = EJF_SD.ui.filters;
+        if (!f) { return true; }
+        if (f.status && f.status !== 'all' && doc.project !== 'EBR') {
+            var resolved = EJF_SD.util.isResolved(doc.status, doc.resolution);
+            if (f.status === 'open' && resolved) { return false; }
+            if (f.status === 'fixed' && !resolved) { return false; }
+        }
+        if (f.createdDays > 0) {
+            var t = doc.created ? Date.parse(doc.created) : NaN;
+            if (isNaN(t) || (Date.now() - t) > f.createdDays * 86400000) { return false; }   // unknown/too-old age
+        }
+        return true;
+    },
+
+    // Whether any filter that AFFECTS the current view is active (drives the funnel's active dot). Status only
+    // counts on the similar-defects (EBR) view; Created counts on both.
+    _filtersActive: function () {
+        var f = EJF_SD.ui.filters;
+        if (!f) { return false; }
+        var onEbr = /^EBR-/.test(EJF_SD.ui.currentKey || '');
+        return !!((onEbr && f.status && f.status !== 'all') || f.createdDays > 0);
+    },
+
+    _funnelSvg: '<svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor" aria-hidden="true"><path d="M1 2.6c0-.33.27-.6.6-.6h12.8c.33 0 .6.27.6.6 0 .14-.05.28-.14.39L10 8.7v4.3a.6.6 0 0 1-.87.54l-2.4-1.2A.6.6 0 0 1 6 11.8V8.7L1.14 2.99A.6.6 0 0 1 1 2.6z"/></svg>',
+
+    // Reflect the active-filter state on the funnel button (colored + dot). Called on every render + change.
+    _syncFilterBtn: function () {
+        var $b = $('#ejf-sd-filterbtn');
+        if ($b.length) { $b.toggleClass('active', EJF_SD.ui._filtersActive()); }
+    },
+
+    // Build + show the filter popover under the funnel button. Rebuilt each open so it can be view-aware
+    // (Status is only shown on the similar-defects view). Changes update EJF_SD.ui.filters + re-render live.
+    _showFilterMenu: function (anchor) {
+        EJF_SD.ui._closeFilterMenu();
+        EJF_SD.ui._hideTip();
+        var f = EJF_SD.ui.filters;
+        var onEbr = /^EBR-/.test(EJF_SD.ui.currentKey || '');   // similar-defects view -> Status applies
+        var menu = document.createElement('div');
+        menu.id = 'ejf-sd-filtermenu';
+
+        if (onEbr) {
+            var sl = document.createElement('div'); sl.className = 'ejf-fm-label'; sl.textContent = 'Status'; menu.appendChild(sl);
+            var seg = document.createElement('div'); seg.className = 'ejf-fm-seg';
+            [['open', 'Open'], ['fixed', 'Closed'], ['all', 'All']].forEach(function (o) {
+                var b = document.createElement('button');
+                b.type = 'button';
+                b.className = 'ejf-fm-segbtn' + (f.status === o[0] ? ' on' : '');
+                b.textContent = o[1];
+                b.addEventListener('click', function () {
+                    EJF_SD.ui.filters.status = o[0];
+                    var bs = seg.querySelectorAll('.ejf-fm-segbtn');
+                    for (var i = 0; i < bs.length; i++) { bs[i].classList.remove('on'); }
+                    b.classList.add('on');
+                    EJF_SD.ui._syncFilterBtn();
+                    EJF_SD.ui._rerenderCurrent();
+                });
+                seg.appendChild(b);
+            });
+            menu.appendChild(seg);
+        }
+
+        var cl = document.createElement('div'); cl.className = 'ejf-fm-label'; cl.textContent = 'Created within'; menu.appendChild(cl);
+        var crow = document.createElement('div'); crow.className = 'ejf-fm-created';
+        var inp = document.createElement('input');
+        inp.type = 'number'; inp.min = '0'; inp.className = 'ejf-fm-num'; inp.placeholder = 'any';
+        inp.value = f.createdDays > 0 ? String(f.createdDays) : '';
+        var unit = document.createElement('span'); unit.className = 'ejf-fm-unit'; unit.textContent = 'days';
+        var ct = null;
+        function commitDays() {
+            var v = parseInt(inp.value, 10);
+            EJF_SD.ui.filters.createdDays = (!isNaN(v) && v > 0) ? v : 0;
+            EJF_SD.ui._syncFilterBtn();
+            EJF_SD.ui._rerenderCurrent();
+        }
+        inp.addEventListener('input', function () { if (ct) { clearTimeout(ct); } ct = setTimeout(commitDays, 250); });
+        inp.addEventListener('change', commitDays);
+        crow.appendChild(inp);
+        crow.appendChild(unit);
+        [7, 30, 90].forEach(function (n) {
+            var p = document.createElement('button'); p.type = 'button'; p.className = 'ejf-fm-chip'; p.textContent = n + 'd';
+            p.addEventListener('click', function () { inp.value = String(n); commitDays(); });
+            crow.appendChild(p);
+        });
+        menu.appendChild(crow);
+
+        var reset = document.createElement('button');
+        reset.type = 'button'; reset.className = 'ejf-fm-reset'; reset.textContent = 'Reset filters';
+        reset.addEventListener('click', function () {
+            EJF_SD.ui.filters = { status: 'all', createdDays: 0 };
+            EJF_SD.ui._closeFilterMenu();
+            EJF_SD.ui._syncFilterBtn();
+            EJF_SD.ui._rerenderCurrent();
+        });
+        menu.appendChild(reset);
+
+        document.body.appendChild(menu);
+        // Position under the funnel, clamped to the viewport (flip above if it would overflow the bottom).
+        var r = anchor.getBoundingClientRect();
+        var mw = menu.offsetWidth, mh = menu.offsetHeight;
+        var left = Math.min(r.left, window.innerWidth - mw - 6);
+        var top = r.bottom + 4;
+        if (top + mh > window.innerHeight - 6) { top = r.top - mh - 4; }
+        menu.style.left = Math.max(6, left) + 'px';
+        menu.style.top = Math.max(6, top) + 'px';
+        // Dismiss on outside click / Esc (registered next tick so the opening click doesn't self-close; the
+        // funnel itself is excluded so its click handler can toggle the menu shut).
+        EJF_SD.ui._filterMenuDismiss = function (e) {
+            if (e.type === 'keydown') { if (e.key === 'Escape') { EJF_SD.ui._closeFilterMenu(); } return; }
+            if (menu.contains(e.target) || (anchor && anchor.contains && anchor.contains(e.target))) { return; }
+            EJF_SD.ui._closeFilterMenu();
+        };
+        setTimeout(function () {
+            document.addEventListener('mousedown', EJF_SD.ui._filterMenuDismiss, true);
+            document.addEventListener('keydown', EJF_SD.ui._filterMenuDismiss, true);
+        }, 0);
+    },
+
+    _closeFilterMenu: function () {
+        var m = document.getElementById('ejf-sd-filtermenu');
+        if (m && m.parentNode) { m.parentNode.removeChild(m); }
+        if (EJF_SD.ui._filterMenuDismiss) {
+            document.removeEventListener('mousedown', EJF_SD.ui._filterMenuDismiss, true);
+            document.removeEventListener('keydown', EJF_SD.ui._filterMenuDismiss, true);
+            EJF_SD.ui._filterMenuDismiss = null;
+        }
     },
 
     // Soft-refresh the open issue after a "Mark dup": patch the status lozenge text in place instead of a
@@ -5686,7 +5749,7 @@ EJF_SD.ui = {
     // anchoring from the CSS. A null/invalid saved value leaves the default bottom-right placement alone.
     _applyPos: function ($p) {
         var pos = null;
-        try { if (typeof GM_getValue === 'function') { pos = GM_getValue(EJF_SD.ui.POS_KEY, null); } } catch (e) { pos = null; }
+        pos = gmGet(EJF_SD.ui.POS_KEY, null);
         if (!pos || typeof pos.left !== 'number' || typeof pos.top !== 'number') { return; }
         var el = $p[0];
         var w = el.offsetWidth || 340, h = el.offsetHeight || 60;
@@ -5767,13 +5830,14 @@ EJF_SD.ui = {
             document.removeEventListener('mouseup', onUp, true);
             var rect = el.getBoundingClientRect();
             var top = (typeof el._ejfTop === 'number') ? el._ejfTop : Math.round(rect.top);
-            try { if (typeof GM_setValue === 'function') { GM_setValue(EJF_SD.ui.POS_KEY, { left: Math.round(rect.left), top: top }); } } catch (e) { /* ignore */ }
+            gmSet(EJF_SD.ui.POS_KEY, { left: Math.round(rect.left), top: top });
             EJF_SD.ui._fitVertical();
         }
         $head.on('mousedown', function (e) {
             if (e.which && e.which !== 1) { return; }                 // left button only
             if ($(e.target).closest('#ejf-sd-collapse').length) { return; }  // let the collapse toggle work
             if ($(e.target).closest('#ejf-sd-filter').length) { return; }    // let the filter input take focus / select text
+            if ($(e.target).closest('#ejf-sd-filterbtn').length) { return; } // let the funnel open the filter popover
             if ($(e.target).closest('#ejf-sd-mode').length) { return; }      // let the mode badge toggle ranking
             // Drag relative to the HEADER's current top (works whether we're top-anchored or in drop-up),
             // so the header tracks the cursor and _fitVertical re-evaluates up/down on every move.
@@ -5792,18 +5856,13 @@ EJF_SD.ui = {
     // Panel style: 'sidebar' (default - integrated into Jira's context column, between Details and
     // Development) or 'floating' (the original draggable box on document.body). Persisted in GM 'sdPanelStyle'.
     mode: function () {
-        try {
-            if (typeof GM_getValue === 'function') {
-                return (GM_getValue('sdPanelStyle', 'sidebar') === 'floating') ? 'floating' : 'sidebar';
-            }
-        } catch (e) { /* ignore */ }
-        return 'sidebar';
+        return (gmGet('sdPanelStyle', 'sidebar') === 'floating') ? 'floating' : 'sidebar';
     },
 
     // Flip the panel style and re-mount in the new location (no reload). Called from the settings overlay.
     toggleStyle: function () {
         var next = (EJF_SD.ui.mode() === 'sidebar') ? 'floating' : 'sidebar';
-        try { if (typeof GM_setValue === 'function') { GM_setValue('sdPanelStyle', next); } } catch (e) { /* ignore */ }
+        gmSet('sdPanelStyle', next);
         $('#ejf-sd-panel').remove();
         $('#ejf-side-group').remove();
         if (EJF_SD.ui.currentKey && /^EBR-/.test(EJF_SD.ui.currentKey)) { EJF_SD.ui.render(EJF_SD.ui.currentKey); }
@@ -5854,6 +5913,7 @@ EJF_SD.ui = {
             '<div id="ejf-sd-panel">' +
             '  <div id="ejf-sd-head"><span id="ejf-sd-title">Similar defects</span>' +
             '    <input id="ejf-sd-filter" type="text" placeholder="Filter…" autocomplete="off" title="Filter the whole database by this text (key / title / description) and show the best matches">' +
+            '    <span id="ejf-sd-filterbtn" title="Filter results (status / recency)">' + EJF_SD.ui._funnelSvg + '</span>' +
             '    <span id="ejf-sd-mode" title="Click to switch ranking mode (resets to automatic on reload)">Keyword</span>' +
             '    <span id="ejf-sd-collapse" title="Collapse / expand">–</span></div>' +
             '  <div id="ejf-sd-status"></div>' +
@@ -5864,13 +5924,13 @@ EJF_SD.ui = {
         );
         // Restore the saved minimized state before showing the panel.
         var collapsed = false;
-        try { if (typeof GM_getValue === 'function') { collapsed = !!GM_getValue(EJF_SD.ui.COLLAPSE_KEY, false); } } catch (e) { collapsed = false; }
+        collapsed = !!gmGet(EJF_SD.ui.COLLAPSE_KEY, false);
         if (collapsed) { $p.addClass('collapsed'); }
         $p.find('#ejf-sd-collapse').text(collapsed ? '+' : '–');
         $p.find('#ejf-sd-collapse').on('click', function () {
             var isCollapsed = $('#ejf-sd-panel').toggleClass('collapsed').hasClass('collapsed');
             $(this).text(isCollapsed ? '+' : '–');   // reflect state in the control
-            try { if (typeof GM_setValue === 'function') { GM_setValue(EJF_SD.ui.COLLAPSE_KEY, isCollapsed); } } catch (e) { /* ignore */ }
+            gmSet(EJF_SD.ui.COLLAPSE_KEY, isCollapsed);
             EJF_SD.ui._fitVertical();   // on expand, grow upward if there's no room below; on collapse, reset
         });
         $p.appendTo(document.body);
@@ -5889,6 +5949,7 @@ EJF_SD.ui = {
     _sidebarBodyHtml: function () {
         return '<div class="ejf-side-subhead"><span id="ejf-sd-title">Similar defects</span>' +
                '<input id="ejf-sd-filter" type="text" placeholder="Filter…" autocomplete="off" title="Filter the whole database by this text (key / title / description) and show the best matches">' +
+               '<span id="ejf-sd-filterbtn" title="Filter results (status / recency)">' + EJF_SD.ui._funnelSvg + '</span>' +
                '<span id="ejf-sd-mode" title="Click to switch ranking mode (resets to automatic on reload)">Keyword</span></div>' +
                '<div id="ejf-sd-status"></div>' +
                '<div id="ejf-sd-loglink"></div>' +
@@ -5924,7 +5985,7 @@ EJF_SD.ui = {
         if (old && old.parentNode) { old.parentNode.removeChild(old); }
 
         var collapsed = false;
-        try { if (typeof GM_getValue === 'function') { collapsed = !!GM_getValue(EJF_SD.ui.SIDE_COLLAPSE_KEY, false); } } catch (e) { collapsed = false; }
+        collapsed = !!gmGet(EJF_SD.ui.SIDE_COLLAPSE_KEY, false);
 
         var group = null, headerClickTarget = null;
 
@@ -6082,7 +6143,7 @@ EJF_SD.ui = {
                 var isColl = group.classList.toggle('collapsed');
                 EJF_SD.ui._setChevron(group, isColl);
                 try { headerClickTarget.setAttribute('aria-expanded', isColl ? 'false' : 'true'); } catch (e) { /* ignore */ }
-                try { if (typeof GM_setValue === 'function') { GM_setValue(EJF_SD.ui.SIDE_COLLAPSE_KEY, isColl); } } catch (e2) { /* ignore */ }
+                gmSet(EJF_SD.ui.SIDE_COLLAPSE_KEY, isColl);
                 // Drop focus so the cloned button doesn't keep Jira's blue focus ring after the toggle click.
                 try { headerClickTarget.blur(); } catch (e3) { /* ignore */ }
             });
@@ -6419,21 +6480,25 @@ EJF_SD.ui = {
         }, 340);
     },
 
-    _item: function (r) {
-        var pct = (typeof r.pct === 'number') ? r.pct : 0; // display % is computed per-mode in render()
+    // Shared list-row builder for both views. `target` = the key link's anchor target ('_self' for the
+    // EBR->defect list so you navigate in place; '_blank' for the defect->report list so the defect page stays
+    // put). `action(key)` returns the trailing control ($ Mark-dup on the EBR view, Attach on the report view).
+    // The staleNote / stale-class bits fire only for stale-demoted defect matches (undefined on reports), and
+    // data-ejf-key (read by the report view's incremental attach/slide-in) is harmless on the EBR view.
+    _row: function (r, target, action) {
+        var pct = (typeof r.pct === 'number') ? r.pct : 0;
         var meta = r.status || '';
         if (r.resolution) { meta += (meta ? ' · ' : '') + r.resolution; }
         if (r.staleNote) { meta += (meta ? ' · ' : '') + r.staleNote; }   // Feature A: explain the demotion
-        var $li = $('<li></li>');
+        var $li = $('<li></li>').attr('data-ejf-key', r.key);
         if (r.stale) { $li.addClass('ejf-sd-stale'); }                    // Feature A: grey out stale-closed matches
         // Feature C: hover preview - a styled card (built in _showTip) showing the summary, full description
         // (incl. reproduction steps) and status, so the triager can judge a match without navigating.
         $li.on('mouseenter', function () { EJF_SD.ui._showTip(r, this, meta); });
         $li.on('mouseleave', function () { EJF_SD.ui._hideTip(); });
-        $('<a></a>').attr('href', '/browse/' + r.key).attr('target', '_self').text(r.key).appendTo($li);
+        $('<a></a>').attr('href', '/browse/' + r.key).attr('target', target).text(r.key).appendTo($li);
         $('<span class="ejf-sd-score"></span>').text(pct + '%').appendTo($li);
-        // Feature B: one-click "mark this bug report as a duplicate of that defect" (links the open EBR to r.key).
-        EJF_SD.ui._markDupButton(r.key).appendTo($li);
+        action(r.key).appendTo($li);
         $('<div class="ejf-sd-sum"></div>').text(r.summary || '').appendTo($li);
         if (meta) { $('<div class="ejf-sd-meta"></div>').text(meta).appendTo($li); }
         var created = EJF_SD.util.fmtDate(r.created);
@@ -6441,24 +6506,14 @@ EJF_SD.ui = {
         return $li;
     },
 
-    // Row builder for the EDR "matching bug reports" view: like _item but with NO "Mark dup" control (the
-    // dup action is an EBR-page concept) and the link opens in a new tab so the defect page stays put.
+    // EBR view row: link navigates in place, trailing control marks the open EBR a duplicate of this defect.
+    _item: function (r) {
+        return EJF_SD.ui._row(r, '_self', function (k) { return EJF_SD.ui._markDupButton(k); });
+    },
+
+    // EDR/EO/PLAT "matching bug reports" row: link opens in a new tab, trailing control attaches the report.
     _reportItem: function (r) {
-        var pct = (typeof r.pct === 'number') ? r.pct : 0;
-        var meta = r.status || '';
-        if (r.resolution) { meta += (meta ? ' · ' : '') + r.resolution; }
-        var $li = $('<li></li>').attr('data-ejf-key', r.key);   // key on the row so the incremental attach/slide-in can diff what's shown
-        $li.on('mouseenter', function () { EJF_SD.ui._showTip(r, this, meta); });
-        $li.on('mouseleave', function () { EJF_SD.ui._hideTip(); });
-        $('<a></a>').attr('href', '/browse/' + r.key).attr('target', '_blank').text(r.key).appendTo($li);
-        $('<span class="ejf-sd-score"></span>').text(pct + '%').appendTo($li);
-        // Attach this bug report to the current defect (gated on assignee: unassigned or mine only).
-        EJF_SD.ui._attachReportButton(r.key).appendTo($li);
-        $('<div class="ejf-sd-sum"></div>').text(r.summary || '').appendTo($li);
-        if (meta) { $('<div class="ejf-sd-meta"></div>').text(meta).appendTo($li); }
-        var created = EJF_SD.util.fmtDate(r.created);
-        if (created) { $('<div class="ejf-sd-date"></div>').text('Created ' + created).appendTo($li); }
-        return $li;
+        return EJF_SD.ui._row(r, '_blank', function (k) { return EJF_SD.ui._attachReportButton(k); });
     },
 
     // Read the open issue's text from the DOM (reusing the Translate selectors); fall back to a REST GET.
@@ -6627,6 +6682,7 @@ EJF_SD.ui = {
 
     render: function (key) {
         EJF_SD.ui._ensurePanel();
+        EJF_SD.ui._syncFilterBtn();   // reflect any active session filters on the funnel
         var terms = EJF_SD.ui._filterTerms();   // filter box: restrict the ranked corpus to these terms (whole DB)
         $('#ejf-sd-title').text('Similar defects');   // reset title (the panel is shared with the EDR reports view)
         $('#ejf-sd-exccluster').removeClass('has-hits').empty();   // defect-only section; clear it on the EBR view
@@ -6670,6 +6726,7 @@ EJF_SD.ui = {
     // and list them in the same panel. Mirrors render() but over the EBR index, with no log-scan / mark-dup.
     renderReports: function (key) {
         EJF_SD.ui._ensurePanel();
+        EJF_SD.ui._syncFilterBtn();   // reflect any active session filters on the funnel
         var terms = EJF_SD.ui._filterTerms();   // filter box: restrict the ranked corpus to these terms (whole DB)
         $('#ejf-sd-title').text('Matching bug reports');
         $('#ejf-sd-loglink').removeClass('has-hits').empty();   // EBR-only section; unused on a defect
@@ -6864,27 +6921,53 @@ EJF_SD.menu = {
         if (EJF_SD.menu._esc) { document.removeEventListener('keydown', EJF_SD.menu._esc); EJF_SD.menu._esc = null; }
     },
 
-    // Open (toggle): a second click of the menu command closes it again.
-    open: function () {
-        if (EJF_SD.menu.isOpen()) { EJF_SD.menu.close(); return; }
+    // Build the shared modal overlay chrome (#ejf-menu-overlay backdrop + #ejf-menu box) used by the settings
+    // menu, the Exception-clusters view, and the responses editor. Closes any existing overlay first - tearing
+    // down its Esc listener, which fixes a leak: the settings command's close() only removed _esc, so the
+    // clusters/editor Esc handlers (their own closures) previously lingered until the next Escape. Injects the
+    // menu CSS, wires backdrop + Esc to menu.close (the single close path, always tracked via _esc), and, when
+    // opts.title is given, builds .ejf-menu-head with an <h2> + × button. opts.wide adds .ejf-menu-wide (editor).
+    // Returns { $overlay, $menu, close }. The settings menu passes NO title - render() rebuilds its head on
+    // every refresh (it $p.empty()s first).
+    _openOverlay: function (opts) {
+        opts = opts || {};
+        EJF_SD.menu.close();
         EJF_SD.menu._injectCss();
         var $overlay = $('<div id="ejf-menu-overlay"></div>');
         $overlay.on('click', function (e) { if (e.target === this) { EJF_SD.menu.close(); } });   // backdrop click
-        $('<div id="ejf-menu"></div>').appendTo($overlay);
+        var $menu = $('<div id="ejf-menu"' + (opts.wide ? ' class="ejf-menu-wide"' : '') + '></div>').appendTo($overlay);
+        if (opts.title) {
+            var $head = $('<div class="ejf-menu-head"><h2></h2></div>');
+            $head.children('h2').text(opts.title);
+            $('<span class="ejf-menu-x" title="Close (Esc)">×</span>').on('click', EJF_SD.menu.close).appendTo($head);
+            $menu.append($head);
+        }
         $overlay.appendTo(document.body);
         EJF_SD.menu._esc = function (e) { if (e.key === 'Escape') { EJF_SD.menu.close(); } };
         document.addEventListener('keydown', EJF_SD.menu._esc);
+        return { $overlay: $overlay, $menu: $menu, close: EJF_SD.menu.close };
+    },
+
+    // Open (toggle): a second click of the menu command closes it again.
+    open: function () {
+        if (EJF_SD.menu.isOpen()) { EJF_SD.menu.close(); return; }
+        EJF_SD.menu._openOverlay({});   // no title - render() builds the head on every refresh
         EJF_SD.menu.render();
     },
 
-    // A label + on/off switch row. `fn` is the existing toggle* function (which flips + persists the setting
-    // and calls refreshMenu() -> render(), so the switch updates itself).
-    _toggleRow: function (label, isOn, fn) {
+    // A label + on/off switch row for the feature at savedVariables[index]. Clicking flips it via
+    // toggleFeature(index) (which persists it + re-renders this overlay so the switch updates itself); an
+    // optional onAfter runs afterwards for features that need extra work on change (e.g. the Triage Assistant
+    // mounting / tearing down its panel).
+    _toggleRow: function (label, index, onAfter) {
         var $row = $('<div class="ejf-menu-row"></div>');
         $('<span class="lbl"></span>').text(label).appendTo($row);
         var $sw = $('<div class="ejf-sw"><span class="knob"></span></div>');
-        if (isOn) { $sw.addClass('on'); }
-        $sw.on('click', function () { try { fn(); } catch (e) { /* swallow */ } });
+        if (savedVariables[index][1]) { $sw.addClass('on'); }
+        $sw.on('click', function () {
+            toggleFeature(index);
+            if (onAfter) { try { onAfter(); } catch (e) { /* swallow */ } }
+        });
         $row.append($sw);
         return $row;
     },
@@ -6901,10 +6984,19 @@ EJF_SD.menu = {
         // ---- Features ----
         var $feat = $('<div class="ejf-menu-sect"></div>');
         $('<h3>Features</h3>').appendTo($feat);
-        $feat.append(EJF_SD.menu._toggleRow('Log Parser', !!savedVariables[1][1], toggleParser));
-        $feat.append(EJF_SD.menu._toggleRow('Custom Scrollbar', !!savedVariables[2][1], toggleScrollbar));
-        $feat.append(EJF_SD.menu._toggleRow('Extra Buttons', !!savedVariables[4][1], toggleButtons));
-        $feat.append(EJF_SD.menu._toggleRow('Triage Assistant', !!savedVariables[5][1], toggleSimilarDefects));
+        $feat.append(EJF_SD.menu._toggleRow('Log Parser', 1));
+        $feat.append(EJF_SD.menu._toggleRow('Custom Scrollbar', 2));
+        $feat.append(EJF_SD.menu._toggleRow('Extra Buttons', 4));
+        // Triage Assistant needs extra work on change: mount its panel when enabled, tear it down when disabled.
+        $feat.append(EJF_SD.menu._toggleRow('Triage Assistant', 5, function () {
+            if (!savedVariables[5][1]) {
+                $('#ejf-sd-panel').remove();
+                $('#ejf-side-group').remove();
+                if (typeof EJF_SD !== 'undefined') { EJF_SD.ui.currentKey = null; }
+            } else if (typeof EJF_SD !== 'undefined') {
+                EJF_SD.ui.ensure();
+            }
+        }));
         $p.append($feat);
 
         // ---- Canned responses (Zendesk Support panel) ----
@@ -6961,7 +7053,7 @@ EJF_SD.menu = {
                 $cnt.val(v);
                 if (v === EJF_SD.TOP_N) { return; }
                 EJF_SD.TOP_N = v;
-                try { if (typeof GM_setValue === 'function') { GM_setValue('sdTopN', v); } } catch (e) { /* ignore */ }
+                gmSet('sdTopN', v);
                 // Re-render whichever view is open so the new count takes effect immediately.
                 var k = EJF_SD.ui.currentKey;
                 if (k && /^EBR-/.test(k)) { EJF_SD.ui.render(k); }
@@ -6973,7 +7065,7 @@ EJF_SD.menu = {
             $ta.append($cntRow);
 
             // Embedding backend (GPU vs CPU). Same flags toggleEmbedBackend() reads/writes; it reloads.
-            var gpuOn = (typeof GM_getValue !== 'function') || (GM_getValue('sdTryWebgpu', true) && !GM_getValue('sdForceCpu', false));
+            var gpuOn = gmGet('sdTryWebgpu', true) && !gmGet('sdForceCpu', false);
             var $row = $('<div class="ejf-menu-row"></div>');
             $('<span class="lbl">Embedding backend</span>')
                 .append($('<span class="sub"></span>').text('Currently: ' + (gpuOn ? 'GPU (faster, experimental)' : 'CPU (stable)')))
@@ -7100,16 +7192,14 @@ EJF_SD.sched = {
     // startup tick so a page RELOAD shortly after a recent sync does not re-fetch (and re-render the Similar
     // Defects list) all over again - the user only wants a catch-up roughly every 30 minutes.
     recentlySynced: function () {
-        if (typeof GM_getValue !== 'function') { return false; }
-        var last = 0;
-        try { last = GM_getValue(EJF_SD.sched.LAST_SYNC_KEY, 0) || 0; } catch (e) { last = 0; }
+        var last = gmGet(EJF_SD.sched.LAST_SYNC_KEY, 0) || 0;
         return !!last && (Date.now() - last) < EJF_SD.sched.INTERVAL_MS;
     },
 
     // Stamp "a sync just completed" so recentlySynced() starts the 30-minute clock. Called from every sync
     // completion path (autoSync / syncNow / rebuild).
     markSynced: function () {
-        try { if (typeof GM_setValue === 'function') { GM_setValue(EJF_SD.sched.LAST_SYNC_KEY, Date.now()); } } catch (e) { /* ignore */ }
+        gmSet(EJF_SD.sched.LAST_SYNC_KEY, Date.now());
         // If a log is open, re-match it against the freshly-synced defect index so a newly-indexed defect
         // (e.g. one you just created) appears in the "Defects in log" panel without reopening the log.
         try { if (EJF_SD.logsig) { EJF_SD.logsig.rematch(); } } catch (e2) { /* ignore */ }
@@ -7118,12 +7208,10 @@ EJF_SD.sched = {
     // Best-effort single-syncer lease across tabs. Returns true if this tab may sync now. Not perfectly
     // race-free, but a rare double-run is harmless (bulkPut is idempotent and embeddings are preserved).
     _acquireLease: function () {
-        if (typeof GM_getValue !== 'function' || typeof GM_setValue !== 'function') { return true; }
-        var l = null;
-        try { l = GM_getValue(EJF_SD.sched.LEASE_KEY, null); } catch (e) { return true; }
+        var l = gmGet(EJF_SD.sched.LEASE_KEY, null);
         var now = Date.now();
         if (!l || !l.ts || (now - l.ts) > EJF_SD.sched.LEASE_TTL_MS || l.tabId === EJF_SD.sched.tabId) {
-            try { GM_setValue(EJF_SD.sched.LEASE_KEY, { tabId: EJF_SD.sched.tabId, ts: now }); } catch (e2) { /* ignore */ }
+            gmSet(EJF_SD.sched.LEASE_KEY, { tabId: EJF_SD.sched.tabId, ts: now });
             return true;
         }
         return false;
