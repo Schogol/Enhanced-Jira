@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.30.0
+// @version     2.31.0
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -85,9 +85,16 @@ function waitForKeyElements(selectorTxt, actionFunction, bWaitOnce, iframeSelect
 
 // Shared globals for the log-file parser flow: the detection / click handlers and the deferred Parse* pass run
 // on separate ticks (setTimeout), so these carry state across that gap. `rows` = the raw file text;
-// `oc`/`lc`/`pdm` = which igbr.zip attachment was opened. (pdmdata / today / driverAge are now locals - the
+// `oc`/`lc`/`pdm`/`dx` = which igbr.zip attachment was opened. (pdmdata / today / driverAge are now locals - the
 // driver age is written straight into #driverAge by renderRequirements; menu_settings was an unused handle.)
-var rows, oc, lc, pdm;
+var rows, oc, lc, pdm, dx;
+
+// The EVE client log header row. Used both to DETECT a logs.txt (its content has this line) and to LOCATE the
+// right CodeMirror editor to swap. Kept in ONE place so if CCP ever changes the header, it's a one-line edit
+// instead of a hunt across every selector. NB: the parsers still index columns positionally (Type=[2],
+// Message=[3], etc.), so a column *rename/reorder* would still need parser changes - this only centralizes the
+// detection string.
+var LOG_HDR = "Time\tFacility\tType\tMessage";
 
 
 // True when this script instance is running INSIDE the Zendesk Support Forge panel's cross-origin iframe
@@ -616,7 +623,7 @@ function addButtons() {
 
 
 // When we detect the "title row" of a log parser file then we swap out the content of the log file with a parsed, more readable version of it with some extra features like buttons which allow you to toggle the visibility of certain types of events
-var selector = "span[data-testid='code-block']:contains(Time	Facility	Type	Message)";
+var selector = "span[data-testid='code-block']:contains(" + LOG_HDR + ")";
 waitForKeyElements(selector, SwapUI);
 
 
@@ -635,45 +642,66 @@ waitForKeyElements(McSelector, SwapUI);
 // CodeMirror only keeps the visible lines in the DOM, so we detect the file by its (always-present) header
 // row and let SwapUI pull the full text out of CodeMirror's in-memory state. (processHealth / methodCalls
 // only ever appear inside the igbr.zip, which still uses the <span> layout, so they need no CodeMirror path.)
-var cmSelector = ".cm-line:contains(Time\tFacility\tType\tMessage)";
+var cmSelector = ".cm-line:contains(" + LOG_HDR + ")";
 waitForKeyElements(cmSelector, SwapUI);
 
 
-// When we detect the oustandingCalls.txt file link inside the igbr.zip then we run the addClickEvent function
-var ocSelector = 'span[data-item-title="true"]:contains(outstandingcalls.txt)';
-waitForKeyElements(ocSelector, addClickEvent);
-
-
-// When we detect the lastCrashes.txt file link inside the igbr.zip then we run the addClickEvent2 function
-var lcSelector = 'span[data-item-title="true"]:contains(lastcrashes.txt)';
-waitForKeyElements(lcSelector, addClickEvent2);
-
-
-// When we detect the PDMData.txt file link inside the igbr.zip then we run the addClickEvent3 function
-var pdmSelector = 'span[data-item-title="true"]:contains(PDMData.txt)';
-waitForKeyElements(pdmSelector, addClickEvent3);
+// outstandingcalls.txt / lastcrashes.txt / PDMData.txt live inside the igbr.zip and - unlike the log /
+// processHealth / methodCalls files - have NO header row in their content to detect them by. So the only way to
+// tell them apart is WHICH file button was clicked: watch for each file's entry in the attachment list, and when
+// its button is clicked, poll for the freshly-loaded text (ejfRunParserWhenLoaded) and set the matching parser
+// flag that SwapUI dispatches on.
+// The click binding is namespaced and .off()'d first so re-firing can never stack duplicate handlers: the SPA
+// re-rendering the attachment list makes waitForKeyElements match a fresh span and re-run this callback.
+var IGBR_FILES = [
+    { name: 'outstandingcalls.txt', setFlag: function () { oc = true; } },
+    { name: 'lastcrashes.txt',      setFlag: function () { lc = true; } },
+    { name: 'PDMData.txt',          setFlag: function () { pdm = true; } },
+    { name: 'dxdiag.txt',           setFlag: function () { dx = true; } }
+];
+IGBR_FILES.forEach(function (f) {
+    waitForKeyElements('span[data-item-title="true"]:contains(' + f.name + ')', function () {
+        $("button:contains('" + f.name + "')")
+            .off('click.ejf').on('click.ejf', function () { ejfRunParserWhenLoaded(f.setFlag); });
+    });
+});
 
 
 // outstandingcalls.txt / lastcrashes.txt / PDMData.txt load their text ASYNCHRONOUSLY into the
 // <span data-testid="code-block"> after the file button is clicked. The old code just waited a fixed 750ms and
 // hoped the content had arrived - if the load was slower, SwapUI parsed empty/stale content and you were out
 // of luck. Instead, poll for THIS file's raw text to appear in the code-block and only then set the parser flag
-// + run SwapUI. A naive "content changed -> fire" poll corrupts, so it's guarded on four fronts:
+// + run SwapUI. A naive "content changed -> fire" poll corrupts, so it's guarded on five fronts:
 //   1. Generation token - a NEWER click (incl. a double-click of the same file) supersedes an earlier poller,
 //      so stale pollers can't fire.
-//   2. Empty file - the content never changes, so we simply time out and DON'T parse (rather than firing later
-//      on whatever unrelated content loads next). This is the reported bug: an empty outstandingcalls.txt left
-//      a poller running that then grabbed methodcalls' content / our own injected parser CSS.
+//   2. Empty file - if the clicked file is empty its content never arrives, so we time out at MAX and give up
+//      rather than polling forever.
 //   3. #tableContent present - our (or another file's) parser markup is currently mounted, so the raw file text
 //      isn't showing; keep waiting for the viewer to swap it back in.
 //   4. HEADER_SIG - a header-based file (log / processHealth / methodCalls) loaded instead; those are handled
 //      by waitForKeyElements+SwapUI, so we must not grab them as our oc/lc/pdm file.
+//   5. Cancel-on-navigate (the ejfParserGen bump below) - the poller watches a SHARED code-block, so if you open
+//      an EMPTY tracked file (its poller keeps waiting - no content ever arrives) and then click ANOTHER file
+//      before MAX, that file's content lands in the same span and would trip the stale poller, parsing it into
+//      the wrong table (the reported bug: empty outstandingcalls -> click fitting.txt -> fitting in the OC table).
+//      Guards #1/#2 don't catch this: an UNtracked file (fitting.txt / prefs.ini / ...) has no click handler to
+//      bump the generation, and its content arrives well before the #2 timeout. So we bump the generation on
+//      EVERY file-entry click, which kills any pending poller the moment you navigate away.
 // `setFlag` marks which parser branch SwapUI takes (oc / lc / pdm).
 var ejfParserGen = 0;
+// Guard #5: clicking any file entry in the igbr.zip viewer cancels a pending poller. Capture phase, so it runs
+// BEFORE the tracked button's bubble handler - a tracked file then starts a fresh poller with the newer (winning)
+// generation, while an untracked file just leaves every poller cancelled. File entries are <button>s containing a
+// [data-item-title] element (the same markers waitForKeyElements uses above); other buttons (download, toggles)
+// have no such child and are ignored.
+document.addEventListener('click', function (e) {
+    var btn = e.target && e.target.closest ? e.target.closest('button') : null;
+    if (btn && btn.querySelector('[data-item-title]')) { ejfParserGen++; }
+}, true);
 function ejfRunParserWhenLoaded(setFlag) {
     var myGen = ++ejfParserGen;
     var CB = "span[data-testid='code-block']";
-    var HEADER_SIG = /Time\tFacility\tType\tMessage|dateTime\tpyDateTime\tprocCpu|Time\tMethod\tDuration/;
+    var HEADER_SIG = new RegExp(LOG_HDR + '|dateTime\tpyDateTime\tprocCpu|Time\tMethod\tDuration');
     var before = ($(CB).text() || '').trim();
     var start = Date.now(), MAX = 8000, POLL = 100;
     (function poll() {
@@ -687,12 +715,6 @@ function ejfRunParserWhenLoaded(setFlag) {
         setTimeout(poll, POLL);
     })();
 }
-
-// Once one of these attachment buttons is clicked, parse the file as soon as its content has loaded.
-function addClickEvent()  { $("button:contains('outstandingcalls.txt')").on('click', function () { ejfRunParserWhenLoaded(function () { oc = true; }); }); }
-function addClickEvent2() { $("button:contains('lastcrashes.txt')").on('click', function () { ejfRunParserWhenLoaded(function () { lc = true; }); }); }
-function addClickEvent3() { $("button:contains('PDMData.txt')").on('click', function () { ejfRunParserWhenLoaded(function () { pdm = true; }); }); }
-
 
 // Reads the complete text of a file rendered by the new CodeMirror-based viewer.
 // CodeMirror only keeps the lines currently in view inside the DOM, but it holds the whole document
@@ -758,7 +780,7 @@ function SwapUI() {
     // Scope everything to the ONE editor that holds the log header row: the page can contain OTHER CodeMirror
     // editors (a ``` code block in the comment box is also a .cm-editor / .cm-content), and operating on all of
     // them read the wrong (comment) text into `rows` AND injected the "Logfile Parser" UI into the comment box.
-    var $logEd = $(".cm-line:contains(Time\tFacility\tType\tMessage)").first().closest('.cm-editor');
+    var $logEd = $(".cm-line:contains(" + LOG_HDR + ")").first().closest('.cm-editor');
     if ($logEd.length && !$("span[data-testid='code-block']").length && savedVariables[1][1]) {
         var $cm = $logEd.find('.cm-content').first().attr('data-ejf-cmsrc', '1');   // mark the exact source editor
         rows = getCmDocText();                                                       // reads the marked .cm-content
@@ -776,7 +798,7 @@ function SwapUI() {
         // Toggle Notice / Warnings / Errors / Exceptions filter buttons get wired up.
     }
 
-    else if ($("span[data-testid='code-block']:contains(Time	Facility	Type	Message)")[0] && savedVariables[1][1]) {
+    else if ($("span[data-testid='code-block']:contains(" + LOG_HDR + ")")[0] && savedVariables[1][1]) {
         mountParser(html, ParseLogs);
     }
 
@@ -796,6 +818,14 @@ function SwapUI() {
     else if (lc && savedVariables[1][1]) {
         lc = false;
         mountParser(lcHtml, ParseOcLogs);
+    }
+
+    else if (dx && savedVariables[1][1]) {
+        readCodeBlock();
+        $("span[data-testid='code-block']").append(dxdiagHtml);
+        // Parse the raw dxdiag text into a triage summary (crash history + GPU driver recency + system). Guarded.
+        try { renderDxdiag(rows); } catch (e) { $('#dxdiag').text('Could not evaluate dxdiag.'); }
+        dx = false;
     }
 
     else if (pdm && savedVariables[1][1]) {
@@ -2223,6 +2253,252 @@ var pdmHtml = `
   <div><h2>Quick Info:</h2></div>
   <div id="driverAge"></div>
   <div id="Requirements"></div>
+</div>
+`
+
+
+/* ---- dxdiag.txt triage summary (Quick Info) ----
+ * dxdiag has no header row, so it's opened by click like the other igbr files. We surface only the handful of
+ * fields that help a Bug Hunter decide "EVE defect, or unstable machine?":
+ *   1. WER crash history - the star. APPCRASH entries for exefile.exe (the EVE client) are the MOST relevant:
+ *      they name the faulting module + exception code that took the client down. BlueScreen / LiveKernelEvent
+ *      entries are decoded to bugcheck names; a nonzero count flags an unstable OS/hardware (the i9 13/14th-gen
+ *      Raptor Lake pattern especially), so the report may not be an EVE bug at all.
+ *   2. Whether dxdiag itself crashed probing Direct3D (a GPU/driver-trouble signal).
+ *   3. GPU(s) + driver DATE (a universal recency signal - "is this driver ancient?"). The vendor version string
+ *      is shown too, but it needs vendor-specific knowledge to read and is mostly a fallback for when the date
+ *      field reads "Unknown" (which is common).
+ * NB: WER history is CUMULATIVE over weeks and not tied to the reported session - it's context, not proof.
+ */
+
+// Common bugcheck (BSOD) codes. WER stores P1 as a hex string with no 0x; unknown codes fall back to raw hex.
+var DX_BUGCHECK = {
+    0xA: 'IRQL_NOT_LESS_OR_EQUAL', 0x1A: 'MEMORY_MANAGEMENT', 0x1E: 'KMODE_EXCEPTION_NOT_HANDLED',
+    0x3B: 'SYSTEM_SERVICE_EXCEPTION', 0x50: 'PAGE_FAULT_IN_NONPAGED_AREA',
+    0x7E: 'SYSTEM_THREAD_EXCEPTION_NOT_HANDLED', 0x7F: 'UNEXPECTED_KERNEL_MODE_TRAP',
+    0x9F: 'DRIVER_POWER_STATE_FAILURE', 0xC2: 'BAD_POOL_CALLER', 0xC4: 'DRIVER_VERIFIER_DETECTED_VIOLATION',
+    0xC5: 'DRIVER_CORRUPTED_EXPOOL', 0xD1: 'DRIVER_IRQL_NOT_LESS_OR_EQUAL', 0xEF: 'CRITICAL_PROCESS_DIED',
+    0x109: 'CRITICAL_STRUCTURE_CORRUPTION', 0x116: 'VIDEO_TDR_ERROR', 0x117: 'VIDEO_TDR_TIMEOUT_DETECTED',
+    0x124: 'WHEA_UNCORRECTABLE_ERROR', 0x133: 'DPC_WATCHDOG_VIOLATION', 0x139: 'KERNEL_SECURITY_CHECK_FAILURE',
+    0x1000007E: 'SYSTEM_THREAD_EXCEPTION_NOT_HANDLED_M', 0x1000008E: 'KERNEL_MODE_EXCEPTION_NOT_HANDLED_M'
+};
+// Common NT exception codes (BSOD P2 on some bugchecks; APPCRASH P7).
+var DX_EXCEPTION = {
+    'c0000005': 'ACCESS_VIOLATION', '80000003': 'BREAKPOINT', 'c000001d': 'ILLEGAL_INSTRUCTION',
+    'c0000094': 'INTEGER_DIVIDE_BY_ZERO', 'c00000fd': 'STACK_OVERFLOW', 'c0000374': 'HEAP_CORRUPTION',
+    'c0000409': 'STACK_BUFFER_OVERRUN', 'c0000420': 'ASSERTION_FAILURE', 'e06d7363': 'C++ exception (SEH)'
+};
+function dxBugcheckName(hex) {
+    var n = parseInt(hex, 16);
+    if (isNaN(n)) { return null; }
+    return DX_BUGCHECK[n] || ('bugcheck 0x' + n.toString(16).toUpperCase());
+}
+function dxExceptionName(hex) {
+    var key = String(hex == null ? '' : hex).toLowerCase().replace(/^0x/, '');
+    return DX_EXCEPTION[key] || null;
+}
+
+// Parse the "Windows Error Reporting" section into [{ name, p:{P1..P10} }, ...] (dxdiag lists newest first).
+function parseWER(text) {
+    var out = [], idx = text.indexOf('Windows Error Reporting');
+    if (idx < 0) { return out; }
+    var blocks = text.substring(idx).split(/\+\+\+\s*WER\d+\s*\+\+\+/);
+    for (var i = 1; i < blocks.length; i++) {
+        var b = blocks[i];
+        var nameM = b.match(/Event Name:\s*(.+)/);
+        var p = {}, re = /\bP(\d+):[ \t]*([^\r\n]*)/g, m;
+        while ((m = re.exec(b))) { p['P' + m[1]] = (m[2] || '').trim(); }
+        out.push({ name: nameM ? nameM[1].trim() : 'Unknown', p: p });
+    }
+    return out;
+}
+
+// Classify a WER entry: 'eve' (exefile.exe crash), 'app' (other app crash), or 'kernel' (BSOD / live dump).
+// App crashes put the faulting app's filename in P1; kernel dumps put a hex bugcheck code there instead.
+function dxWerKind(e) {
+    var p1 = e.p.P1 || '';
+    if (/\.exe/i.test(p1)) { return /exefile\.exe/i.test(p1) ? 'eve' : 'app'; }
+    if (/bluescreen|livekernel|kernel/i.test(e.name)) { return 'kernel'; }
+    return 'app';
+}
+
+// First "Label: value" line in the dxdiag text (labels are right-aligned, so allow leading whitespace).
+function dxFirst(text, label) {
+    var esc = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    var m = text.match(new RegExp('^[ \\t]*' + esc + '[ \\t]*:[ \\t]*([^\\r\\n]+)', 'im'));
+    return m ? m[1].trim() : '';
+}
+
+// dxdiag dates use the reporter's locale (US default M/D/YYYY). Parse leniently; if the "month" is > 12 the
+// locale must be D/M, so swap. Returns a Date or null.
+function dxParseDate(s) {
+    var m = String(s == null ? '' : s).match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+    if (!m) { return null; }
+    var mm = +m[1], dd = +m[2], yy = +m[3];
+    if (mm > 12 && dd <= 12) { var t = mm; mm = dd; dd = t; }
+    var d = new Date(yy, mm - 1, dd);
+    return isNaN(d.getTime()) ? null : d;
+}
+function dxFmtDate(d) {
+    var MO = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    return d ? (MO[d.getMonth()] + ' ' + d.getFullYear()) : '';
+}
+// Driver age in days, measured against the dxdiag report date (falls back to now); null if no date.
+function dxDriverAge(driverDate, refDate) {
+    if (!driverDate) { return null; }
+    var ref = refDate || new Date();
+    var days = Math.round((ref.getTime() - driverDate.getTime()) / 86400000);
+    return days < 0 ? 0 : days;
+}
+// Human-readable age. `withOld` appends " old" for the primary/standalone reading; omit it for the
+// "(... at time of report)" parenthetical, which reads better as a bare duration.
+function dxAgeText(days, withOld) {
+    if (days == null) { return ''; }
+    if (days < 45) { return withOld ? 'recent' : 'new'; }
+    var s;
+    if (days < 365) { s = Math.round(days / 30) + ' mo'; }
+    else { var yr = days / 365; s = (yr >= 2 ? Math.round(yr) : Math.round(yr * 10) / 10) + ' yr'; }
+    return withOld ? (s + ' old') : s;
+}
+
+// NVIDIA's internal WDDM version 32.0.15.8157 -> public "581.57" (last 5 digits of the concatenated tail).
+function dxNvidiaDriver(ver) {
+    var d = ver.replace(/\./g, '');
+    if (d.length < 5) { return null; }
+    var t = d.slice(-5);
+    return t.slice(0, 3) + '.' + t.slice(3);
+}
+// Display devices -> [{ name, version, driverDate }]. dxdiag repeats a card once per attached monitor, so dedupe.
+function dxGpus(text) {
+    var out = [], seen = {}, start = text.indexOf('Display Devices');
+    if (start < 0) { return out; }
+    var blocks = text.substring(start).split(/Card name:[ \t]*/).slice(1);
+    blocks.forEach(function (b) {
+        var name = ((b.match(/^([^\r\n]+)/) || [])[1] || '').trim();
+        if (!name) { return; }
+        var vm = b.match(/Driver Version:[ \t]*([\d.]+)/), ver = vm ? vm[1] : '';
+        if (/nvidia|geforce|gtx|rtx|quadro|titan/i.test(name) && ver) { ver = dxNvidiaDriver(ver) || ver; }
+        var dm = b.match(/Driver Date\/Size:[ \t]*([^,\r\n]+),/);
+        var hg = b.match(/Hybrid Graphics GPU:[ \t]*([^\r\n]+)/);         // Discrete / Integrated / Not Supported
+        var role = hg ? hg[1].trim() : '';
+        var key = name + '|' + ver;
+        if (seen[key]) { return; }
+        seen[key] = 1;
+        out.push({ name: name, version: ver, driverDate: dm ? dxParseDate(dm[1]) : null, role: role });
+    });
+    return out;
+}
+
+// Build the dxdiag Quick-Info summary and drop it into #dxdiag.
+function renderDxdiag(text) {
+    var COL = { crit: '#ff8f8f', warn: '#ffd479', ok: '#7fdca4' };
+    var reportDate = dxParseDate(dxFirst(text, 'Time of this report'));
+    var html = '';
+
+    var eve = [], kernel = [], app = [];
+    parseWER(text).forEach(function (e) {
+        var k = dxWerKind(e);
+        (k === 'eve' ? eve : k === 'kernel' ? kernel : app).push(e);
+    });
+
+    // EVE client crashes - the headline. APPCRASH P4 = faulting module, P7 = exception code.
+    if (eve.length) {
+        html += '<div style="font-weight:700; color:' + COL.crit + '; margin:2px 0 4px;">&#9888; ' + eve.length +
+            ' EVE client crash' + (eve.length === 1 ? '' : 'es') + ' (exefile.exe)</div>' +
+            '<table style="border-collapse:collapse; font-size:12px; line-height:1.5; margin-bottom:8px;">';
+        eve.forEach(function (e) {
+            var mod = e.p.P4 || '', exc = dxExceptionName(e.p.P7) || e.p.P7 || '';
+            var detail = [exc, mod].filter(Boolean).map(reqEscape).join(' in ');
+            html += '<tr><td style="padding:0 8px 0 0; color:#9aa6b2; vertical-align:top; white-space:nowrap;">' +
+                reqEscape(e.name) + '</td><td style="padding:0; color:#e6e6e6;">' + (detail || '&ndash;') + '</td></tr>';
+        });
+        html += '</table>';
+    }
+
+    // Kernel crashes (BSOD / live dumps), grouped by decoded bugcheck name.
+    if (kernel.length) {
+        var counts = {}, whea = false;
+        kernel.forEach(function (e) {
+            var label = /livekernel/i.test(e.name)
+                ? ('LiveKernelEvent 0x' + (parseInt(e.p.P1, 16) || 0).toString(16).toUpperCase())
+                : (dxBugcheckName(e.p.P1) || e.name);
+            counts[label] = (counts[label] || 0) + 1;
+            if (/WHEA/i.test(label)) { whea = true; }
+        });
+        var list = Object.keys(counts).map(function (k) { return counts[k] > 1 ? (counts[k] + '× ' + k) : k; });
+        html += '<div style="font-weight:700; color:' + COL.crit + '; margin:2px 0 4px;">&#9888; ' + kernel.length +
+            ' system crash' + (kernel.length === 1 ? '' : 'es') + ' in history</div>' +
+            '<div style="font-size:12px; color:#e6e6e6; margin-bottom:' + (whea ? '2px' : '8px') + ';">' +
+            reqEscape(list.join(', ')) + '</div>';
+        if (whea) {
+            html += '<div style="font-size:11px; color:' + COL.warn + '; margin-bottom:8px;">WHEA = a hardware ' +
+                'error (CPU / RAM / bus) - strongly points at unstable hardware, not EVE.</div>';
+        }
+    }
+
+    if (app.length) {
+        html += '<div style="font-size:11px; color:#9aa6b2; margin-bottom:8px;">+ ' + app.length +
+            ' other app crash' + (app.length === 1 ? '' : 'es') + ' in history</div>';
+    }
+    if (!eve.length && !kernel.length) {
+        html += '<div style="font-size:12px; color:' + COL.ok + '; margin-bottom:8px;">&#10003; No crashes in WER history.</div>';
+    }
+
+    // dxdiag's own Direct3D probe crash.
+    if (/Crashed in Direct3D/i.test(text)) {
+        html += '<div style="font-size:12px; color:' + COL.warn + '; margin-bottom:8px;">&#9888; dxdiag itself ' +
+            'crashed probing Direct3D - possible GPU / driver trouble.</div>';
+    }
+
+    // GPU(s): driver DATE + age (recency), version as fallback. Warn (amber) when the driver is over a year old.
+    var gpus = dxGpus(text);
+    if (gpus.length) {
+        html += '<div style="font-size:12px; line-height:1.6;">';
+        gpus.forEach(function (g) {
+            var meta = [], old = false;
+            // With more than one GPU, tag which is the discrete card (what EVE actually renders on) vs the iGPU.
+            var tag = (gpus.length > 1 && /discrete|integrated/i.test(g.role))
+                ? ' <span style="font-size:9px; text-transform:uppercase; letter-spacing:.04em; color:#9aa6b2;">' +
+                  reqEscape(g.role) + '</span>' : '';
+            if (g.version) { meta.push('drv ' + reqEscape(g.version)); }
+            if (g.driverDate) {
+                // Age from NOW (when the Bug Hunter reads it) is the headline; the age AT REPORT time is added in
+                // parens only when it rounds differently - an old report makes a fixed "Nov 2025" read very
+                // differently from how fresh the driver was when the bug was actually filed.
+                var daysNow = dxDriverAge(g.driverDate, new Date());
+                old = daysNow != null && daysNow > 365;
+                var ageStr = dxAgeText(daysNow, true);
+                if (reportDate) {
+                    var repShort = dxAgeText(dxDriverAge(g.driverDate, reportDate), false);
+                    if (repShort && repShort !== dxAgeText(daysNow, false)) {
+                        ageStr += ' (' + repShort + ' at time of report)';
+                    }
+                }
+                meta.push(dxFmtDate(g.driverDate) + (ageStr ? ' - ' + ageStr : ''));
+            }
+            html += '<div><b style="color:#e6e6e6;">' + reqEscape(g.name) + '</b>' + tag + (meta.length
+                ? ' <span style="color:' + (old ? COL.warn : '#9aa6b2') + ';">' + meta.join(' · ') + '</span>' : '') +
+                '</div>';
+        });
+        html += '</div>';
+    }
+
+    // System context line.
+    var sys = [dxFirst(text, 'Operating System'), dxFirst(text, 'Processor'), dxFirst(text, 'Memory')]
+        .filter(Boolean).map(reqEscape).join(' · ');
+    if (sys) { html += '<div style="font-size:11px; color:#9aa6b2; margin-top:8px;">' + sys + '</div>'; }
+
+    $('#dxdiag').html(html || 'Could not read dxdiag.');
+}
+
+// Floating Div for the dxdiag.txt file: the triage summary overlay (crash history / GPU driver recency / system).
+var dxdiagHtml = `
+<style>
+`+ css +`
+</style>
+<div class="floating-div">
+  <div><h2>Quick Info:</h2></div>
+  <div id="dxdiag"></div>
 </div>
 `
 
