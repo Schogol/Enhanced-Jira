@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.31.0
+// @version     2.32.0
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -530,6 +530,17 @@ function addButtons() {
                 if (tr[0]) { $title.text(tr[0]); }
                 if (tr[1]) { setBlockText($desc.children().eq(0), tr[1]); }
                 if (tr[2]) { setBlockText($desc.children().eq(1), tr[2]); }
+
+                // The Triage Assistant reads its search query straight from these same DOM nodes (see
+                // EJF_SD.ui.getIssueText), so now that they hold the ENGLISH translation, re-run the similar-
+                // defects search - otherwise it keeps matching against the reporter's native-language text and
+                // finds little. Guarded so this only fires when the Triage Assistant is enabled in settings
+                // (savedVariables[5]) AND its panel is live on this bug report; the typeof guard also keeps the
+                // Translate button working when the Similar Defects feature's code isn't loaded at all.
+                if (typeof EJF_SD !== 'undefined' && EJF_SD.ui && savedVariables[5][1]
+                    && EJF_SD.ui.currentKey && /^EBR-/.test(EJF_SD.ui.currentKey)) {
+                    EJF_SD.ui.render(EJF_SD.ui.currentKey);
+                }
             });
     });
 
