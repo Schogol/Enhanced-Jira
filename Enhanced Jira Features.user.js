@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.33.0
+// @version     2.34.0
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -5547,6 +5547,9 @@ EJF_SD.ui = {
 #ejf-sd-filtermenu .ejf-fm-chip:hover { border-color: #4c9aff; color: #fff; }\
 #ejf-sd-filtermenu .ejf-fm-reset { display: block; width: 100%; margin-top: 10px; background: transparent; color: #9aa6b2; border: 1px solid #3a434d; border-radius: 5px; padding: 5px; cursor: pointer; font-size: 11px; }\
 #ejf-sd-filtermenu .ejf-fm-reset:hover { color: #fff; border-color: #4c9aff; }\
+#ejf-sd-filtermenu .ejf-fm-view { display: block; width: 100%; margin: 0 0 10px; background: #2c333a; color: #cfd6dd; border: 1px solid #3a434d; border-radius: 5px; padding: 6px; cursor: pointer; font-size: 12px; text-align: center; }\
+#ejf-sd-filtermenu .ejf-fm-view:hover { color: #fff; border-color: #4c9aff; }\
+#ejf-sd-filtermenu .ejf-fm-view.on { background: #4c9aff; color: #fff; font-weight: 700; border-color: #4c9aff; }\
 .ejf-sd-list li.ejf-sd-stale { opacity: .6; }\
 .ejf-sd-sum { margin-top: 2px; color: #e6e6e6; overflow-wrap: anywhere; word-break: break-word; }\
 .ejf-sd-meta { margin-top: 2px; color: #7a8694; font-size: 10px; overflow-wrap: anywhere; word-break: break-word; }\
@@ -5674,6 +5677,7 @@ EJF_SD.ui = {
     // and re-renders. The override is in-memory only, so a reload resets it to automatic (which prefers Hybrid
     // whenever the embedding model is available).
     modeOverride: null,        // null = automatic (prefer Hybrid); 'Hybrid' / 'Keyword' = user-forced this session
+    reporterMode: false,       // EBR view: when on, the panel lists the reporter's OTHER reports instead of similar defects (session-only; reset on navigation)
     _filterTimer: null,
     _wireFilter: function () {
         if (EJF_SD.ui._filterWired) { return; }   // one set of delegated handlers survives chrome re-mounts
@@ -5752,6 +5756,7 @@ EJF_SD.ui = {
         var f = EJF_SD.ui.filters;
         if (!f) { return false; }
         var onEbr = /^EBR-/.test(EJF_SD.ui.currentKey || '');
+        if (onEbr && EJF_SD.ui.reporterMode) { return true; }   // reporter's-other-reports view is active
         return !!((onEbr && f.status && f.status !== 'all') || f.createdDays > 0);
     },
 
@@ -5773,6 +5778,23 @@ EJF_SD.ui = {
         var menu = document.createElement('div');
         menu.id = 'ejf-sd-filtermenu';
 
+        // Reporter's-other-reports toggle (EBR view only): swaps the similar-defects list for this reporter's
+        // other synced reports, and back. In reporter mode the ranking filters below don't apply, so they're hidden.
+        if (onEbr) {
+            var vb = document.createElement('button');
+            vb.type = 'button';
+            vb.className = 'ejf-fm-view' + (EJF_SD.ui.reporterMode ? ' on' : '');
+            vb.textContent = EJF_SD.ui.reporterMode ? '← Back to similar defects' : '⚑ This reporter’s other reports';
+            vb.addEventListener('click', function () {
+                EJF_SD.ui.reporterMode = !EJF_SD.ui.reporterMode;
+                EJF_SD.ui._closeFilterMenu();
+                EJF_SD.ui._syncFilterBtn();
+                EJF_SD.ui._rerenderCurrent();
+            });
+            menu.appendChild(vb);
+        }
+
+        if (!(onEbr && EJF_SD.ui.reporterMode)) {
         if (onEbr) {
             var sl = document.createElement('div'); sl.className = 'ejf-fm-label'; sl.textContent = 'Status'; menu.appendChild(sl);
             var seg = document.createElement('div'); seg.className = 'ejf-fm-seg';
@@ -5827,6 +5849,7 @@ EJF_SD.ui = {
             EJF_SD.ui._rerenderCurrent();
         });
         menu.appendChild(reset);
+        }   // end !reporterMode (ranking filters hidden while showing the reporter's other reports)
 
         document.body.appendChild(menu);
         // Position under the funnel, clamped to the viewport (flip above if it would overflow the bottom).
@@ -6797,7 +6820,7 @@ EJF_SD.ui = {
     // put). `action(key)` returns the trailing control ($ Mark-dup on the EBR view, Attach on the report view).
     // The staleNote / stale-class bits fire only for stale-demoted defect matches (undefined on reports), and
     // data-ejf-key (read by the report view's incremental attach/slide-in) is harmless on the EBR view.
-    _row: function (r, target, action) {
+    _row: function (r, target, action, opts) {
         var pct = (typeof r.pct === 'number') ? r.pct : 0;
         var meta = r.status || '';
         if (r.resolution) { meta += (meta ? ' · ' : '') + r.resolution; }
@@ -6809,7 +6832,7 @@ EJF_SD.ui = {
         $li.on('mouseenter', function () { EJF_SD.ui._showTip(r, this, meta); });
         $li.on('mouseleave', function () { EJF_SD.ui._hideTip(); });
         $('<a></a>').attr('href', '/browse/' + r.key).attr('target', target).text(r.key).appendTo($li);
-        $('<span class="ejf-sd-score"></span>').text(pct + '%').appendTo($li);
+        if (!(opts && opts.noScore)) { $('<span class="ejf-sd-score"></span>').text(pct + '%').appendTo($li); }   // reporter-list rows have no relevance score
         action(r.key).appendTo($li);
         $('<div class="ejf-sd-sum"></div>').text(r.summary || '').appendTo($li);
         if (meta) { $('<div class="ejf-sd-meta"></div>').text(meta).appendTo($li); }
@@ -6993,6 +7016,10 @@ EJF_SD.ui = {
     },
 
     render: function (key) {
+        // View-mode switch: when the funnel's "this reporter's other reports" toggle is on, the EBR panel lists
+        // the reporter's OTHER reports instead of similar defects. Every re-render path funnels through here, so
+        // the branch lives here (one chokepoint) rather than at each caller.
+        if (EJF_SD.ui.reporterMode) { return EJF_SD.ui.renderReporterReports(key); }
         EJF_SD.ui._ensurePanel();
         EJF_SD.ui._syncFilterBtn();   // reflect any active session filters on the funnel
         var terms = EJF_SD.ui._filterTerms();   // filter box: restrict the ranked corpus to these terms (whole DB)
@@ -7072,6 +7099,70 @@ EJF_SD.ui = {
                 });
             });
         }).catch(function (e) { EJF_SD.ui.setStatus('Error: ' + (e && e.message || e)); });
+    },
+
+    // EBR view, "reporter's other reports" mode (funnel toggle): list EVERY other bug report from the same
+    // Original Reporter as this one, newest first. This is a LIVE Jira search (not the local cache) on purpose:
+    // we deliberately want ALL of the reporter's reports - open AND closed, GM-team included - and the cache
+    // holds only open, non-GM reports. Closed reports are greyed so the open ones stand out.
+    renderReporterReports: function (key) {
+        EJF_SD.ui._ensurePanel();
+        EJF_SD.ui._syncFilterBtn();
+        $('#ejf-sd-title').text('Reports by this reporter');
+        $('#ejf-sd-mode').text('');                                  // no ranking mode in this view
+        $('#ejf-sd-exccluster').removeClass('has-hits').empty();     // defect-only section
+        $('#ejf-sd-loglink').removeClass('has-hits').empty();        // similar-defects-only section
+        $('#ejf-sd-list').empty();
+        EJF_SD.ui.setStatus('Finding this reporter’s other reports…');
+        EJF_SD.ui._getReporterId(key).then(function (rid) {
+            if (EJF_SD.ui.currentKey !== key || !EJF_SD.ui.reporterMode) { return; }   // navigated / toggled off meanwhile
+            if (!rid) { EJF_SD.ui.setStatus('This report has no Original Reporter ID.'); return; }
+            var jql = 'project = EBR AND cf[11660] ~ ' + EJF_SD.ui._jqlQuote(rid) + ' ORDER BY created DESC';
+            return EJF_SD.sync._apiPost('/rest/api/3/search/jql', {
+                jql: jql, fields: ['summary', 'status', 'resolution', 'created', 'description'], maxResults: 100
+            }).then(function (r) {
+                if (EJF_SD.ui.currentKey !== key || !EJF_SD.ui.reporterMode) { return; }
+                var issues = (r.data && r.data.issues) || [];
+                var rows = [];
+                for (var i = 0; i < issues.length; i++) {
+                    var iss = issues[i], f = iss.fields || {};
+                    if (iss.key === key) { continue; }   // exclude the report we're on
+                    var status = (f.status && f.status.name) || '';
+                    rows.push({
+                        key: iss.key,
+                        summary: f.summary || '',
+                        status: status,
+                        resolution: (f.resolution && f.resolution.name) || null,
+                        created: f.created || null,
+                        description: EJF_SD.util.toPlainText(f.description),
+                        stale: EJF_SD.util.isClosedStatus(status)   // grey out closed reports so the open ones stand out
+                    });
+                }
+                if (!rows.length) { EJF_SD.ui.setStatus('No other reports from this reporter.'); return; }
+                EJF_SD.ui.setStatus(rows.length + ' other report' + (rows.length === 1 ? '' : 's') + ' from this reporter');
+                var $list = $('#ejf-sd-list');
+                $list.empty();
+                for (var j = 0; j < rows.length; j++) { $list.append(EJF_SD.ui._reporterRow(rows[j])); }
+                EJF_SD.ui._fitVertical();
+            });
+        }).catch(function (e) { EJF_SD.ui.setStatus('Error: ' + (e && e.message || e)); });
+    },
+
+    // Wrap a value as a JQL string literal (escape backslashes + double-quotes).
+    _jqlQuote: function (s) { return '"' + String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"'; },
+
+    // This report's Original Reporter ID, read live from Jira (one field). '' when the field is empty/absent.
+    _getReporterId: function (key) {
+        return new Promise(function (resolve) {
+            $.ajax({ url: EJF_SD.HOST + '/rest/api/2/issue/' + key + '?fields=customfield_11660', dataType: 'json' })
+                .done(function (d) { var v = d && d.fields && d.fields.customfield_11660; resolve(typeof v === 'string' ? v.trim() : ''); })
+                .fail(function () { resolve(''); });
+        });
+    },
+
+    // Reporter-list row: link navigates in place; no relevance score and no trailing control (not a ranked match).
+    _reporterRow: function (r) {
+        return EJF_SD.ui._row(r, '_self', function () { return $(); }, { noScore: true });
     },
 
     // Populate the "Same exception" section: every OTHER defect that reported the same exception signature as
@@ -7166,6 +7257,7 @@ EJF_SD.ui = {
         // Skip only when the chrome is mounted AND it's the same issue. In sidebar mode a Jira re-render can
         // wipe our injected section; _chromePresent() then reports false and we re-mount + repopulate here.
         if (EJF_SD.ui._chromePresent() && EJF_SD.ui.currentKey === key) { return; }
+        if (EJF_SD.ui.currentKey !== key) { EJF_SD.ui.reporterMode = false; }   // new issue -> leave the reporter-reports view (its reporter is per-issue)
         EJF_SD.ui.currentKey = key;
         if (isEbr) {
             EJF_SD.ui.render(key);              // bug report -> similar defects
