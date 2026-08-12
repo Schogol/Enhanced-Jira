@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Enhanced Jira Features
-// @version     2.32.0
+// @version     2.33.0
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Enhanced-Jira/raw/main/Enhanced%20Jira%20Features.user.js
@@ -2531,7 +2531,10 @@ var EJF_SD = {
     HOST: 'https://fenriscreations.atlassian.net',
     SCOPE: 'project in (EDR, EO, PLAT)',           // defect dataset (crawled + embedded); shown as similar-defect candidates on EBR pages
     EBR_SCOPE: 'project = EBR AND statusCategory != Done',  // open bug reports, for the EDR "matching reports" view
-    FIELDS: ['summary', 'description', 'status', 'resolution', 'resolutiondate', 'created', 'components', 'updated', 'project'],
+    // "EO - GameMasters" team id (Team field = customfield_10001). Bug reports assigned to the GM team are being
+    // handled BY the GMs, so they're excluded from the "matching bug reports" view (see EJF_SD.rank EBR indexes).
+    GM_TEAM_ID: 'ef4edd53-c099-4431-82af-9b4bd717cb88-38',
+    FIELDS: ['summary', 'description', 'status', 'resolution', 'resolutiondate', 'created', 'components', 'updated', 'project', 'customfield_10001'],  // customfield_10001 = Team
     DB_NAME: 'EJF_SimilarDefects',
     DB_VERSION: 1,
     PAGE_SIZE: 100,
@@ -2549,14 +2552,15 @@ var EJF_SD = {
     })(),
     MODEL_VERSION: 'gte-small-v3',                  // embedding model tag; bump to force a full re-embed
                                                     // (v1 = NaN from fp16; v2 = fp32; v3 = boilerplate-stripped text)
-    DATA_VERSION: 2                                 // stored-record SCHEMA version. Bump whenever a sync change
+    DATA_VERSION: 3                                 // stored-record SCHEMA version. Bump whenever a sync change
                                                     // adds/changes a FIELD on stored records - OR widens the crawl
                                                     // SCOPE - that a plain incremental catch-up can't backfill (it
                                                     // only re-fetches CHANGED issues, so old rows / newly-in-scope
                                                     // projects are missed). On load EJF_SD.migrate auto-re-fetches
                                                     // any dataset stamped below this. (v1 = added the `created`
                                                     // field; v2 = added PLAT to SCOPE -> full refetch backfills
-                                                    // existing PLAT defects.)
+                                                    // existing PLAT defects; v3 = added the `team` field
+                                                    // (customfield_10001) so GM-team bug reports can be excluded.)
 };
 
 
@@ -3466,6 +3470,25 @@ EJF_SD.util = {
         return /closed|done|resolved|rejected|cancel|attached/i.test(status || '');
     },
 
+    // Normalize a Team custom-field value (customfield_10001) to a plain id string, or '' when absent. The field
+    // can come back as a bare string / number OR an object ({id}/{value}/{teamId}) depending on the Team-field
+    // variant, so handle every shape.
+    teamId: function (v) {
+        if (v == null) { return ''; }
+        if (typeof v === 'string' || typeof v === 'number') { return String(v); }
+        if (typeof v === 'object') { return String(v.id || v.value || v.teamId || v.name || ''); }
+        return '';
+    },
+
+    // True when a Team value is "EO - GameMasters". Matches the full id, the short numeric id ('38'), or any
+    // "<prefix>-38" form, so it's robust to whichever shape the API / a stored record carries.
+    isGmTeam: function (v) {
+        var id = EJF_SD.util.teamId(v);
+        if (!id) { return false; }
+        var short = String(EJF_SD.GM_TEAM_ID).split('-').pop();   // '38' - the short numeric team id
+        return id === EJF_SD.GM_TEAM_ID || id === short || id.slice(-(short.length + 1)) === ('-' + short);
+    },
+
     // Stale-match demotion factor. A defect that was FIXED long before this bug report was even filed is
     // very unlikely to be the report's real duplicate, so we gently scale its score down with that gap.
     // Returns { factor (0.5..1), ageDays }. Linear ramp: full weight until `grace` days, decaying to a
@@ -4336,6 +4359,7 @@ EJF_SD.sync = {
             created: f.created || null,                  // when the issue was created (shown in the suggestion row)
             components: components,
             updated: f.updated || '',
+            team: EJF_SD.util.teamId(f.customfield_10001),   // Team field; used to exclude GM-team bug reports
             embedding: null,
             embeddingModelVersion: null,
             textHash: EJF_SD.util.hash(summary + '\n' + description)
@@ -4752,7 +4776,7 @@ EJF_SD.rank = {
     // them, but a stale record could linger between syncs).
     _ensureEbrIndex: function () {
         return EJF_SD.rank._ensureCached('_ebrIndex', '_dirtyEbr', '_buildingEbr', function (records) {
-            return EJF_SD.rank._buildKeywordIndex(records, function (rec) { return rec.project === 'EBR' && !EJF_SD.util.isClosedStatus(rec.status); });
+            return EJF_SD.rank._buildKeywordIndex(records, function (rec) { return rec.project === 'EBR' && !EJF_SD.util.isClosedStatus(rec.status) && !EJF_SD.util.isGmTeam(rec.team); });
         });
     },
 
@@ -4979,8 +5003,9 @@ EJF_SD.embed = {
             var todo = [], curVer = 0;
             for (var i = 0; i < recs.length; i++) {
                 // Embed BOTH defects and open bug reports (EBRs): hybrid ranking is used on both the EBR
-                // (similar defects) and EDR (matching reports) views. Skip closed EBRs - they're not ranked.
-                if (recs[i].project === 'EBR' && EJF_SD.util.isClosedStatus(recs[i].status)) { continue; }
+                // (similar defects) and EDR (matching reports) views. Skip closed EBRs and GM-team EBRs - neither
+                // is ranked in the "matching reports" view, so embedding them is wasted work.
+                if (recs[i].project === 'EBR' && (EJF_SD.util.isClosedStatus(recs[i].status) || EJF_SD.util.isGmTeam(recs[i].team))) { continue; }
                 if (recs[i].embedding && recs[i].embeddingModelVersion === EJF_SD.MODEL_VERSION) { curVer++; }
                 else { todo.push(recs[i]); }
             }
@@ -5187,7 +5212,7 @@ EJF_SD.rank._buildingEbrVec = null;
 // _ensureVecIndex but keeps only open EBRs (closed ones aren't ranked and lose their slot).
 EJF_SD.rank._ensureEbrVecIndex = function () {
     return EJF_SD.rank._ensureCached('_ebrVecIndex', '_dirtyEbrVec', '_buildingEbrVec', function (recs) {
-        return EJF_SD.rank._buildVecIndex(recs, function (r) { return r.project === 'EBR' && !EJF_SD.util.isClosedStatus(r.status); });
+        return EJF_SD.rank._buildVecIndex(recs, function (r) { return r.project === 'EBR' && !EJF_SD.util.isClosedStatus(r.status) && !EJF_SD.util.isGmTeam(r.team); });
     });
 };
 
