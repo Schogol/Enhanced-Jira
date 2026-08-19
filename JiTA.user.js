@@ -199,7 +199,7 @@ if (!JITA_IS_FORGE_FRAME) {
         if (typeof JiTA !== 'undefined' && JiTA.menu) { JiTA.menu.open(); }
     });
     // Open the ISD Credits overlay (your live monthly total + the leads-only leaderboard). The overlay's
-    // Refresh recomputes the selected month and also dumps the table to the console (verify vs. monthly_report.py).
+    // Refresh recomputes the selected month's full leaderboard on demand.
     GM_registerMenuCommand("📊 ISD Credits leaderboard…", function () {
         if (typeof JiTA !== 'undefined' && JiTA.credits) { JiTA.credits.openView(); }
     });
@@ -7468,18 +7468,7 @@ JiTA.menu = {
                 JiTA.credits._quiet = false;
                 JiTA.credits.refresh(now.y, now.m).then(function () { JiTA.credits.badge.refresh(); }).catch(function () { /* ignore */ });
             }).appendTo($crAct);
-            // Auto-update interval: how often the current month is recomputed in the background (0 = manual only).
-            var $ivRow = $('<div class="jita-menu-row"></div>');
-            $('<span class="lbl">Auto-update</span>')
-                .append($('<span class="sub"></span>').text('How often to recompute this month in the background'))
-                .appendTo($ivRow);
-            var $iv = $('<select class="jita-cred-input" style="width:auto;"></select>');
-            [['Manual only', '0'], ['Every 5 minutes', '5'], ['Every 15 minutes', '15'], ['Every 30 minutes', '30'], ['Every hour', '60'], ['Every 3 hours', '180'], ['Every 6 hours', '360'], ['Every 12 hours', '720'], ['Every 24 hours', '1440']]
-                .forEach(function (o) { $('<option></option>').val(o[1]).text(o[0]).appendTo($iv); });
-            $iv.val(String(JiTA.credits.sched.intervalMin()));
-            $iv.on('change', function () { gmSet('creditsIntervalMin', parseInt($iv.val(), 10) || 0); });
-            $ivRow.append($iv);
-            $cr.append($ivRow);
+            $('<div class="jita-menu-status" style="margin-top:6px;color:#7a8694;">Your own total refreshes automatically every ~2 min; the full leaderboard every ~15 min.</div>').appendTo($cr);
             $p.append($cr);
         }
 
@@ -8205,7 +8194,7 @@ JiTA.credits = {
                         });
                         table.push(['Total', tot.created, tot.resolved, tot.attached, tot.trashed, tot.reassigned,
                             tot.actioned, Math.round(tot.extra * 10) / 10, Math.round(tot.credits * 10) / 10]);
-                        return { ym: ym, computedAt: new Date().toISOString(), header: header, table: table, rows: rows, nameToAcc: nameToAcc };
+                        return { ym: ym, computedAt: new Date().toISOString(), header: header, table: table, rows: rows, nameToAcc: nameToAcc, memberAccounts: memberAccounts };
                     });
             });
         });
@@ -8237,6 +8226,125 @@ JiTA.credits = {
             JiTA.credits.running = false;
             JiTA.credits._clearProgress();
             JiTA.ui.setStatus('Credits error: ' + (e && e.message || e));
+            throw e;
+        });
+    },
+
+    // ---- self-only compute (cheap; the badge / your card refresh on this every ~2 min) ------------------
+    // We recompute only the LOGGED-IN user's numbers frequently, and reuse the slow-changing Reassigned +
+    // Extra (and the rank basis) from the last full leaderboard run. This avoids the expensive group-wide
+    // reassignment crawl on the fast cadence, so the fast path is just a handful of self-scoped searches.
+    _selfKey: function (ym) { return 'creditsSelf:' + ym; },
+    getSelf: function (ym) { return JiTA.db.getMeta(JiTA.credits._selfKey(ym)); },
+
+    // Resolve the viewer's name + accounts (+ their cached Reassigned/Extra and the full table for ranking),
+    // preferring the last full-leaderboard cache; falls back to /myself + old-account resolution if there's none.
+    _selfIdentity: function (me, full) {
+        var C = JiTA.credits;
+        if (full && full.nameToAcc) {
+            var myName = null;
+            for (var n in full.nameToAcc) { if (full.nameToAcc.hasOwnProperty(n) && full.nameToAcc[n] === me) { myName = n; } }
+            if (myName) {
+                var myAccounts = (full.memberAccounts && full.memberAccounts[myName]) || [me];
+                var reassigned = (full.rows && full.rows[myName] && full.rows[myName].reassigned) || 0;
+                var extra = 0;
+                (full.table || []).forEach(function (row) { if (row[0] === myName) { extra = row[7] || 0; } });
+                return Promise.resolve({ myName: myName, myAccounts: myAccounts, reassigned: reassigned, extra: extra, fullTable: full.table });
+            }
+        }
+        return C._get('/rest/api/2/myself').then(function (mys) {
+            var myName = (mys && mys.displayName) || null;
+            return C._resolveOldReporters([{ accountId: me, displayName: myName, emailAddress: (mys && mys.emailAddress) || '' }]).then(function (old) {
+                var myAccounts = [me];
+                for (var oid in old.oldNames) { if (old.oldNames.hasOwnProperty(oid)) { myAccounts.push(oid); } }
+                var extra = myName ? (C._computeExtra([myName])[myName] || 0) : 0;
+                return { myName: myName, myAccounts: myAccounts, reassigned: 0, extra: extra, fullTable: null };
+            });
+        }, function () { return { myName: null, myAccounts: [me], reassigned: 0, extra: 0, fullTable: null }; });
+    },
+
+    // Attached / Trashed for MY accounts only. Same rules as _reportsActioned, but the reopen-aware changelog
+    // crawl is limited to the reports I TOUCHED that later moved out (a tiny set) instead of every moved-out report.
+    _reportsActionedSelf: function (accs, b) {
+        var C = JiTA.credits, win = 'DURING ("' + b.start + '", "' + b.end + '")';
+        var att = {}, clo = {}, queries = [];
+        for (var i = 0; i < accs.length; i++) {
+            queries.push({ tgt: att, jql: 'project = ' + C.EBR + ' AND status CHANGED TO "' + C.ATTACHED_STATUS + '" BY "' + accs[i] + '" ' + win });
+            queries.push({ tgt: clo, jql: 'project = ' + C.EBR + ' AND status CHANGED TO "' + C.CLOSED_STATUS + '" BY "' + accs[i] + '" ' + win });
+        }
+        if (C.AUTOMATION_ID) {
+            var who = 'assignee in (' + C._accList(accs) + ')';
+            queries.push({ tgt: att, jql: 'project = ' + C.EBR + ' AND status CHANGED TO "' + C.ATTACHED_STATUS + '" BY "' + C.AUTOMATION_ID + '" ' + win + ' AND ' + who });
+            queries.push({ tgt: clo, jql: 'project = ' + C.EBR + ' AND status CHANGED TO "' + C.CLOSED_STATUS + '" BY "' + C.AUTOMATION_ID + '" ' + win + ' AND ' + who });
+        }
+        var movedOut = {};
+        return C._allKeys('project = ' + C.EBR + ' AND status CHANGED FROM "' + C.ATTACHED_STATUS + '" ' + win).then(function (a) {
+            return C._allKeys('project = ' + C.EBR + ' AND status CHANGED FROM "' + C.CLOSED_STATUS + '" ' + win).then(function (c) {
+                var k; for (k in a) { if (a.hasOwnProperty(k)) { movedOut[k] = true; } }
+                for (k in c) { if (c.hasOwnProperty(k)) { movedOut[k] = true; } }
+            });
+        }).then(function () {
+            return C._serial(queries, function (q) { return C._allKeys(q.jql).then(function (keys) { for (var kk in keys) { if (keys.hasOwnProperty(kk)) { q.tgt[kk] = true; } } }); });
+        }).then(function () {
+            var attached = 0, trashed = 0, ambiguous = [];
+            for (var kA in att) { if (att.hasOwnProperty(kA)) { if (!movedOut[kA]) { attached++; } else { ambiguous.push({ k: kA, kind: 'att' }); } } }
+            for (var kC in clo) { if (clo.hasOwnProperty(kC)) { if (!movedOut[kC]) { trashed++; } else { ambiguous.push({ k: kC, kind: 'clo' }); } } }
+            var myAcc = {}; accs.forEach(function (a) { myAcc[a] = true; });
+            return C._serial(ambiguous, function (item) {
+                return JiTA.util.delay(C.CRAWL_DELAY_MS).then(function () { return C._allHistories(item.k); }).then(function (hist) {
+                    var status = item.kind === 'att' ? C.ATTACHED_STATUS : C.CLOSED_STATUS;
+                    var actioner = C._effectiveActioner(hist, status, b);
+                    if (actioner && myAcc[actioner]) { if (item.kind === 'att') { attached++; } else { trashed++; } }
+                });
+            }).then(function () { return { attached: attached, trashed: trashed }; });
+        });
+    },
+
+    // Compute + cache only the viewer's numbers for (y, m). Resolves the self record (also written to creditsSelf:<ym>).
+    computeSelf: function (y, m) {
+        var C = JiTA.credits, b = C._monthBounds(y, m), ym = b.start.slice(0, 7);
+        return JiTA.link.currentUser().then(function (me) {
+            if (!me) { return null; }
+            return C.getCached(ym).then(function (full) {
+                return C._selfIdentity(me, full).then(function (id) {
+                    if (!id.myName) { return null; }   // couldn't identify the viewer as a member
+                    var rows = {}; rows[id.myName] = { created: 0, resolved: 0, attached: 0, trashed: 0, reassigned: 0 };
+                    var acctToName = {}; id.myAccounts.forEach(function (a) { acctToName[a] = id.myName; });
+                    return C._defectsCreated(id.myAccounts, b, acctToName, rows)
+                        .then(function () { return C._defectsResolved(id.myAccounts, b, acctToName, rows); })
+                        .then(function () { return C._reportsActionedSelf(id.myAccounts, b); })
+                        .then(function (rep) {
+                            var r = rows[id.myName];
+                            r.attached = rep.attached; r.trashed = rep.trashed; r.reassigned = id.reassigned;
+                            var credits = C._creditFormula(r, id.extra);
+                            var actioned = r.attached + r.trashed + r.reassigned + r.created;
+                            var rank = null, total = null;
+                            if (id.fullTable) {
+                                var real = id.fullTable.slice(0, id.fullTable.length - 1);
+                                var better = 0;
+                                real.forEach(function (row) { var cv = (row[0] === id.myName) ? credits : row[8]; if (cv > credits) { better++; } });
+                                rank = better + 1; total = real.length;
+                            }
+                            var out = { ym: ym, computedAt: new Date().toISOString(), me: me, myName: id.myName,
+                                created: r.created, resolved: r.resolved, attached: r.attached, trashed: r.trashed,
+                                reassigned: r.reassigned, actioned: actioned, extra: id.extra, credits: credits, rank: rank, total: total };
+                            return JiTA.db.setMeta(C._selfKey(ym), out).then(function () { return out; });
+                        });
+                });
+            });
+        });
+    },
+
+    // Guarded self recompute (mirrors refresh): updates creditsSelf + the badge. Shares the single `running` flag.
+    refreshSelf: function (y, m) {
+        if (JiTA.credits.running) { return Promise.resolve(null); }
+        JiTA.credits.running = true;
+        return JiTA.credits.computeSelf(y, m).then(function (res) {
+            JiTA.credits.running = false;
+            try { JiTA.credits.badge.refresh(); } catch (e) { /* ignore */ }
+            return res;
+        }).catch(function (e) {
+            JiTA.credits.running = false;
             throw e;
         });
     },
@@ -8305,8 +8413,7 @@ JiTA.credits = {
             var p = sel.split('-'), yy = parseInt(p[0], 10), mm = parseInt(p[1], 10);
             $refresh.prop('disabled', true).text('Computing…');
             C._quiet = false;   // user-triggered: show the progress pill
-            C.refresh(yy, mm).then(function (res) {
-                if (res) { C._report(res); }   // also dump to console (verification)
+            C.refresh(yy, mm).then(function () {
                 C.badge.refresh();
                 $refresh.prop('disabled', false).text('Refresh');
                 render();
@@ -8316,35 +8423,67 @@ JiTA.credits = {
             });
         });
 
-        function card(res, d) {
-            var h = res.header;
+        // The viewer's line, preferring the fresher self cache (current month) over the full-leaderboard row.
+        function cardInfo(fullRes, selfRes, me) {
+            if (selfRes && selfRes.me === me && selfRes.credits != null) {
+                return { myName: selfRes.myName, created: selfRes.created, resolved: selfRes.resolved, attached: selfRes.attached,
+                    trashed: selfRes.trashed, reassigned: selfRes.reassigned, actioned: selfRes.actioned, extra: selfRes.extra,
+                    credits: selfRes.credits, rank: selfRes.rank, total: selfRes.total };
+            }
+            if (fullRes) {
+                var d = C._derive(fullRes, me);
+                if (d.myRow) {
+                    return { myName: d.myName, created: d.myRow[1], resolved: d.myRow[2], attached: d.myRow[3], trashed: d.myRow[4],
+                        reassigned: d.myRow[5], actioned: d.myRow[6], extra: d.myRow[7], credits: d.myRow[8], rank: d.myRank, total: d.total };
+                }
+            }
+            return { myName: null };
+        }
+
+        function card(info) {
             var $c = $('<div style="background:#22272b;border:1px solid #2c333a;border-radius:8px;padding:12px 14px;"></div>');
             $('<div style="font-weight:700;font-size:13px;margin-bottom:8px;"></div>')
-                .text(d.myName ? ('You - ' + d.myName) : 'Your account was not matched to an ECAID member').appendTo($c);
-            if (d.myRow) {
-                var bits = [];
-                for (var i = 1; i <= 6; i++) { bits.push(h[i].replace('Defects ', '').replace('Reports ', '') + ' ' + d.myRow[i]); }
-                $('<div style="color:#c7cdd4;font-size:12px;line-height:1.8;"></div>').text(bits.join('   ')).appendTo($c);
-                var $big = $('<div style="margin-top:8px;font-size:16px;font-weight:800;color:#fff;"></div>').text(d.myRow[8] + ' credits');
-                $('<span style="color:#9aa6b2;font-weight:600;font-size:12px;margin-left:12px;"></span>').text('rank #' + d.myRank + ' of ' + d.total).appendTo($big);
-                if (d.myRow[7]) { $('<span style="color:#b794f6;font-weight:600;font-size:12px;margin-left:12px;"></span>').text('(+' + d.myRow[7] + ' extra)').appendTo($big); }
-                $big.appendTo($c);
+                .text(info.myName ? ('You - ' + info.myName) : 'Your account was not matched to an ECAID member').appendTo($c);
+            if (info.myName && info.credits != null) {
+                // Two labelled groups so it's clear Created/Resolved are DEFECTS and Attached/Trashed/Reassigned are BUG REPORTS.
+                function group(label, parts) {
+                    var $l = $('<div style="font-size:12px;line-height:1.9;"></div>');
+                    $('<span style="color:#8a94a0;font-weight:700;"></span>').text(label).appendTo($l);
+                    parts.forEach(function (p) { $('<span style="color:#c7cdd4;margin-left:14px;"></span>').text(p).appendTo($l); });
+                    return $l;
+                }
+                $c.append(group('Defects', [info.created + ' created', info.resolved + ' resolved']));
+                $c.append(group('Bug reports', [info.attached + ' attached', info.trashed + ' trashed', info.reassigned + ' reassigned']));
+                var $big = $('<div style="margin-top:10px;font-size:16px;font-weight:800;color:#fff;"></div>').text(info.credits + ' credits');
+                if (info.rank != null) { $('<span style="color:#9aa6b2;font-weight:600;font-size:12px;margin-left:12px;"></span>').text('rank #' + info.rank + ' of ' + info.total).appendTo($big); }
+                if (info.extra) { $('<span style="color:#b794f6;font-weight:600;font-size:12px;margin-left:12px;"></span>').text('(+' + info.extra + ' extra)').appendTo($big); }
+                $('<span style="color:#7a8694;font-weight:500;font-size:11px;margin-left:12px;"></span>').text(info.actioned + ' total actioned').appendTo($big);
+                $c.append($big);
             }
             return $c;
         }
 
         function table(res, d) {
-            var h = res.header;
+            // Short column labels (the grouping row above clarifies defects vs bug reports; keeps columns narrow).
+            var short = res.header.map(function (c) { return c.replace(/^Defects |^Reports |^Total /, '').replace(/ Credits$| Earned$/, ''); });
             var $wrap = $('<div style="overflow-x:auto;"></div>');
             var $tbl = $('<table style="border-collapse:collapse;font-size:12px;width:100%;"></table>');
+            var $thead = $('<thead></thead>');
+            // grouping row: which columns are DEFECTS (Created/Resolved) vs BUG REPORTS (Attached/Trashed/Reassigned)
+            var thg = 'padding:4px 8px;border-bottom:1px solid #2c333a;color:#7a8694;font-size:11px;text-transform:uppercase;letter-spacing:.04em;text-align:center;';
+            var $g = $('<tr></tr>');
+            $('<th colspan="2"></th>').appendTo($g);                                        // # + Name
+            $('<th colspan="2"></th>').attr('style', thg).text('Defects').appendTo($g);      // Created + Resolved
+            $('<th colspan="3"></th>').attr('style', thg).text('Bug reports').appendTo($g);  // Attached + Trashed + Reassigned
+            $('<th colspan="3"></th>').appendTo($g);                                        // Actioned + Extra + Credits
+            $thead.append($g);
+            // label row
             var $hr = $('<tr></tr>');
             $('<th style="text-align:left;padding:5px 8px;border-bottom:1px solid #3a434d;color:#9aa6b2;">#</th>').appendTo($hr);
-            h.forEach(function (c, i) {
-                // Short column labels so all 9 columns fit without horizontal scroll (the card shows the full names).
-                var lbl = c.replace(/^Defects |^Reports |^Total /, '').replace(/ Credits$| Earned$/, '');
-                $('<th></th>').attr('style', 'padding:5px 8px;border-bottom:1px solid #3a434d;color:#9aa6b2;white-space:nowrap;text-align:' + (i === 0 ? 'left' : 'right') + ';').text(lbl).appendTo($hr);
+            short.forEach(function (c, i) {
+                $('<th></th>').attr('style', 'padding:5px 8px;border-bottom:1px solid #3a434d;color:#9aa6b2;white-space:nowrap;text-align:' + (i === 0 ? 'left' : 'right') + ';').text(c).appendTo($hr);
             });
-            $tbl.append($('<thead></thead>').append($hr));
+            $tbl.append($thead.append($hr));
             var $tb = $('<tbody></tbody>');
             d.real.forEach(function (row, idx) {
                 var mine = row[0] === d.myName;
@@ -8367,31 +8506,47 @@ JiTA.credits = {
             return $wrap.append($tbl);
         }
 
+        function fillCard() {
+            return Promise.all([C.getCached(sel), C.getSelf(sel), JiTA.link.currentUser()]).then(function (arr) {
+                var slot = document.getElementById('jita-cred-card-slot');
+                if (slot) { $(slot).empty().append(card(cardInfo(arr[0], arr[1], arr[2]))); }
+                return arr;
+            });
+        }
+
         function render() {
             $scroll.empty();
             $msel.val(sel);
             $scroll.append($('<div class="jita-menu-status">Loading…</div>'));
-            C.getCached(sel).then(function (res) {
+            Promise.all([C.getCached(sel), C.getSelf(sel), JiTA.link.currentUser()]).then(function (arr) {
+                var fullRes = arr[0], selfRes = arr[1], me = arr[2];
                 $scroll.empty();
-                if (!res) {
-                    $scroll.append($('<div class="jita-menu-status"></div>').text('Not computed yet for ' + sel + '. Click Refresh to compute it (can take a minute).'));
+                $scroll.append($('<div id="jita-cred-card-slot"></div>').append(card(cardInfo(fullRes, selfRes, me))));
+                if (!fullRes) {
+                    $scroll.append($('<div class="jita-menu-status" style="margin-top:12px;"></div>')
+                        .text('Leaderboard not computed yet for ' + sel + '. It refreshes automatically, or click Refresh.'));
                     return;
                 }
-                JiTA.link.currentUser().then(function (me) {
-                    var d = C._derive(res, me);
-                    $scroll.append(card(res, d));
-                    if (d.isLead) {
-                        $scroll.append($('<div class="jita-cred-sub">Leaderboard</div>'));
-                        $scroll.append(table(res, d));
-                    } else {
-                        $scroll.append($('<div class="jita-menu-status" style="margin-top:12px;"></div>')
-                            .text('The full leaderboard is visible to leads only.' + (d.myRank ? (' You are ranked #' + d.myRank + ' of ' + d.total + '.') : '')));
-                    }
-                    $scroll.append($('<div class="jita-menu-status" style="margin-top:12px;color:#7a8694;"></div>')
-                        .text('Computed ' + String(res.computedAt || '').replace('T', ' ').slice(0, 16) + ' - ' + d.total + ' members.'));
-                });
+                var d = C._derive(fullRes, me);
+                if (d.isLead) {
+                    $scroll.append($('<div class="jita-cred-sub">Leaderboard</div>'));
+                    $scroll.append(table(fullRes, d));
+                } else {
+                    var info = cardInfo(fullRes, selfRes, me);
+                    $scroll.append($('<div class="jita-menu-status" style="margin-top:12px;"></div>')
+                        .text('The full leaderboard is visible to leads only.' + (info.rank != null ? (' You are ranked #' + info.rank + ' of ' + info.total + '.') : '')));
+                }
+                $scroll.append($('<div class="jita-menu-status" style="margin-top:12px;color:#7a8694;"></div>')
+                    .text('Leaderboard computed ' + String(fullRes.computedAt || '').replace('T', ' ').slice(0, 16) + ' - ' + d.total + ' members. Your own total updates every ~2 min.'));
             });
         }
+
+        // Keep the "You" card fresh while the overlay is open (the self compute writes creditsSelf every ~2 min).
+        var cardTimer = setInterval(function () {
+            if (!document.getElementById('jita-menu')) { clearInterval(cardTimer); return; }
+            fillCard();
+        }, 30 * 1000);
+
         render();
     },
 
@@ -8417,12 +8572,19 @@ JiTA.credits = {
             var el = document.getElementById('jita-credits-badge');
             if (!el) { return; }
             var ym = JiTA.credits._ymNow().ym;
-            JiTA.credits.getCached(ym).then(function (res) {
-                if (!res) { el.textContent = '📊 credits: —'; return; }
-                JiTA.link.currentUser().then(function (me) {
-                    var d = JiTA.credits._derive(res, me);
-                    el.textContent = d.myRow ? ('📊 ' + d.myRow[8] + ' cr · #' + d.myRank + '/' + d.total) : '📊 credits: n/a';
-                });
+            JiTA.credits.getSelf(ym).then(function (self) {
+                if (self && self.credits != null) {
+                    el.textContent = '📊 ' + self.credits + ' cr' + (self.rank != null ? (' · #' + self.rank + '/' + self.total) : '');
+                    return;
+                }
+                // fallback: derive from the full-leaderboard cache until the first self compute lands
+                JiTA.credits.getCached(ym).then(function (res) {
+                    if (!res) { el.textContent = '📊 credits: —'; return; }
+                    JiTA.link.currentUser().then(function (me) {
+                        var d = JiTA.credits._derive(res, me);
+                        el.textContent = d.myRow ? ('📊 ' + d.myRow[8] + ' cr · #' + d.myRank + '/' + d.total) : '📊 credits: n/a';
+                    });
+                }).catch(function () { /* ignore */ });
             }).catch(function () { /* ignore */ });
         },
         remove: function () {
@@ -8431,102 +8593,74 @@ JiTA.credits = {
         }
     },
 
-    // ---- background scheduler (throttled current-month recompute; interval is user-configurable) ----------
+    // ---- background schedulers (two cadences: your own total often, the full leaderboard less often) ------
+    // A single tick() runs on POLL_MS and starts AT MOST ONE job per tick (full takes priority, then self).
+    // Both jobs share the in-memory `running` flag and tick bails if it's set, so within a tab the two can NEVER
+    // overlap. Each job has its own cross-tab lease; different tabs writing different cache keys is harmless.
     sched: {
-        POLL_MS: 60 * 1000,              // check every minute (so even a 5-minute interval is honored closely)
-        STARTUP_DELAY_MS: 25 * 1000,     // let the page settle before the first (possibly heavy) run
-        LEASE_TTL_MS: 90 * 1000,         // lease is heartbeated every 30s while computing; a dead tab's lease expires ~90s after it stops
+        SELF_MS: 2 * 60 * 1000,          // recompute only YOUR credits this often (cheap, self-scoped)
+        FULL_MS: 15 * 60 * 1000,         // recompute the whole leaderboard this often (heavy group crawl)
+        POLL_MS: 30 * 1000,              // how often tick() checks whether either cadence is due
+        STARTUP_DELAY_MS: 20 * 1000,     // let the page settle before the first run
+        FULL_TTL_MS: 90 * 1000,          // full-run lease is heartbeated every 30s; a dead tab's lease expires ~90s after
+        SELF_TTL_MS: 2 * 60 * 1000,      // self run is short, so a plain lease TTL suffices (no heartbeat)
         HEARTBEAT_MS: 30 * 1000,
-        LAST_KEY: 'creditsLastTs',
-        LEASE_KEY: 'creditsLease',
+        LAST_FULL_KEY: 'creditsLastFullTs',
+        LAST_SELF_KEY: 'creditsLastSelfTs',
+        FULL_LEASE_KEY: 'creditsFullLease',
+        SELF_LEASE_KEY: 'creditsSelfLease',
         _timer: null,
 
-        // Auto-update interval in MINUTES, read live from GM storage (0 = manual only). Set from the settings menu.
-        intervalMin: function () { var v = parseInt(gmGet('creditsIntervalMin', 15), 10); return isNaN(v) ? 15 : v; },
-
-        _recently: function () {
-            var iv = JiTA.credits.sched.intervalMin();
-            if (iv <= 0) { return true; }   // manual-only -> never auto-compute
-            var last = gmGet(JiTA.credits.sched.LAST_KEY, 0) || 0;
-            return !!last && (Date.now() - last) < iv * 60 * 1000;
-        },
-        _lease: function () {
-            var l = gmGet(JiTA.credits.sched.LEASE_KEY, null), now = Date.now();
-            if (!l || !l.ts || (now - l.ts) > JiTA.credits.sched.LEASE_TTL_MS || l.tabId === JiTA.sched.tabId) {
-                gmSet(JiTA.credits.sched.LEASE_KEY, { tabId: JiTA.sched.tabId, ts: now });
-                return true;
-            }
+        _elapsed: function (lastKey, ms) { var last = gmGet(lastKey, 0) || 0; return !last || (Date.now() - last) >= ms; },
+        _lease: function (key, ttl) {
+            var l = gmGet(key, null), now = Date.now();
+            if (!l || !l.ts || (now - l.ts) > ttl || l.tabId === JiTA.sched.tabId) { gmSet(key, { tabId: JiTA.sched.tabId, ts: now }); return true; }
             return false;
         },
+        _release: function (key) { var l = gmGet(key, null); if (l && l.tabId === JiTA.sched.tabId) { gmSet(key, null); } },
+
         tick: function () {
             var S = JiTA.credits.sched;
             if (!savedVariables[3][1]) { return; }                 // feature off
-            try { JiTA.credits.badge.refresh(); } catch (e) { /* ignore */ }   // cheap: reflect the latest cache
-            if (JiTA.credits.running) { return; }
-            if (S._recently()) { return; }                         // interval not elapsed (or manual-only)
-            if (!S._lease()) { return; }                           // another tab is computing
+            try { JiTA.credits.badge.refresh(); } catch (e) { /* ignore */ }   // cheap: reflect the latest cache each poll
+            if (JiTA.credits.running) { return; }                  // a job is already running in THIS tab -> never overlap
             var now = JiTA.credits._ymNow();
-            JiTA.credits._quiet = true;                            // background run: no floating pill
-            try { var b = document.getElementById('jita-credits-badge'); if (b) { b.textContent = '📊 updating…'; } } catch (e) { /* ignore */ }
-            // Heartbeat the lease while computing. The compute is in-memory and only writes its result on
-            // completion, so an interrupted run (tab refresh/close) leaves NO partial data and simply restarts
-            // next cycle. The heartbeat means a dead tab's lease goes stale in ~90s (vs. the full TTL), so the
-            // reloaded/other tab picks the work back up promptly instead of skipping cycles.
-            var hb = setInterval(function () { gmSet(S.LEASE_KEY, { tabId: JiTA.sched.tabId, ts: Date.now() }); }, S.HEARTBEAT_MS);
-            var stop = function () { clearInterval(hb); };
-            JiTA.credits.refresh(now.y, now.m).then(function () {
-                gmSet(S.LAST_KEY, Date.now());
-                gmSet(S.LEASE_KEY, null);   // release on success
-                try { JiTA.credits.badge.refresh(); } catch (e) { /* ignore */ }
-                stop();
-            }).catch(function () { stop(); });   // heartbeat stops -> lease expires -> retry next window
+
+            // Full leaderboard (heavy) takes priority. Heartbeats + releases its lease, then refreshes self off the fresh result.
+            if (S._elapsed(S.LAST_FULL_KEY, S.FULL_MS) && S._lease(S.FULL_LEASE_KEY, S.FULL_TTL_MS)) {
+                JiTA.credits._quiet = true;
+                try { var b = document.getElementById('jita-credits-badge'); if (b) { b.textContent = '📊 updating…'; } } catch (e) { /* ignore */ }
+                var hb = setInterval(function () { gmSet(S.FULL_LEASE_KEY, { tabId: JiTA.sched.tabId, ts: Date.now() }); }, S.HEARTBEAT_MS);
+                JiTA.credits.refresh(now.y, now.m).then(function () {
+                    gmSet(S.LAST_FULL_KEY, Date.now());
+                    clearInterval(hb); S._release(S.FULL_LEASE_KEY);
+                    return JiTA.credits.refreshSelf(now.y, now.m).then(function () { gmSet(S.LAST_SELF_KEY, Date.now()); });
+                }).then(function () { try { JiTA.credits.badge.refresh(); } catch (e) { /* ignore */ } })
+                    .catch(function () { clearInterval(hb); S._release(S.FULL_LEASE_KEY); });
+                return;   // one job per tick
+            }
+
+            // Your own credits (cheap, frequent).
+            if (S._elapsed(S.LAST_SELF_KEY, S.SELF_MS) && S._lease(S.SELF_LEASE_KEY, S.SELF_TTL_MS)) {
+                JiTA.credits.refreshSelf(now.y, now.m).then(function () {
+                    gmSet(S.LAST_SELF_KEY, Date.now()); S._release(S.SELF_LEASE_KEY);
+                }).catch(function () { S._release(S.SELF_LEASE_KEY); });
+            }
         },
+
         start: function () {
             var S = JiTA.credits.sched;
             if (S._timer) { return; }
-            // Release our lease when the tab goes away (refresh / close / navigate) so a reload can recompute at
-            // once instead of waiting out the TTL. Best-effort; the heartbeat + TTL are the backstop if it doesn't fire.
-            try {
-                window.addEventListener('pagehide', function () {
-                    var l = gmGet(S.LEASE_KEY, null);
-                    if (l && l.tabId === JiTA.sched.tabId) { gmSet(S.LEASE_KEY, null); }
-                });
-            } catch (e) { /* ignore */ }
+            // Release our leases when the tab goes away so a reload can pick the work up at once (TTL is the backstop).
+            try { window.addEventListener('pagehide', function () { S._release(S.FULL_LEASE_KEY); S._release(S.SELF_LEASE_KEY); }); } catch (e) { /* ignore */ }
             setTimeout(function () {
                 try { S.tick(); } catch (e) { /* swallow */ }
-                S._timer = setInterval(function () {
-                    try { S.tick(); } catch (e) { /* swallow */ }
-                }, S.POLL_MS);
+                S._timer = setInterval(function () { try { S.tick(); } catch (e) { /* swallow */ } }, S.POLL_MS);
             }, S.STARTUP_DELAY_MS);
         }
     },
 
-    // ---- Phase 1a: manual trigger + console dump (verify against monthly_report.py) ---------------------
-    // Pretty-print the table to the console and return the current user's row + rank.
-    _report: function (res) {
-        var header = res.header, table = res.table;
-        // fixed-width console dump
-        var widths = header.map(function (h, i) {
-            return Math.max.apply(null, [String(h).length].concat(table.map(function (r) { return String(r[i]).length; })));
-        });
-        function line(row) {
-            return row.map(function (c, i) { var s = String(c); return i === 0 ? s + Array(widths[i] - s.length + 1).join(' ') : Array(widths[i] - s.length + 1).join(' ') + s; }).join('  ');
-        }
-        if (window.console) {
-            console.log('[JiTA] ISD credits ' + res.ym + ' (computed ' + res.computedAt + ')');
-            console.log(line(header));
-            table.forEach(function (r) { console.log(line(r)); });
-        }
-        return JiTA.link.currentUser().then(function (me) {
-            var myName = null;
-            for (var name in res.nameToAcc) { if (res.nameToAcc.hasOwnProperty(name) && res.nameToAcc[name] === me) { myName = name; } }
-            // rank among real members (exclude the Total row) by Credits Earned desc
-            var real = table.slice(0, -1).slice().sort(function (a, b) { return b[8] - a[8]; });
-            var myRow = null, myRank = null;
-            for (var i = 0; i < real.length; i++) { if (real[i][0] === myName) { myRow = real[i]; myRank = i + 1; } }
-            return { myName: myName, myRow: myRow, myRank: myRank, total: real.length };
-        });
-    }
+    _noop: null
 };
 
 
