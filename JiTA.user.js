@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Jira Triage Assistant
-// @version     2.37.0
+// @version     2.39.0
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Jira-Triage-Assistant/raw/main/JiTA.user.js
@@ -121,10 +121,11 @@ function gmSet(key, val) {
 
 
 // Array which contains the locally saved values for a couple of variables.
-// NOTE: index 3 ("dropdowns") is a RETIRED feature (Linked Issue Dropdowns, removed because Jira's markup
-// changed and it stopped working). The slot is kept as a placeholder so the later indices (4 = buttons,
-// 5 = similarDefects), which are referenced by number throughout this file, don't shift.
-var savedVariables = [["key",""], ["parser", ""], ["scrollbar", ""], ["dropdowns_retired", ""], ["buttons", ""], ["similarDefects", ""]];
+// NOTE: index 3 was "dropdowns" (Linked Issue Dropdowns), a RETIRED feature (removed when Jira's markup
+// changed). That dead slot is now REPURPOSED as "credits" (the ISD credit tracker) - the key name changed
+// so an existing install's orphaned "dropdowns" value is ignored and credits simply defaults on. Indices
+// 4 = buttons and 5 = similarDefects are referenced by number throughout this file, so they must not shift.
+var savedVariables = [["key",""], ["parser", ""], ["scrollbar", ""], ["credits", ""], ["buttons", ""], ["similarDefects", ""]];
 
 
 // Custom-scrollbar CSS, injected on load (when enabled) and by the scrollbar change-listener below. The
@@ -197,11 +198,10 @@ if (!JITA_IS_FORGE_FRAME) {
     GM_registerMenuCommand("⚙ Jira Triage Assistant - Settings…", function () {
         if (typeof JiTA !== 'undefined' && JiTA.menu) { JiTA.menu.open(); }
     });
-    // Phase 1a (dev): compute the current month's ISD credit table in-browser and dump it to the console so
-    // the numbers can be verified against monthly_report.py. The always-on panel + background refresh + the
-    // leads leaderboard come in later phases.
-    GM_registerMenuCommand("📊 Compute my ISD credits (this month)", function () {
-        if (typeof JiTA !== 'undefined' && JiTA.credits) { JiTA.credits.runManual(); }
+    // Open the ISD Credits overlay (your live monthly total + the leads-only leaderboard). The overlay's
+    // Refresh recomputes the selected month and also dumps the table to the console (verify vs. monthly_report.py).
+    GM_registerMenuCommand("📊 ISD Credits leaderboard…", function () {
+        if (typeof JiTA !== 'undefined' && JiTA.credits) { JiTA.credits.openView(); }
     });
 }
 
@@ -7446,7 +7446,42 @@ JiTA.menu = {
                 JiTA.ui.ensure();
             }
         }));
+        // ISD Credits: mount / tear down the corner badge (and start the scheduler) on toggle.
+        $feat.append(JiTA.menu._toggleRow('ISD Credits', 3, function () {
+            if (!savedVariables[3][1]) { JiTA.credits.badge.remove(); }
+            else { JiTA.credits.badge.mount(); JiTA.credits.sched.start(); }
+        }));
         $p.append($feat);
+
+        // ---- ISD Credits (only when enabled) ----
+        if (savedVariables[3][1]) {
+            JiTA.credits._injectCss();
+            var $cr = $('<div class="jita-menu-sect"></div>');
+            $('<h3>ISD Credits</h3>').appendTo($cr);
+            $('<div class="jita-menu-status">Your live monthly defect-credit total, plus the leads-only leaderboard, computed from Jira.</div>').appendTo($cr);
+            var $crAct = $('<div class="jita-menu-actions"></div>').appendTo($cr);
+            $('<button class="jita-btn">Open leaderboard</button>')
+                .on('click', function () { JiTA.menu.close(); JiTA.credits.openView(); }).appendTo($crAct);
+            $('<button class="jita-btn">Refresh now</button>').on('click', function () {
+                JiTA.menu.close();
+                var now = JiTA.credits._ymNow();
+                JiTA.credits._quiet = false;
+                JiTA.credits.refresh(now.y, now.m).then(function () { JiTA.credits.badge.refresh(); }).catch(function () { /* ignore */ });
+            }).appendTo($crAct);
+            // Auto-update interval: how often the current month is recomputed in the background (0 = manual only).
+            var $ivRow = $('<div class="jita-menu-row"></div>');
+            $('<span class="lbl">Auto-update</span>')
+                .append($('<span class="sub"></span>').text('How often to recompute this month in the background'))
+                .appendTo($ivRow);
+            var $iv = $('<select class="jita-cred-input" style="width:auto;"></select>');
+            [['Manual only', '0'], ['Every hour', '60'], ['Every 3 hours', '180'], ['Every 6 hours', '360'], ['Every 12 hours', '720'], ['Daily', '1440']]
+                .forEach(function (o) { $('<option></option>').val(o[1]).text(o[0]).appendTo($iv); });
+            $iv.val(String(JiTA.credits.sched.intervalMin()));
+            $iv.on('change', function () { gmSet('creditsIntervalMin', parseInt($iv.val(), 10) || 0); });
+            $ivRow.append($iv);
+            $cr.append($ivRow);
+            $p.append($cr);
+        }
 
         // ---- Canned responses (Zendesk Support panel) ----
         // A repository of reusable replies, shown as a dropdown in the Zendesk Support activity panel (picking
@@ -7726,12 +7761,15 @@ JiTA.credits = {
     CRAWL_DELAY_MS: 120,   // polite gap between per-issue changelog GETs (the crawl is the expensive part)
 
     running: false,
+    _quiet: false,        // background (scheduled) runs set this true so the floating pill stays hidden (the badge is the visible artifact)
+    _cssInjected: false,
 
     // ---- progress (page-independent floating pill + console; shows with or without the Similar Defects panel) --
     // A multi-minute crawl needs live feedback. _pill updates a fixed-position status pill (and the panel line
     // when it exists); _log additionally breadcrumbs to the console. Use _pill for every-item ticks (smooth,
     // no console spam) and _log for phase changes / interval milestones.
     _pill: function (msg) {
+        if (JiTA.credits._quiet) { return; }   // scheduled background runs stay silent
         try {
             var el = document.getElementById('jita-credits-progress');
             if (!el) {
@@ -8203,6 +8241,245 @@ JiTA.credits = {
         });
     },
 
+    // ---- shared: per-viewer derivation (your row / rank / lead-ness) ------------------------------------
+    // True if a member's display name carries a lead handle token (e.g. "ISD BH Solnichka" -> "solnichka").
+    _leadFromName: function (name) {
+        var toks = {};
+        (name || '').toLowerCase().replace(/-/g, ' ').split(/\s+/).forEach(function (t) { if (t) { toks[t] = true; } });
+        for (var l in JiTA.credits.LEADS) { if (JiTA.credits.LEADS.hasOwnProperty(l) && toks[l]) { return true; } }
+        return false;
+    },
+    // From a computed/cached result + the viewer's accountId: the members sorted by credits desc, plus which
+    // row is the viewer's, their rank, and whether they're a lead (gates the full leaderboard).
+    _derive: function (res, me) {
+        var real = res.table.slice(0, res.table.length - 1).slice().sort(function (a, b) { return b[8] - a[8]; });
+        var myName = null;
+        for (var name in res.nameToAcc) { if (res.nameToAcc.hasOwnProperty(name) && res.nameToAcc[name] === me) { myName = name; } }
+        var myRow = null, myRank = null;
+        for (var i = 0; i < real.length; i++) { if (real[i][0] === myName) { myRow = real[i]; myRank = i + 1; } }
+        return { real: real, myName: myName, myRow: myRow, myRank: myRank, total: real.length, isLead: JiTA.credits._leadFromName(myName) };
+    },
+
+    // ---- overlay CSS (the wide, scrollable overlay chrome; base menu CSS comes from JiTA.menu._injectCss) --
+    _injectCss: function () {
+        if (JiTA.credits._cssInjected) { return; }
+        JiTA.credits._cssInjected = true;
+        try {
+            GM_addStyle(
+                '#jita-menu.jita-credits-view { width: 760px; max-width: 94vw; display: flex; flex-direction: column; overflow: hidden; }' +
+                '#jita-menu.jita-credits-view .jita-menu-head { flex: 0 0 auto; }' +
+                '#jita-menu.jita-credits-view .jita-cred-scroll { flex: 1 1 auto; min-height: 0; max-height: 68vh; overflow-y: auto; padding: 8px 16px 12px; }' +
+                '#jita-menu.jita-credits-view .jita-cred-foot { flex: 0 0 auto; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 10px 16px; border-top: 1px solid #3a434d; background: #282d33; }' +
+                '#jita-menu.jita-credits-view .jita-cred-sub { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: #7a8694; margin: 14px 0 6px; }' +
+                '.jita-cred-input { background: #0f1316; color: #e6e6e6; border: 1px solid #3a434d; border-radius: 5px; padding: 4px 8px; font-size: 12px; }'
+            );
+        } catch (e) { /* ignore */ }
+    },
+
+    // ---- the dedicated ISD Credits overlay (your card + leads-only leaderboard, month selector) ----------
+    openView: function (ym) {
+        var C = JiTA.credits, cur = C._ymNow();
+        var sel = ym || cur.ym;
+        C._injectCss();
+        var ov = JiTA.menu._openOverlay({ title: 'ISD Credits', wide: false });
+        ov.$menu.addClass('jita-credits-view');
+        var $scroll = $('<div class="jita-cred-scroll"></div>').appendTo(ov.$menu);
+        var $foot = $('<div class="jita-cred-foot"></div>').appendTo(ov.$menu);
+
+        // footer: month selector (last 12 months) + a Refresh that recomputes the selected month
+        var MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+        var $msel = $('<select class="jita-cred-input"></select>');
+        (function () {
+            var y = cur.y, m = cur.m;
+            for (var i = 0; i < 12; i++) {
+                var v = y + '-' + (m < 10 ? '0' : '') + m;
+                $('<option></option>').val(v).text(MON[m - 1] + ' ' + y + (i === 0 ? ' (current)' : '')).appendTo($msel);
+                m--; if (m < 1) { m = 12; y--; }
+            }
+        })();
+        $msel.val(sel).on('change', function () { sel = $msel.val(); render(); });
+        $('<span style="color:#9aa6b2;font-size:12px;">Month</span>').appendTo($foot);
+        $msel.appendTo($foot);
+        var $refresh = $('<button class="jita-btn">Refresh</button>').appendTo($foot);
+        $refresh.on('click', function () {
+            var p = sel.split('-'), yy = parseInt(p[0], 10), mm = parseInt(p[1], 10);
+            $refresh.prop('disabled', true).text('Computing…');
+            C._quiet = false;   // user-triggered: show the progress pill
+            C.refresh(yy, mm).then(function (res) {
+                if (res) { C._report(res); }   // also dump to console (verification)
+                C.badge.refresh();
+                $refresh.prop('disabled', false).text('Refresh');
+                render();
+            }).catch(function (e) {
+                $refresh.prop('disabled', false).text('Refresh');
+                $scroll.prepend($('<div class="jita-menu-status" style="color:#ff8f8f;"></div>').text('Failed: ' + (e && e.message || e)));
+            });
+        });
+
+        function card(res, d) {
+            var h = res.header;
+            var $c = $('<div style="background:#22272b;border:1px solid #2c333a;border-radius:8px;padding:12px 14px;"></div>');
+            $('<div style="font-weight:700;font-size:13px;margin-bottom:8px;"></div>')
+                .text(d.myName ? ('You - ' + d.myName) : 'Your account was not matched to an ECAID member').appendTo($c);
+            if (d.myRow) {
+                var bits = [];
+                for (var i = 1; i <= 6; i++) { bits.push(h[i].replace('Defects ', '').replace('Reports ', '') + ' ' + d.myRow[i]); }
+                $('<div style="color:#c7cdd4;font-size:12px;line-height:1.8;"></div>').text(bits.join('   ')).appendTo($c);
+                var $big = $('<div style="margin-top:8px;font-size:16px;font-weight:800;color:#fff;"></div>').text(d.myRow[8] + ' credits');
+                $('<span style="color:#9aa6b2;font-weight:600;font-size:12px;margin-left:12px;"></span>').text('rank #' + d.myRank + ' of ' + d.total).appendTo($big);
+                if (d.myRow[7]) { $('<span style="color:#b794f6;font-weight:600;font-size:12px;margin-left:12px;"></span>').text('(+' + d.myRow[7] + ' extra)').appendTo($big); }
+                $big.appendTo($c);
+            }
+            return $c;
+        }
+
+        function table(res, d) {
+            var h = res.header;
+            var $wrap = $('<div style="overflow-x:auto;"></div>');
+            var $tbl = $('<table style="border-collapse:collapse;font-size:12px;width:100%;"></table>');
+            var $hr = $('<tr></tr>');
+            $('<th style="text-align:left;padding:5px 8px;border-bottom:1px solid #3a434d;color:#9aa6b2;">#</th>').appendTo($hr);
+            h.forEach(function (c, i) {
+                $('<th></th>').attr('style', 'padding:5px 8px;border-bottom:1px solid #3a434d;color:#9aa6b2;white-space:nowrap;text-align:' + (i === 0 ? 'left' : 'right') + ';').text(c).appendTo($hr);
+            });
+            $tbl.append($('<thead></thead>').append($hr));
+            var $tb = $('<tbody></tbody>');
+            d.real.forEach(function (row, idx) {
+                var mine = row[0] === d.myName;
+                var $r = $('<tr></tr>').attr('style', mine ? 'background:#20303f;' : '');
+                $('<td style="padding:4px 8px;color:#7a8694;"></td>').text(idx + 1).appendTo($r);
+                var acc = res.nameToAcc[row[0]];
+                var $nt = $('<td style="padding:4px 8px;white-space:nowrap;font-weight:600;"></td>');
+                if (acc) { $('<a target="_blank" rel="noopener" style="color:#b794f6;text-decoration:none;"></a>').attr('href', JiTA.HOST + '/jira/people/' + acc).text(row[0]).appendTo($nt); }
+                else { $nt.text(row[0]); }
+                $nt.appendTo($r);
+                for (var i = 1; i < row.length; i++) {
+                    var st = 'padding:4px 8px;text-align:right;white-space:nowrap;color:#d7dce2;';
+                    if (i === 7 && row[i]) { st = 'padding:4px 8px;text-align:right;color:#b794f6;font-weight:700;'; }   // Extra
+                    if (i === 8) { st = 'padding:4px 8px;text-align:right;color:#fff;font-weight:800;'; }               // Credits
+                    $('<td></td>').attr('style', st).text(row[i]).appendTo($r);
+                }
+                $tb.append($r);
+            });
+            $tbl.append($tb);
+            return $wrap.append($tbl);
+        }
+
+        function render() {
+            $scroll.empty();
+            $msel.val(sel);
+            $scroll.append($('<div class="jita-menu-status">Loading…</div>'));
+            C.getCached(sel).then(function (res) {
+                $scroll.empty();
+                if (!res) {
+                    $scroll.append($('<div class="jita-menu-status"></div>').text('Not computed yet for ' + sel + '. Click Refresh to compute it (can take a minute).'));
+                    return;
+                }
+                JiTA.link.currentUser().then(function (me) {
+                    var d = C._derive(res, me);
+                    $scroll.append(card(res, d));
+                    if (d.isLead) {
+                        $scroll.append($('<div class="jita-cred-sub">Leaderboard</div>'));
+                        $scroll.append(table(res, d));
+                    } else {
+                        $scroll.append($('<div class="jita-menu-status" style="margin-top:12px;"></div>')
+                            .text('The full leaderboard is visible to leads only.' + (d.myRank ? (' You are ranked #' + d.myRank + ' of ' + d.total + '.') : '')));
+                    }
+                    $scroll.append($('<div class="jita-menu-status" style="margin-top:12px;color:#7a8694;"></div>')
+                        .text('Computed ' + String(res.computedAt || '').replace('T', ' ').slice(0, 16) + ' - ' + d.total + ' members.'));
+                });
+            });
+        }
+        render();
+    },
+
+    // ---- always-on corner badge (your current-month total + rank; reads cache; click opens the view) -----
+    badge: {
+        mount: function () {
+            if (!savedVariables[3][1] || JITA_IS_FORGE_FRAME) { return; }
+            var el = document.getElementById('jita-credits-badge');
+            if (!el) {
+                el = document.createElement('div');
+                el.id = 'jita-credits-badge';
+                el.style.cssText = 'position:fixed;z-index:9000;left:16px;bottom:16px;cursor:pointer;' +
+                    'background:#1a1c1f;color:#e8e8ea;border:1px solid #34373d;border-radius:16px;padding:6px 12px;' +
+                    'font:12px/1 "Segoe UI",Roboto,Arial,sans-serif;box-shadow:0 3px 12px rgba(0,0,0,.4);user-select:none;';
+                el.title = 'ISD credits this month - click for the leaderboard';
+                el.addEventListener('click', function () { JiTA.credits.openView(); });
+                (document.body || document.documentElement).appendChild(el);
+                el.textContent = '📊 credits…';
+            }
+            JiTA.credits.badge.refresh();
+        },
+        refresh: function () {
+            var el = document.getElementById('jita-credits-badge');
+            if (!el) { return; }
+            var ym = JiTA.credits._ymNow().ym;
+            JiTA.credits.getCached(ym).then(function (res) {
+                if (!res) { el.textContent = '📊 credits: —'; return; }
+                JiTA.link.currentUser().then(function (me) {
+                    var d = JiTA.credits._derive(res, me);
+                    el.textContent = d.myRow ? ('📊 ' + d.myRow[8] + ' cr · #' + d.myRank + '/' + d.total) : '📊 credits: n/a';
+                });
+            }).catch(function () { /* ignore */ });
+        },
+        remove: function () {
+            var el = document.getElementById('jita-credits-badge');
+            if (el && el.parentNode) { el.parentNode.removeChild(el); }
+        }
+    },
+
+    // ---- background scheduler (throttled current-month recompute; interval is user-configurable) ----------
+    sched: {
+        POLL_MS: 5 * 60 * 1000,          // how often we CHECK whether the interval has elapsed
+        STARTUP_DELAY_MS: 25 * 1000,     // let the page settle before the first (possibly heavy) run
+        LEASE_TTL_MS: 20 * 60 * 1000,    // a full compute can take minutes; treat an older lease as abandoned
+        LAST_KEY: 'creditsLastTs',
+        LEASE_KEY: 'creditsLease',
+        _timer: null,
+
+        // Auto-update interval in MINUTES, read live from GM storage (0 = manual only). Set from the settings menu.
+        intervalMin: function () { var v = parseInt(gmGet('creditsIntervalMin', 180), 10); return isNaN(v) ? 180 : v; },
+
+        _recently: function () {
+            var iv = JiTA.credits.sched.intervalMin();
+            if (iv <= 0) { return true; }   // manual-only -> never auto-compute
+            var last = gmGet(JiTA.credits.sched.LAST_KEY, 0) || 0;
+            return !!last && (Date.now() - last) < iv * 60 * 1000;
+        },
+        _lease: function () {
+            var l = gmGet(JiTA.credits.sched.LEASE_KEY, null), now = Date.now();
+            if (!l || !l.ts || (now - l.ts) > JiTA.credits.sched.LEASE_TTL_MS || l.tabId === JiTA.sched.tabId) {
+                gmSet(JiTA.credits.sched.LEASE_KEY, { tabId: JiTA.sched.tabId, ts: now });
+                return true;
+            }
+            return false;
+        },
+        tick: function () {
+            if (!savedVariables[3][1]) { return; }                 // feature off
+            try { JiTA.credits.badge.refresh(); } catch (e) { /* ignore */ }   // cheap: reflect the latest cache
+            if (JiTA.credits.running) { return; }
+            if (JiTA.credits.sched._recently()) { return; }        // interval not elapsed (or manual-only)
+            if (!JiTA.credits.sched._lease()) { return; }          // another tab is computing
+            var now = JiTA.credits._ymNow();
+            JiTA.credits._quiet = true;                            // background run: no floating pill
+            try { var b = document.getElementById('jita-credits-badge'); if (b) { b.textContent = '📊 updating…'; } } catch (e) { /* ignore */ }
+            JiTA.credits.refresh(now.y, now.m).then(function () {
+                gmSet(JiTA.credits.sched.LAST_KEY, Date.now());
+                try { JiTA.credits.badge.refresh(); } catch (e) { /* ignore */ }
+            }).catch(function () { /* swallow; retry next window */ });
+        },
+        start: function () {
+            if (JiTA.credits.sched._timer) { return; }
+            setTimeout(function () {
+                try { JiTA.credits.sched.tick(); } catch (e) { /* swallow */ }
+                JiTA.credits.sched._timer = setInterval(function () {
+                    try { JiTA.credits.sched.tick(); } catch (e) { /* swallow */ }
+                }, JiTA.credits.sched.POLL_MS);
+            }, JiTA.credits.sched.STARTUP_DELAY_MS);
+        }
+    },
+
     // ---- Phase 1a: manual trigger + console dump (verify against monthly_report.py) ---------------------
     // Pretty-print the table to the console and return the current user's row + rank.
     _report: function (res) {
@@ -8227,23 +8504,6 @@ JiTA.credits = {
             var myRow = null, myRank = null;
             for (var i = 0; i < real.length; i++) { if (real[i][0] === myName) { myRow = real[i]; myRank = i + 1; } }
             return { myName: myName, myRow: myRow, myRank: myRank, total: real.length };
-        });
-    },
-
-    runManual: function () {
-        var now = JiTA.credits._ymNow();
-        JiTA.ui.toast('Computing ISD credits for ' + now.ym + '… (see console; this can take a while)');
-        JiTA.credits.refresh(now.y, now.m).then(function (res) {
-            if (!res) { return; }
-            return JiTA.credits._report(res).then(function (mine) {
-                if (mine.myRow) {
-                    JiTA.ui.toast('Your credits ' + now.ym + ': ' + mine.myRow[8] + ' (rank ' + mine.myRank + '/' + mine.total + '). Full table in console.');
-                } else {
-                    JiTA.ui.toast('Credits ' + now.ym + ' computed (' + mine.total + ' members). Full table in console. (Your account was not matched to a member.)');
-                }
-            });
-        }).catch(function (e) {
-            alert('Credit computation failed: ' + (e && e.message || e) + '\nReport issues to Schogol :).');
         });
     }
 };
@@ -8282,6 +8542,11 @@ JiTA.credits = {
     }
     // start the periodic background catch-up sync
     JiTA.sched.start();
+    // ISD credit tracker: show the corner badge (from cache) and start the throttled background recompute.
+    if (savedVariables[3][1]) {
+        try { JiTA.credits.badge.mount(); } catch (e) { /* swallow */ }
+        try { JiTA.credits.sched.start(); } catch (e) { /* swallow */ }
+    }
 })();
 
 
