@@ -7939,10 +7939,12 @@ JiTA.credits = {
         return { start: y + '-' + p2(m) + '-01', end: ny + '-' + p2(nm) + '-01' };
     },
 
-    _creditFormula: function (r, extra) {
+    // NOTE: diverges from monthly_report.py - the Extra Credits (lead/mentor bonus) is intentionally NOT
+    // added to the score here. It's still computed + stored (index 7) but no longer affects Credits or rank.
+    _creditFormula: function (r) {
         var filtered = r.attached + r.trashed;
         var c = 0.3 * Math.min(100, filtered) + 0.1 * Math.max(0, filtered - 100);
-        c += 0.1 * r.reassigned + r.created + r.resolved + (extra || 0);
+        c += 0.1 * r.reassigned + r.created + r.resolved;
         return Math.round(c * 10) / 10;
     },
 
@@ -8186,7 +8188,7 @@ JiTA.credits = {
                         names.forEach(function (n) {
                             var r = rows[n], extra = extras[n] || 0;
                             var actioned = r.attached + r.trashed + r.reassigned + r.created;
-                            var earned = C._creditFormula(r, extra);
+                            var earned = C._creditFormula(r);
                             table.push([n, r.created, r.resolved, r.attached, r.trashed, r.reassigned, actioned, extra, earned]);
                             tot.created += r.created; tot.resolved += r.resolved; tot.attached += r.attached;
                             tot.trashed += r.trashed; tot.reassigned += r.reassigned; tot.actioned += actioned;
@@ -8316,7 +8318,7 @@ JiTA.credits = {
                         .then(function (rep) {
                             var r = rows[id.myName];
                             r.attached = rep.attached; r.trashed = rep.trashed; r.reassigned = id.reassigned;
-                            var credits = C._creditFormula(r, id.extra);
+                            var credits = C._creditFormula(r);
                             var actioned = r.attached + r.trashed + r.reassigned + r.created;
                             var rank = null, total = null;
                             if (id.fullTable) {
@@ -8456,7 +8458,6 @@ JiTA.credits = {
                 $c.append(group('Bug reports', [info.attached + ' attached', info.trashed + ' trashed', info.reassigned + ' reassigned']));
                 var $big = $('<div style="margin-top:10px;font-size:16px;font-weight:800;color:#fff;"></div>').text(info.credits + ' credits');
                 if (info.rank != null) { $('<span style="color:#9aa6b2;font-weight:600;font-size:12px;margin-left:12px;"></span>').text('rank #' + info.rank + ' of ' + info.total).appendTo($big); }
-                if (info.extra) { $('<span style="color:#b794f6;font-weight:600;font-size:12px;margin-left:12px;"></span>').text('(+' + info.extra + ' extra)').appendTo($big); }
                 $('<span style="color:#7a8694;font-weight:500;font-size:11px;margin-left:12px;"></span>').text(info.actioned + ' total actioned').appendTo($big);
                 $c.append($big);
             }
