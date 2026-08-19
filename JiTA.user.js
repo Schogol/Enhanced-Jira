@@ -7474,7 +7474,7 @@ JiTA.menu = {
                 .append($('<span class="sub"></span>').text('How often to recompute this month in the background'))
                 .appendTo($ivRow);
             var $iv = $('<select class="jita-cred-input" style="width:auto;"></select>');
-            [['Manual only', '0'], ['Every hour', '60'], ['Every 3 hours', '180'], ['Every 6 hours', '360'], ['Every 12 hours', '720'], ['Daily', '1440']]
+            [['Manual only', '0'], ['Every 5 minutes', '5'], ['Every 15 minutes', '15'], ['Every 30 minutes', '30'], ['Every hour', '60'], ['Every 3 hours', '180'], ['Every 6 hours', '360'], ['Every 12 hours', '720'], ['Every 24 hours', '1440']]
                 .forEach(function (o) { $('<option></option>').val(o[1]).text(o[0]).appendTo($iv); });
             $iv.val(String(JiTA.credits.sched.intervalMin()));
             $iv.on('change', function () { gmSet('creditsIntervalMin', parseInt($iv.val(), 10) || 0); });
@@ -8266,7 +8266,7 @@ JiTA.credits = {
         JiTA.credits._cssInjected = true;
         try {
             GM_addStyle(
-                '#jita-menu.jita-credits-view { width: 760px; max-width: 94vw; display: flex; flex-direction: column; overflow: hidden; }' +
+                '#jita-menu.jita-credits-view { width: 1180px; max-width: 96vw; display: flex; flex-direction: column; overflow: hidden; }' +
                 '#jita-menu.jita-credits-view .jita-menu-head { flex: 0 0 auto; }' +
                 '#jita-menu.jita-credits-view .jita-cred-scroll { flex: 1 1 auto; min-height: 0; max-height: 68vh; overflow-y: auto; padding: 8px 16px 12px; }' +
                 '#jita-menu.jita-credits-view .jita-cred-foot { flex: 0 0 auto; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 10px 16px; border-top: 1px solid #3a434d; background: #282d33; }' +
@@ -8340,7 +8340,9 @@ JiTA.credits = {
             var $hr = $('<tr></tr>');
             $('<th style="text-align:left;padding:5px 8px;border-bottom:1px solid #3a434d;color:#9aa6b2;">#</th>').appendTo($hr);
             h.forEach(function (c, i) {
-                $('<th></th>').attr('style', 'padding:5px 8px;border-bottom:1px solid #3a434d;color:#9aa6b2;white-space:nowrap;text-align:' + (i === 0 ? 'left' : 'right') + ';').text(c).appendTo($hr);
+                // Short column labels so all 9 columns fit without horizontal scroll (the card shows the full names).
+                var lbl = c.replace(/^Defects |^Reports |^Total /, '').replace(/ Credits$| Earned$/, '');
+                $('<th></th>').attr('style', 'padding:5px 8px;border-bottom:1px solid #3a434d;color:#9aa6b2;white-space:nowrap;text-align:' + (i === 0 ? 'left' : 'right') + ';').text(lbl).appendTo($hr);
             });
             $tbl.append($('<thead></thead>').append($hr));
             var $tb = $('<tbody></tbody>');
@@ -8431,15 +8433,16 @@ JiTA.credits = {
 
     // ---- background scheduler (throttled current-month recompute; interval is user-configurable) ----------
     sched: {
-        POLL_MS: 5 * 60 * 1000,          // how often we CHECK whether the interval has elapsed
+        POLL_MS: 60 * 1000,              // check every minute (so even a 5-minute interval is honored closely)
         STARTUP_DELAY_MS: 25 * 1000,     // let the page settle before the first (possibly heavy) run
-        LEASE_TTL_MS: 20 * 60 * 1000,    // a full compute can take minutes; treat an older lease as abandoned
+        LEASE_TTL_MS: 90 * 1000,         // lease is heartbeated every 30s while computing; a dead tab's lease expires ~90s after it stops
+        HEARTBEAT_MS: 30 * 1000,
         LAST_KEY: 'creditsLastTs',
         LEASE_KEY: 'creditsLease',
         _timer: null,
 
         // Auto-update interval in MINUTES, read live from GM storage (0 = manual only). Set from the settings menu.
-        intervalMin: function () { var v = parseInt(gmGet('creditsIntervalMin', 180), 10); return isNaN(v) ? 180 : v; },
+        intervalMin: function () { var v = parseInt(gmGet('creditsIntervalMin', 15), 10); return isNaN(v) ? 15 : v; },
 
         _recently: function () {
             var iv = JiTA.credits.sched.intervalMin();
@@ -8456,27 +8459,45 @@ JiTA.credits = {
             return false;
         },
         tick: function () {
+            var S = JiTA.credits.sched;
             if (!savedVariables[3][1]) { return; }                 // feature off
             try { JiTA.credits.badge.refresh(); } catch (e) { /* ignore */ }   // cheap: reflect the latest cache
             if (JiTA.credits.running) { return; }
-            if (JiTA.credits.sched._recently()) { return; }        // interval not elapsed (or manual-only)
-            if (!JiTA.credits.sched._lease()) { return; }          // another tab is computing
+            if (S._recently()) { return; }                         // interval not elapsed (or manual-only)
+            if (!S._lease()) { return; }                           // another tab is computing
             var now = JiTA.credits._ymNow();
             JiTA.credits._quiet = true;                            // background run: no floating pill
             try { var b = document.getElementById('jita-credits-badge'); if (b) { b.textContent = '📊 updating…'; } } catch (e) { /* ignore */ }
+            // Heartbeat the lease while computing. The compute is in-memory and only writes its result on
+            // completion, so an interrupted run (tab refresh/close) leaves NO partial data and simply restarts
+            // next cycle. The heartbeat means a dead tab's lease goes stale in ~90s (vs. the full TTL), so the
+            // reloaded/other tab picks the work back up promptly instead of skipping cycles.
+            var hb = setInterval(function () { gmSet(S.LEASE_KEY, { tabId: JiTA.sched.tabId, ts: Date.now() }); }, S.HEARTBEAT_MS);
+            var stop = function () { clearInterval(hb); };
             JiTA.credits.refresh(now.y, now.m).then(function () {
-                gmSet(JiTA.credits.sched.LAST_KEY, Date.now());
+                gmSet(S.LAST_KEY, Date.now());
+                gmSet(S.LEASE_KEY, null);   // release on success
                 try { JiTA.credits.badge.refresh(); } catch (e) { /* ignore */ }
-            }).catch(function () { /* swallow; retry next window */ });
+                stop();
+            }).catch(function () { stop(); });   // heartbeat stops -> lease expires -> retry next window
         },
         start: function () {
-            if (JiTA.credits.sched._timer) { return; }
+            var S = JiTA.credits.sched;
+            if (S._timer) { return; }
+            // Release our lease when the tab goes away (refresh / close / navigate) so a reload can recompute at
+            // once instead of waiting out the TTL. Best-effort; the heartbeat + TTL are the backstop if it doesn't fire.
+            try {
+                window.addEventListener('pagehide', function () {
+                    var l = gmGet(S.LEASE_KEY, null);
+                    if (l && l.tabId === JiTA.sched.tabId) { gmSet(S.LEASE_KEY, null); }
+                });
+            } catch (e) { /* ignore */ }
             setTimeout(function () {
-                try { JiTA.credits.sched.tick(); } catch (e) { /* swallow */ }
-                JiTA.credits.sched._timer = setInterval(function () {
-                    try { JiTA.credits.sched.tick(); } catch (e) { /* swallow */ }
-                }, JiTA.credits.sched.POLL_MS);
-            }, JiTA.credits.sched.STARTUP_DELAY_MS);
+                try { S.tick(); } catch (e) { /* swallow */ }
+                S._timer = setInterval(function () {
+                    try { S.tick(); } catch (e) { /* swallow */ }
+                }, S.POLL_MS);
+            }, S.STARTUP_DELAY_MS);
         }
     },
 
