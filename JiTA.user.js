@@ -8470,13 +8470,23 @@ JiTA.credits = {
             var $wrap = $('<div style="overflow-x:auto;"></div>');
             var $tbl = $('<table style="border-collapse:collapse;font-size:12px;width:100%;"></table>');
             var $thead = $('<thead></thead>');
-            // grouping row: which columns are DEFECTS (Created/Resolved) vs BUG REPORTS (Attached/Trashed/Reassigned)
-            var thg = 'padding:4px 8px;border-bottom:1px solid #2c333a;color:#7a8694;font-size:11px;text-transform:uppercase;letter-spacing:.04em;text-align:center;';
+            // grouping row: DEFECTS (Created/Resolved) vs BUG REPORTS (Attached/Trashed/Reassigned). The caption +
+            // its underline live in an INSET div, so each group's underline is separated by a gap (adjacent <th>
+            // bottom-borders would otherwise merge into one long line) and the label is centred over its columns.
             var $g = $('<tr></tr>');
-            $('<th colspan="2"></th>').appendTo($g);                                        // # + Name
-            $('<th colspan="2"></th>').attr('style', thg).text('Defects').appendTo($g);      // Created + Resolved
-            $('<th colspan="3"></th>').attr('style', thg).text('Bug reports').appendTo($g);  // Attached + Trashed + Reassigned
-            $('<th colspan="2"></th>').appendTo($g);                                        // Actioned + Credits
+            function grpCell(colspan, label) {
+                var $th = $('<th colspan="' + colspan + '"></th>');
+                if (label) {
+                    $('<div></div>').attr('style', 'margin:0 16px;padding-bottom:4px;border-bottom:1px solid #4a5560;' +
+                        'text-align:center;color:#8a94a0;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;')
+                        .text(label).appendTo($th);
+                }
+                return $th;
+            }
+            $g.append(grpCell(2, ''));             // # + Name
+            $g.append(grpCell(2, 'Defects'));      // Created + Resolved
+            $g.append(grpCell(3, 'Bug reports'));  // Attached + Trashed + Reassigned
+            $g.append(grpCell(2, ''));             // Actioned + Credits
             $thead.append($g);
             // label row
             var $hr = $('<tr></tr>');
