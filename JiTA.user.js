@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Jira Triage Assistant
-// @version     2.36.0
+// @version     2.37.0
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Jira-Triage-Assistant/raw/main/JiTA.user.js
@@ -2746,7 +2746,7 @@ JiTA.logsig = {
             JiTA.logsig._building = null;
             var nClusters = 0;
             Object.keys(sigMap).forEach(function (s) { if (sigMap[s].members.length >= 2) { nClusters++; } });
-            console.log('[JiTA-SD] log signatures: ' + nSig + ' stack signatures (' + nClusters + ' shared across ≥2 defects) mined from ' + recs.length + ' defects');
+            console.log('[JiTA] log signatures: ' + nSig + ' stack signatures (' + nClusters + ' shared across ≥2 defects) mined from ' + recs.length + ' defects');
             return JiTA.logsig._index;
         }).catch(function (e) { JiTA.logsig._building = null; throw e; });
         return JiTA.logsig._building;
@@ -2996,7 +2996,7 @@ JiTA.logsig = {
                 i = j;
             }
             JiTA.logsig.renderPanel(found);
-        }).catch(function (e) { console.log('[JiTA-SD] log signature apply skipped:', e && e.message || e); });
+        }).catch(function (e) { console.log('[JiTA] log signature apply skipped:', e && e.message || e); });
     },
 
     // Re-run the log->defect match against the CURRENT (possibly just-synced) signature index. Clears the
@@ -4620,7 +4620,7 @@ JiTA.sync = {
             })
             .catch(function (e) {
                 JiTA.sync.running = false;
-                console.log('[JiTA-SD] defect refetch (migration) failed:', e && e.message || e);
+                console.log('[JiTA] defect refetch (migration) failed:', e && e.message || e);
             });
     },
 
@@ -4642,7 +4642,7 @@ JiTA.sync = {
             })
             .catch(function (e) {
                 JiTA.sync.running = false;
-                console.log('[JiTA-SD] bug report refetch (migration) failed:', e && e.message || e);
+                console.log('[JiTA] bug report refetch (migration) failed:', e && e.message || e);
             });
     },
 
@@ -4729,7 +4729,7 @@ JiTA.sync = {
             });
         }).then(function () {
             JiTA.sync.running = false;
-            console.log('[JiTA-SD] auto-sync done (defects ' + defectStored + ' fetched; EBRs ' + (ebrChanged ? 'updated' : 'unchanged') + ')');
+            console.log('[JiTA] auto-sync done (defects ' + defectStored + ' fetched; EBRs ' + (ebrChanged ? 'updated' : 'unchanged') + ')');
             return JiTA.db.setMeta('lastAutoSyncAt', new Date().toISOString()).then(function () {
                 JiTA.sched.markSynced();   // start the 30-min clock so reloads don't re-fetch
                 if (defectStored > 0 || ebrChanged) { JiTA.embed.prepare(true); }   // embed any new/changed defects AND bug reports
@@ -4739,7 +4739,7 @@ JiTA.sync = {
         }).catch(function (e) {
             JiTA.sync.running = false;
             JiTA.db.setMeta('lastError', String(e && e.message || e));
-            console.log('[JiTA-SD] auto-sync error:', e && e.message || e);
+            console.log('[JiTA] auto-sync error:', e && e.message || e);
         });
     }
 };
@@ -4993,13 +4993,13 @@ JiTA.embed = {
             }).then(function (pipe) {
                 JiTA.embed._pipe = pipe;
                 JiTA.embed.ready = true;
-                console.log('[JiTA-SD] embedding model ready (backend: ' + JiTA.embed.backend + ')');
+                console.log('[JiTA] embedding model ready (backend: ' + JiTA.embed.backend + ')');
                 return pipe;
             });
         })().catch(function (e) {
             JiTA.embed.unavailable = true;
             JiTA.embed._loading = null;
-            console.log('[JiTA-SD] embedding model unavailable, using keyword ranking. Reason:', e && e.message || e);
+            console.log('[JiTA] embedding model unavailable, using keyword ranking. Reason:', e && e.message || e);
             throw e;
         });
         return JiTA.embed._loading;
@@ -5048,13 +5048,13 @@ JiTA.embed = {
                 if (recs[i].embedding && recs[i].embeddingModelVersion === JiTA.MODEL_VERSION) { curVer++; }
                 else { todo.push(recs[i]); }
             }
-            console.log('[JiTA-SD] embed pass: ' + todo.length + ' to embed, ' + curVer + ' already at ' +
+            console.log('[JiTA] embed pass: ' + todo.length + ' to embed, ' + curVer + ' already at ' +
                 JiTA.MODEL_VERSION + ' (of ' + recs.length + ' total, backend ' + JiTA.embed.backend + ')');
             if (!todo.length) { JiTA.ui.setStatus('Embeddings up to date (' + curVer + ')'); return; }
             JiTA.ui.toast('Embedding ' + todo.length + ' issues locally…');
             var idx = 0, gpuRetries = 0;
             function nextBatch() {
-                if (idx >= todo.length) { console.log('[JiTA-SD] embed pass complete (' + todo.length + ' embedded)'); JiTA.rank._dirtyVec = true; JiTA.rank._dirtyEbrVec = true; return Promise.resolve(); }
+                if (idx >= todo.length) { console.log('[JiTA] embed pass complete (' + todo.length + ' embedded)'); JiTA.rank._dirtyVec = true; JiTA.rank._dirtyEbrVec = true; return Promise.resolve(); }
                 var size = JiTA.embed.BATCH;
                 var slice = todo.slice(idx, idx + size);
                 var texts = slice.map(function (r) { return JiTA.util.cleanForCompare(r.summary, r.description); });
@@ -5087,7 +5087,7 @@ JiTA.embed = {
                         JiTA.rank._dirtyEbrVec = true;
                         // Log throughput periodically so we can see the real CPU speed (first item always logs).
                         if (idx <= slice.length || idx % 50 === 0) {
-                            console.log('[JiTA-SD] embedded ' + idx + '/' + todo.length + ' (' + size + ' in ' + dt + 'ms, ' + JiTA.embed.backend + ')');
+                            console.log('[JiTA] embedded ' + idx + '/' + todo.length + ' (' + size + ' in ' + dt + 'ms, ' + JiTA.embed.backend + ')');
                         }
                         JiTA.ui.setStatus('Embedding… ' + Math.min(idx, todo.length) + '/' + todo.length + ' (' + JiTA.embed.backend + ')');
                         return JiTA.util.delay(0).then(nextBatch);   // yield to keep the UI responsive
@@ -5098,7 +5098,7 @@ JiTA.embed = {
                     // no progress is lost: retry a few times on the SAME backend to ride out a transient blip,
                     // and if it keeps failing, pause the pass (it resumes on the next reload / scheduled sync)
                     // and tell the user they can switch backend from the menu.
-                    console.log('[JiTA-SD] embed batch failed (' + JiTA.embed.backend + ', size ' + size + '):', e && e.message || e);
+                    console.log('[JiTA] embed batch failed (' + JiTA.embed.backend + ', size ' + size + '):', e && e.message || e);
                     JiTA.embed._resetPipe();
                     gpuRetries++;
                     if (gpuRetries <= 3) {
@@ -5132,7 +5132,7 @@ JiTA.embed = {
             JiTA.embed._preparing = null;
         }).catch(function (e) {
             JiTA.embed._preparing = null;
-            console.log('[JiTA-SD] embed prepare skipped:', e && e.message || e);
+            console.log('[JiTA] embed prepare skipped:', e && e.message || e);
         });
         return JiTA.embed._preparing;
     }
@@ -6646,7 +6646,7 @@ JiTA.ui = {
                 }
                 JiTA.ui.toast(msg);
             }, function (e) {
-                console.log('[JiTA-SD] mark-dup failed (attachDuplicate rejected):', e && e.message || e);
+                console.log('[JiTA] mark-dup failed (attachDuplicate rejected):', e && e.message || e);
                 $btn.removeClass('jita-sd-linking').text('Attach');
                 JiTA.ui.toast('Could not link: ' + (e && e.message || e));
             });
@@ -6722,7 +6722,7 @@ JiTA.ui = {
                         }
                     });
                 }).catch(function (e) {
-                    console.log('[JiTA-SD] attach-report failed:', e && e.message || e);
+                    console.log('[JiTA] attach-report failed:', e && e.message || e);
                     $b.removeClass('jita-sd-linking').text('Attach');
                     JiTA.ui.toast('Could not attach: ' + (e && e.message || e));
                 });
@@ -6818,7 +6818,7 @@ JiTA.ui = {
                     refreshCount();
                 });
             });
-        }).catch(function (e) { console.log('[JiTA-SD] append-next-report skipped:', e && e.message || e); });
+        }).catch(function (e) { console.log('[JiTA] append-next-report skipped:', e && e.message || e); });
     },
 
     // Append a freshly-built row to the list and animate it sliding/expanding in from a collapsed state. We
@@ -6972,7 +6972,7 @@ JiTA.ui = {
                         if (/\.txt$/i.test(fn) && /log/i.test(fn) && atts[i].content) { logs.push(atts[i]); }
                     }
                     if (!logs.length) { JiTA.ui._logScanCache[key] = {}; resolve({}); return; }
-                    console.log('[JiTA-SD] log scan ' + key + ': ' + logs.length + ' log attachment(s)');
+                    console.log('[JiTA] log scan ' + key + ': ' + logs.length + ' log attachment(s)');
                     var merged = {}, pending = logs.length;
                     function mergeFound(found) {
                         Object.keys(found || {}).forEach(function (k) {
@@ -6982,7 +6982,7 @@ JiTA.ui = {
                             if (!merged[k].msg && found[k].msg) { merged[k].msg = found[k].msg; }
                         });
                         if (--pending === 0) {
-                            console.log('[JiTA-SD] log scan ' + key + ': ' + Object.keys(merged).length + ' known defect(s) matched');
+                            console.log('[JiTA] log scan ' + key + ': ' + Object.keys(merged).length + ' known defect(s) matched');
                             JiTA.ui._logScanCache[key] = merged;
                             resolve(merged);
                         }
@@ -7262,7 +7262,7 @@ JiTA.ui = {
             return JiTA.db.getDefect(key).then(function (rec) {
                 if (rec) { return; }   // already indexed - nothing to do
                 JiTA.ui._autoSyncedKeys[key] = true;   // don't retrigger for this key this session
-                console.log('[JiTA-SD] ' + key + ' not in local DB - triggering catch-up sync');
+                console.log('[JiTA] ' + key + ' not in local DB - triggering catch-up sync');
                 JiTA.sync.autoSync();   // quiet incremental catch-up (fetches the new defect/EO issue; embeds + refreshes)
             });
         });
@@ -7598,7 +7598,7 @@ JiTA.migrate = {
                     return JiTA.db.getMeta('dataVersionEbr').then(function (ev) {
                         var ebrStale = nEbr > 0 && (Number(ev) || 0) < JiTA.DATA_VERSION;
                         if (!defStale && !ebrStale) { return; }
-                        console.log('[JiTA-SD] local DB schema out of date (defects v' + (Number(dv) || 0) +
+                        console.log('[JiTA] local DB schema out of date (defects v' + (Number(dv) || 0) +
                             ', reports v' + (Number(ev) || 0) + ' < v' + JiTA.DATA_VERSION +
                             ') - auto re-fetching to backfill new fields');
                         // Sequential: each refetch is single-flight (the `running` guard), so chain them.
@@ -7609,7 +7609,7 @@ JiTA.migrate = {
                     });
                 });
             });
-        }).catch(function (e) { console.log('[JiTA-SD] migration check skipped:', e && e.message || e); });
+        }).catch(function (e) { console.log('[JiTA] migration check skipped:', e && e.message || e); });
     }
 };
 
