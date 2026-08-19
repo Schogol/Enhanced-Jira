@@ -8493,7 +8493,8 @@ JiTA.credits = {
             $('<th style="text-align:left;padding:5px 8px;border-bottom:1px solid #3a434d;color:#9aa6b2;">#</th>').appendTo($hr);
             short.forEach(function (c, i) {
                 if (i === 7) { return; }   // Extra Credits column removed (the bonus is still baked into Credits)
-                $('<th></th>').attr('style', 'padding:5px 8px;border-bottom:1px solid #3a434d;color:#9aa6b2;white-space:nowrap;text-align:' + (i === 0 ? 'left' : 'right') + ';').text(c).appendTo($hr);
+                // numeric columns centred (so they line up under the centred group captions); Name stays left
+                $('<th></th>').attr('style', 'padding:5px 8px;border-bottom:1px solid #3a434d;color:#9aa6b2;white-space:nowrap;text-align:' + (i === 0 ? 'left' : 'center') + ';').text(c).appendTo($hr);
             });
             $tbl.append($thead.append($hr));
             var $tb = $('<tbody></tbody>');
@@ -8508,8 +8509,8 @@ JiTA.credits = {
                 $nt.appendTo($r);
                 for (var i = 1; i < row.length; i++) {
                     if (i === 7) { continue; }   // Extra Credits column removed (still counted in Credits)
-                    var st = 'padding:4px 8px;text-align:right;white-space:nowrap;color:#d7dce2;';
-                    if (i === 8) { st = 'padding:4px 8px;text-align:right;color:#fff;font-weight:800;'; }               // Credits
+                    var st = 'padding:4px 8px;text-align:center;white-space:nowrap;color:#d7dce2;';
+                    if (i === 8) { st = 'padding:4px 8px;text-align:center;color:#fff;font-weight:800;'; }               // Credits
                     $('<td></td>').attr('style', st).text(row[i]).appendTo($r);
                 }
                 $tb.append($r);
