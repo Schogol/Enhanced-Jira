@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Jira Triage Assistant
-// @version     2.35.0
+// @version     2.36.0
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Jira-Triage-Assistant/raw/main/JiTA.user.js
@@ -103,7 +103,7 @@ var LOG_HDR = "Time\tFacility\tType\tMessage";
 // none of their DOM or same-origin Jira REST calls apply there. The canned-response repository lives in GM
 // storage, which Tampermonkey shares across frames, so the settings menu (main frame) edits it and the
 // dropdown (this frame) reads it.
-var EJF_IS_FORGE_FRAME = (function () {
+var JITA_IS_FORGE_FRAME = (function () {
     try { return /(^|\.)atlassian-dev\.net$/i.test(location.hostname); } catch (e) { return false; }
 })();
 
@@ -191,17 +191,17 @@ if (savedVariables[2][1]) {
 
 
 // Single Tampermonkey menu entry. All feature toggles and Triage Assistant actions (sync / rebuild /
-// embedding backend) live in an in-page settings overlay (EJF_SD.menu) instead of a long flat list of GM
-// menu commands. The callback references EJF_SD lazily, so it's fine that the namespace is defined later.
-if (!EJF_IS_FORGE_FRAME) {
+// embedding backend) live in an in-page settings overlay (JiTA.menu) instead of a long flat list of GM
+// menu commands. The callback references JiTA lazily, so it's fine that the namespace is defined later.
+if (!JITA_IS_FORGE_FRAME) {
     GM_registerMenuCommand("⚙ Jira Triage Assistant - Settings…", function () {
-        if (typeof EJF_SD !== 'undefined' && EJF_SD.menu) { EJF_SD.menu.open(); }
+        if (typeof JiTA !== 'undefined' && JiTA.menu) { JiTA.menu.open(); }
     });
 }
 
 
 // Switch the embedding backend between GPU (WebGPU - fast but has been unstable on some GPUs/drivers) and
-// CPU (WASM - slow but rock-solid). The choice is persisted in GM flags that EJF_SD.embed.load() reads:
+// CPU (WASM - slow but rock-solid). The choice is persisted in GM flags that JiTA.embed.load() reads:
 // `sdTryWebgpu` opts into WebGPU, and `sdForceCpu` is the sticky lock the embed pass sets after a GPU device
 // loss. Switching to GPU clears that lock so WebGPU is actually retried. We reload afterwards so the pipeline
 // rebuilds cleanly on the chosen backend - embedding is resumable, so a reload never loses progress, and any
@@ -223,13 +223,13 @@ function toggleEmbedBackend() {
 // there's nothing to re-register with GM_registerMenuCommand - we just re-render the overlay (if it's open)
 // so its switches / sections reflect the new state immediately.
 function refreshMenu() {
-    if (typeof EJF_SD !== 'undefined' && EJF_SD.menu && EJF_SD.menu.isOpen()) { EJF_SD.menu.render(); }
+    if (typeof JiTA !== 'undefined' && JiTA.menu && JiTA.menu.isOpen()) { JiTA.menu.render(); }
 }
 
 
 // Flip savedVariables[i] between true/false, persist it, and re-render the settings overlay (if open) so its
 // switch reflects the new state. Shared core of every feature toggle: the in-page settings menu wires each
-// switch to toggleFeature(index) via EJF_SD.menu._toggleRow, and a feature that needs extra work on change
+// switch to toggleFeature(index) via JiTA.menu._toggleRow, and a feature that needs extra work on change
 // (e.g. the Triage Assistant tearing down / re-mounting its panel) passes an onAfter callback there.
 function toggleFeature(i) {
     savedVariables[i][1] = !savedVariables[i][1];
@@ -254,7 +254,7 @@ var issueItem = 'a[data-testid="issue.views.issue-base.foundation.breadcrumbs.cu
 waitForKeyElements (issueItem, checkIssueType);
 
 // The current issue's key (e.g. "EBR-67728"), read from the breadcrumb. Returns '' when not on an issue.
-function ejfCurrentKey() { return $.trim($(issueItem).text()); }
+function jitaCurrentKey() { return $.trim($(issueItem).text()); }
 
 
 // Check if the issue is a Bug report. If it is then we add the extra buttons
@@ -286,18 +286,18 @@ function ensureButtonsPresent() {
 
 // Throttle: a single issue-view re-render fires a burst of mutations, so we coalesce them and run the
 // (cheap, early-exiting) check at most once every 200ms rather than on every individual mutation.
-var ejfButtonGuardScheduled = false;
-var ejfButtonObserver = new MutationObserver(function () {
-    if (ejfButtonGuardScheduled) { return; }
-    ejfButtonGuardScheduled = true;
+var jitaButtonGuardScheduled = false;
+var jitaButtonObserver = new MutationObserver(function () {
+    if (jitaButtonGuardScheduled) { return; }
+    jitaButtonGuardScheduled = true;
     setTimeout(function () {
-        ejfButtonGuardScheduled = false;
+        jitaButtonGuardScheduled = false;
         ensureButtonsPresent();
-        try { ejfShowIssueDates(); } catch (e) { /* ignore */ }   // mirror Created/Updated into the top header
-        try { ejfHideNativeDates(); } catch (e) { /* ignore */ }   // ...and hide Jira's native bottom timestamps
+        try { jitaShowIssueDates(); } catch (e) { /* ignore */ }   // mirror Created/Updated into the top header
+        try { jitaHideNativeDates(); } catch (e) { /* ignore */ }   // ...and hide Jira's native bottom timestamps
     }, 200);
 });
-if (!EJF_IS_FORGE_FRAME) { ejfButtonObserver.observe(document.body, { childList: true, subtree: true }); }
+if (!JITA_IS_FORGE_FRAME) { jitaButtonObserver.observe(document.body, { childList: true, subtree: true }); }
 
 
 // ---- Surface the issue's Created / Updated dates at the TOP of the header ----
@@ -305,8 +305,8 @@ if (!EJF_IS_FORGE_FRAME) { ejfButtonObserver.observe(document.body, { childList:
 // scroll to see them. Mirror them into the top header bar (the empty space between the breadcrumb and the
 // lock / watch / share / … action icons) so they're visible at a glance. Same-origin REST read, cached per
 // issue. Always on for issue pages; cheap early-exit once mounted for the current issue.
-var ejfDatesCache = {};   // issueKey -> { created, updated } ISO strings
-function ejfFmtDateShort(iso) {
+var jitaDatesCache = {};   // issueKey -> { created, updated } ISO strings
+function jitaFmtDateShort(iso) {
     var d = new Date(iso);
     if (isNaN(d.getTime())) { return ''; }
     var MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -321,7 +321,7 @@ function ejfFmtDateShort(iso) {
 // positioning context, so left:0 lands on the red-box border and top:50% keeps it level with the icons). The
 // breadcrumb is in a SEPARATE left structure, so it can't be used as a row anchor. Fallbacks probe the sticky-
 // header testid, then derive the bar from the watch button.
-function ejfDatesTarget() {
+function jitaDatesTarget() {
     var bar = document.getElementById('jira-issue-header-actions')
         || document.querySelector('[data-testid="issue-view-sticky-header-container.sticky-header"]');
     if (!bar) {
@@ -336,23 +336,23 @@ function ejfDatesTarget() {
     return { row: bar, before: null };   // before:null -> append; the element is absolutely positioned at left:0
 }
 
-function ejfShowIssueDates() {
+function jitaShowIssueDates() {
     var bc = document.querySelector(issueItem);
     if (!bc) {   // not on an issue page -> drop any stale element
-        var gone = document.getElementById('ejf-issue-dates');
+        var gone = document.getElementById('jita-issue-dates');
         if (gone && gone.parentNode) { gone.parentNode.removeChild(gone); }
         return;
     }
     var key = (bc.textContent || '').trim();
     if (!key) { return; }
-    var existing = document.getElementById('ejf-issue-dates');
+    var existing = document.getElementById('jita-issue-dates');
     if (existing && existing.getAttribute('data-key') === key && existing.isConnected) { return; }   // already shown for this issue
-    var tgt = ejfDatesTarget();
+    var tgt = jitaDatesTarget();
     if (!tgt) { return; }   // header not ready yet; the observer will retry
     if (existing && existing.parentNode) { existing.parentNode.removeChild(existing); }
 
     var el = document.createElement('div');
-    el.id = 'ejf-issue-dates';
+    el.id = 'jita-issue-dates';
     el.setAttribute('data-key', key);
     // Absolutely positioned near the LEFT edge of the sticky header bar (its positioning context), vertically
     // centered with the icons. A small left inset (not 0) clears the bar's left clip/overflow so the first
@@ -375,7 +375,7 @@ function ejfShowIssueDates() {
             var lbl = document.createElement('span');
             lbl.textContent = label;
             var val = document.createElement('span');
-            val.textContent = ejfFmtDateShort(iso);
+            val.textContent = jitaFmtDateShort(iso);
             val.style.marginLeft = 'auto';   // push the date to the right edge of the (stretched) row
             row.appendChild(lbl);
             row.appendChild(val);
@@ -385,12 +385,12 @@ function ejfShowIssueDates() {
         part('Updated', updated);
     }
 
-    if (ejfDatesCache[key]) { paint(ejfDatesCache[key].created, ejfDatesCache[key].updated); return; }
+    if (jitaDatesCache[key]) { paint(jitaDatesCache[key].created, jitaDatesCache[key].updated); return; }
     $.ajax({ url: 'https://fenriscreations.atlassian.net/rest/api/2/issue/' + key + '?fields=created,updated', dataType: 'json' })
         .done(function (d) {
             var f = (d && d.fields) || {};
-            ejfDatesCache[key] = { created: f.created || null, updated: f.updated || null };
-            paint(ejfDatesCache[key].created, ejfDatesCache[key].updated);
+            jitaDatesCache[key] = { created: f.created || null, updated: f.updated || null };
+            paint(jitaDatesCache[key].created, jitaDatesCache[key].updated);
         })
         .fail(function () { if (el.isConnected) { el.textContent = ''; } });
 }
@@ -399,22 +399,22 @@ function ejfShowIssueDates() {
 // column (the spot you'd otherwise have to scroll to). Now that we mirror them into the top header, hide that
 // native block so the date isn't shown twice. Jira gives those rows stable testids
 // ("created-date.ui.read.meta-date" / "updated-date.ui.read.meta-date"), so we target them directly. Idempotent.
-function ejfHideNativeDates() {
+function jitaHideNativeDates() {
     var nodes = document.querySelectorAll(
         '[data-testid="created-date.ui.read.meta-date"], [data-testid="updated-date.ui.read.meta-date"],' +
         ' [data-testid$="-date.ui.read.meta-date"]');
     for (var i = 0; i < nodes.length; i++) {
         var n = nodes[i];
-        if (n.getAttribute('data-ejf-hidden-dates')) { continue; }   // already hidden
+        if (n.getAttribute('data-jita-hidden-dates')) { continue; }   // already hidden
         n.style.display = 'none';
-        n.setAttribute('data-ejf-hidden-dates', '1');
+        n.setAttribute('data-jita-hidden-dates', '1');
     }
 }
 
 // Initial nudge in case the header is already present before the first DOM mutation fires.
 waitForKeyElements(issueItem, function () {
-    try { ejfShowIssueDates(); } catch (e) { /* ignore */ }
-    try { ejfHideNativeDates(); } catch (e) { /* ignore */ }
+    try { jitaShowIssueDates(); } catch (e) { /* ignore */ }
+    try { jitaHideNativeDates(); } catch (e) { /* ignore */ }
 });
 
 
@@ -423,7 +423,7 @@ waitForKeyElements(issueItem, function () {
 // than GET) so a long EVE description can't blow the URL length limit, and go through GM_xmlhttpRequest so
 // CORS is a non-issue (no session cookie needed). Source language is auto-detected (sl=auto -> tl=en).
 // Resolves to: the translated string, '' for empty input, or null on failure (HTTP error / throttle / parse).
-function ejfTranslateFree(text) {
+function jitaTranslateFree(text) {
     return new Promise(function (resolve) {
         var t = (text || '').trim();
         if (!t) { resolve(''); return; }
@@ -453,19 +453,19 @@ function ejfTranslateFree(text) {
 
 // Standard $.ajax error handler for the action buttons: log the raw response, then alert `msg` (default: the
 // generic failure text) followed by the shared "check console / report to Schogol" tail. Returns the handler.
-function ejfAjaxError(msg) {
+function jitaAjaxError(msg) {
     return function (data) {
         console.log(JSON.stringify(data));
         alert((msg || 'This failed for some reason.') + ' Check Console for errors and report issues to Schogol :).');
     };
 }
 
-// Convert-to-Defect (EBR -> EDR) automation rule id (invoked via ejfInvokeAutomationRule).
-var EJF_CONVERT_DEFECT_RULE = '767335';
+// Convert-to-Defect (EBR -> EDR) automation rule id (invoked via jitaInvokeAutomationRule).
+var JITA_CONVERT_DEFECT_RULE = '767335';
 
 // POST a manual automation-rule invocation for the issue with the given NUMERIC id (ari .../issue/<id>). Optional
 // `userInputs` carries a form selection (Convert-to-Defect passes none). Returns the $.ajax promise.
-function ejfInvokeAutomationRule(numericId, ruleId, userInputs) {
+function jitaInvokeAutomationRule(numericId, ruleId, userInputs) {
     var cloudId = $('meta[name="ajs-cloud-id"]').attr('content');
     var body = { objects: ['ari:cloud:jira:' + cloudId + ':issue/' + numericId] };
     if (userInputs) { body.userInputs = userInputs; }
@@ -477,7 +477,7 @@ function ejfInvokeAutomationRule(numericId, ruleId, userInputs) {
 }
 
 // Keys of the issues linked to a v2 issue (from its fields.issuelinks - either side of each link).
-function ejfLinkedKeys(links) {
+function jitaLinkedKeys(links) {
     var keys = [];
     (links || []).forEach(function (l) {
         var other = l.outwardIssue || l.inwardIssue;
@@ -489,14 +489,14 @@ function ejfLinkedKeys(links) {
 // After Convert-to-Defect, the automation creates a defect and links it to the EBR. Poll the EBR's links for one
 // that wasn't there before (prefer a defect project) and navigate to it. Falls back to reloading the EBR after
 // ~30s if none appears (e.g. the conversion linked it some other way).
-function ejfGoToNewDefect(ebrKey, beforeKeys) {
+function jitaGoToNewDefect(ebrKey, beforeKeys) {
     var before = {};
     (beforeKeys || []).forEach(function (k) { before[k] = true; });
     var tries = 0;
     (function poll() {
         $.ajax({ url: 'https://fenriscreations.atlassian.net/rest/api/2/issue/' + ebrKey + '?fields=issuelinks', type: 'GET', dataType: 'json' })
             .done(function (d) {
-                var fresh = ejfLinkedKeys(d.fields && d.fields.issuelinks).filter(function (k) { return !before[k]; });
+                var fresh = jitaLinkedKeys(d.fields && d.fields.issuelinks).filter(function (k) { return !before[k]; });
                 var defect = fresh.filter(function (k) { return /^(EDR|EO|PLAT)-/.test(k); })[0] || fresh[0];
                 if (defect) { window.location.href = '/browse/' + defect; return; }
                 if (tries >= 30) { window.location.reload(false); return; }
@@ -536,9 +536,9 @@ function addButtons() {
     addActionButton('translateButton', 'Translate');
 
     // When the translate button is clicked we translate the Issue title + description blocks to English via
-    // Google's FREE keyless gtx endpoint (ejfTranslateFree). One request per text, run in parallel, then we
+    // Google's FREE keyless gtx endpoint (jitaTranslateFree). One request per text, run in parallel, then we
     // replace the original Title / Description / Repro-Steps with the translation - same DOM mapping as before.
-    $("#translateButton").off('click.ejf').on('click.ejf', function () {
+    $("#translateButton").off('click.jita').on('click.jita', function () {
         var $title = $("h1[data-testid='issue.views.issue-base.foundation.summary.heading']");
         var $desc = $("div[data-component-selector='jira-issue-view-rich-text-inline-edit-view-container']");
         // Read with innerText (NOT jQuery .text()/textContent): innerText reflects the RENDERED text and
@@ -569,7 +569,7 @@ function addButtons() {
         var titleText = readText($title);
         var d0 = readText($desc.children().eq(0));
         var d1 = readText($desc.children().eq(1));
-        Promise.all([ejfTranslateFree(titleText), ejfTranslateFree(d0), ejfTranslateFree(d1)])
+        Promise.all([jitaTranslateFree(titleText), jitaTranslateFree(d0), jitaTranslateFree(d1)])
             .then(function (tr) {
                 // null == request failed (HTTP error / throttle / parse); all-null means nothing came back.
                 if (tr[0] === null && tr[1] === null && tr[2] === null) {
@@ -581,14 +581,14 @@ function addButtons() {
                 if (tr[2]) { setBlockText($desc.children().eq(1), tr[2]); }
 
                 // The Triage Assistant reads its search query straight from these same DOM nodes (see
-                // EJF_SD.ui.getIssueText), so now that they hold the ENGLISH translation, re-run the similar-
+                // JiTA.ui.getIssueText), so now that they hold the ENGLISH translation, re-run the similar-
                 // defects search - otherwise it keeps matching against the reporter's native-language text and
                 // finds little. Guarded so this only fires when the Triage Assistant is enabled in settings
                 // (savedVariables[5]) AND its panel is live on this bug report; the typeof guard also keeps the
                 // Translate button working when the Similar Defects feature's code isn't loaded at all.
-                if (typeof EJF_SD !== 'undefined' && EJF_SD.ui && savedVariables[5][1]
-                    && EJF_SD.ui.currentKey && /^EBR-/.test(EJF_SD.ui.currentKey)) {
-                    EJF_SD.ui.render(EJF_SD.ui.currentKey);
+                if (typeof JiTA !== 'undefined' && JiTA.ui && savedVariables[5][1]
+                    && JiTA.ui.currentKey && /^EBR-/.test(JiTA.ui.currentKey)) {
+                    JiTA.ui.render(JiTA.ui.currentKey);
                 }
             });
     });
@@ -598,9 +598,9 @@ function addButtons() {
     addActionButton('GMButton', 'Assign to GM');
 
     // When the Assign to GM button is clicked we change the Team to "EO - Game Masters" and also visually change the field so the user sees that it worked.
-    // .off('click.ejf').on(...) so re-running addButtons (React re-renders / SPA nav) never STACKS a second handler on the same button.
-    $("#GMButton").off('click.ejf').on('click.ejf', function () {
-        var key = ejfCurrentKey();
+    // .off('click.jita').on(...) so re-running addButtons (React re-renders / SPA nav) never STACKS a second handler on the same button.
+    $("#GMButton").off('click.jita').on('click.jita', function () {
+        var key = jitaCurrentKey();
         $.ajax({
             url: 'https://fenriscreations.atlassian.net/rest/api/2/issue/' + key,
             type: 'PUT',
@@ -624,13 +624,13 @@ function addButtons() {
                     },
 
                     // If we get an Error we annoy the user by telling them that it failed and to check their Dev Console for errors
-                    error: ejfAjaxError("Wasn't able to change Assignee field to 'Unassigned'.")
+                    error: jitaAjaxError("Wasn't able to change Assignee field to 'Unassigned'.")
                 });
 
             },
 
             // If we get an Error then we annoy the user by telling them that it failed and to check their Dev Console for errors
-            error: ejfAjaxError()
+            error: jitaAjaxError()
         });
     });
 
@@ -638,21 +638,21 @@ function addButtons() {
     // Create Convert To Defect Button
     addActionButton('convertToDefectButton', 'Convert to Defect');
     // When the Convert to Defect button is clicked we trigger the Automation which converts the EBR into an EDR issue
-    // .off('click.ejf').on(...) so re-running addButtons (React re-renders / SPA nav) never STACKS a second handler
+    // .off('click.jita').on(...) so re-running addButtons (React re-renders / SPA nav) never STACKS a second handler
     // on the same button - stacked handlers fired the automation twice and created two defects.
-    $("#convertToDefectButton").off('click.ejf').on('click.ejf', function () {
+    $("#convertToDefectButton").off('click.jita').on('click.jita', function () {
         var $btn = $(this);
         if ($btn.prop('disabled')) { return; }                 // conversion already in progress - ignore extra clicks
         $btn.prop('disabled', true);
-        var ebrKey = ejfCurrentKey();
-        function fail(xhr) { $btn.prop('disabled', false); ejfAjaxError()(xhr); }
+        var ebrKey = jitaCurrentKey();
+        function fail(xhr) { $btn.prop('disabled', false); jitaAjaxError()(xhr); }
         // Snapshot the EBR's numeric id + existing issue links, run the conversion automation, then navigate to the
         // newly-created defect (found as the freshly-linked issue that wasn't linked before).
         $.ajax({ url: 'https://fenriscreations.atlassian.net/rest/api/2/issue/' + ebrKey + '?fields=issuelinks', type: 'GET', dataType: 'json' })
             .done(function (d) {
-                var before = ejfLinkedKeys(d.fields && d.fields.issuelinks);
-                ejfInvokeAutomationRule(d.id, EJF_CONVERT_DEFECT_RULE)
-                    .done(function () { ejfGoToNewDefect(ebrKey, before); })   // poll the EBR's links for the new defect, then navigate
+                var before = jitaLinkedKeys(d.fields && d.fields.issuelinks);
+                jitaInvokeAutomationRule(d.id, JITA_CONVERT_DEFECT_RULE)
+                    .done(function () { jitaGoToNewDefect(ebrKey, before); })   // poll the EBR's links for the new defect, then navigate
                     .fail(fail);
             }).fail(fail);
     });
@@ -661,7 +661,7 @@ function addButtons() {
     // Create close button
     addActionButton('closeButton', 'Close');
     // When the Close button is clicked we change the status to Closed by simulating clicks on the relevant buttons. This is extremely janky right now because I cant figure out a better way to do this.
-    $("#closeButton").off('click.ejf').on('click.ejf', function () {
+    $("#closeButton").off('click.jita').on('click.jita', function () {
         $("div[data-testid='issue.views.issue-base.foundation.status.status-field-wrapper']").find("button").click();
         setTimeout(function(){$("div[data-testid='issue.fields.status.common.ui.status-lozenge.3']").children().find("span:contains(Closed)").click();}, 100);
     });
@@ -695,7 +695,7 @@ waitForKeyElements(cmSelector, SwapUI);
 // outstandingcalls.txt / lastcrashes.txt / PDMData.txt live inside the igbr.zip and - unlike the log /
 // processHealth / methodCalls files - have NO header row in their content to detect them by. So the only way to
 // tell them apart is WHICH file button was clicked: watch for each file's entry in the attachment list, and when
-// its button is clicked, poll for the freshly-loaded text (ejfRunParserWhenLoaded) and set the matching parser
+// its button is clicked, poll for the freshly-loaded text (jitaRunParserWhenLoaded) and set the matching parser
 // flag that SwapUI dispatches on.
 // The click binding is namespaced and .off()'d first so re-firing can never stack duplicate handlers: the SPA
 // re-rendering the attachment list makes waitForKeyElements match a fresh span and re-run this callback.
@@ -708,7 +708,7 @@ var IGBR_FILES = [
 IGBR_FILES.forEach(function (f) {
     waitForKeyElements('span[data-item-title="true"]:contains(' + f.name + ')', function () {
         $("button:contains('" + f.name + "')")
-            .off('click.ejf').on('click.ejf', function () { ejfRunParserWhenLoaded(f.setFlag); });
+            .off('click.jita').on('click.jita', function () { jitaRunParserWhenLoaded(f.setFlag); });
     });
 });
 
@@ -726,7 +726,7 @@ IGBR_FILES.forEach(function (f) {
 //      isn't showing; keep waiting for the viewer to swap it back in.
 //   4. HEADER_SIG - a header-based file (log / processHealth / methodCalls) loaded instead; those are handled
 //      by waitForKeyElements+SwapUI, so we must not grab them as our oc/lc/pdm file.
-//   5. Cancel-on-navigate (the ejfParserGen bump below) - the poller watches a SHARED code-block, so if you open
+//   5. Cancel-on-navigate (the jitaParserGen bump below) - the poller watches a SHARED code-block, so if you open
 //      an EMPTY tracked file (its poller keeps waiting - no content ever arrives) and then click ANOTHER file
 //      before MAX, that file's content lands in the same span and would trip the stale poller, parsing it into
 //      the wrong table (the reported bug: empty outstandingcalls -> click fitting.txt -> fitting in the OC table).
@@ -734,7 +734,7 @@ IGBR_FILES.forEach(function (f) {
 //      bump the generation, and its content arrives well before the #2 timeout. So we bump the generation on
 //      EVERY file-entry click, which kills any pending poller the moment you navigate away.
 // `setFlag` marks which parser branch SwapUI takes (oc / lc / pdm).
-var ejfParserGen = 0;
+var jitaParserGen = 0;
 // Guard #5: clicking any file entry in the igbr.zip viewer cancels a pending poller. Capture phase, so it runs
 // BEFORE the tracked button's bubble handler - a tracked file then starts a fresh poller with the newer (winning)
 // generation, while an untracked file just leaves every poller cancelled. File entries are <button>s containing a
@@ -742,16 +742,16 @@ var ejfParserGen = 0;
 // have no such child and are ignored.
 document.addEventListener('click', function (e) {
     var btn = e.target && e.target.closest ? e.target.closest('button') : null;
-    if (btn && btn.querySelector('[data-item-title]')) { ejfParserGen++; }
+    if (btn && btn.querySelector('[data-item-title]')) { jitaParserGen++; }
 }, true);
-function ejfRunParserWhenLoaded(setFlag) {
-    var myGen = ++ejfParserGen;
+function jitaRunParserWhenLoaded(setFlag) {
+    var myGen = ++jitaParserGen;
     var CB = "span[data-testid='code-block']";
     var HEADER_SIG = new RegExp(LOG_HDR + '|dateTime\tpyDateTime\tprocCpu|Time\tMethod\tDuration');
     var before = ($(CB).text() || '').trim();
     var start = Date.now(), MAX = 8000, POLL = 100;
     (function poll() {
-        if (myGen !== ejfParserGen) { return; }                 // superseded by a newer click
+        if (myGen !== jitaParserGen) { return; }                 // superseded by a newer click
         if (Date.now() - start > MAX) { return; }               // empty / never-loaded file -> don't parse
         var $cb = $(CB), now = ($cb.text() || '').trim();
         var ready = !document.getElementById('tableContent')    // no parser markup currently mounted
@@ -768,7 +768,7 @@ function ejfRunParserWhenLoaded(setFlag) {
 // so we run the read in the page context via an injected <script> and hand the text back through a
 // shared, hidden DOM node (which both contexts can see).
 function getCmDocText() {
-    var NODE_ID = 'EJF_cmdoc_transfer';
+    var NODE_ID = 'JITA_cmdoc_transfer';
 
     var transfer = document.getElementById(NODE_ID);
     if (!transfer) {
@@ -781,7 +781,7 @@ function getCmDocText() {
 
     var pageCode =
         '(function(){var out=document.getElementById(' + JSON.stringify(NODE_ID) + ');try{' +
-        'var c=document.querySelector(".cm-content[data-ejf-cmsrc]")||document.querySelector(".cm-content");' +
+        'var c=document.querySelector(".cm-content[data-jita-cmsrc]")||document.querySelector(".cm-content");' +
         'var dv=c&&c.cmView;' +
         'var v=dv&&(dv.view||(dv.rootView&&dv.rootView.view)||dv.editorView);' +
         'out.textContent=(v&&v.state)?v.state.doc.toString():"";' +
@@ -828,9 +828,9 @@ function SwapUI() {
     // them read the wrong (comment) text into `rows` AND injected the "Logfile Parser" UI into the comment box.
     var $logEd = $(".cm-line:contains(" + LOG_HDR + ")").first().closest('.cm-editor');
     if ($logEd.length && !$("span[data-testid='code-block']").length && savedVariables[1][1]) {
-        var $cm = $logEd.find('.cm-content').first().attr('data-ejf-cmsrc', '1');   // mark the exact source editor
+        var $cm = $logEd.find('.cm-content').first().attr('data-jita-cmsrc', '1');   // mark the exact source editor
         rows = getCmDocText();                                                       // reads the marked .cm-content
-        $cm.removeAttr('data-ejf-cmsrc');
+        $cm.removeAttr('data-jita-cmsrc');
         $logEd.html(html);
         // The parser's scrollable #table is position:absolute (top:85px; bottom:0), so it sizes itself
         // against the nearest positioned ancestor. In the old <span> viewer that ancestor filled the screen;
@@ -915,16 +915,16 @@ function SwapUI() {
 
     // Live search box (Feature D): filter rows by text, composing with the type toggles above. A row is
     // shown iff it matches the (case-insensitive) query AND its message-type isn't currently toggled off.
-    // ejfApplyLogFilter recomputes visibility from the toggle state (including the "Only Exceptions" combo,
+    // jitaApplyLogFilter recomputes visibility from the toggle state (including the "Only Exceptions" combo,
     // which also hides info rows) so search and the toggle buttons never fight. Wired only on the main log
     // parser, the one layout that has the search input.
-    if ($('#ejf-log-search').length) {
-        var ejfApplyLogFilter = function () {
+    if ($('#jita-log-search').length) {
+        var jitaApplyLogFilter = function () {
             // Drop the previous Nx badges before measuring row text, so a stale "52×" can't pollute the search
-            // match; ejfRegroupLog() re-adds them from the new visibility at the end of this pass.
-            var pb = document.querySelectorAll('#tableContent .ejf-rep-badge');
+            // match; jitaRegroupLog() re-adds them from the new visibility at the end of this pass.
+            var pb = document.querySelectorAll('#tableContent .jita-rep-badge');
             for (var pi = 0; pi < pb.length; pi++) { if (pb[pi].parentNode) { pb[pi].parentNode.removeChild(pb[pi]); } }
-            var q = ($('#ejf-log-search').val() || '').toLowerCase();
+            var q = ($('#jita-log-search').val() || '').toLowerCase();
             var off = {};
             $('#gnav a.toggle').each(function () { off[$(this).attr('id')] = true; });
             var onlyExc = off.notice && off.warning && off.error && !off.exception;   // the "Only Exceptions" state
@@ -941,15 +941,15 @@ function SwapUI() {
             });
             // Re-collapse identical runs against the visibility we just computed (hiding a type can make
             // previously-separated duplicates adjacent, so the "Nx" grouping must be recalculated here).
-            ejfRegroupLog();
+            jitaRegroupLog();
         };
-        var ejfSearchTimer = null;
-        $('#ejf-log-search').on('input', function () {
-            if (ejfSearchTimer) { clearTimeout(ejfSearchTimer); }
-            ejfSearchTimer = setTimeout(ejfApplyLogFilter, 120);   // debounce for large logs
+        var jitaSearchTimer = null;
+        $('#jita-log-search').on('input', function () {
+            if (jitaSearchTimer) { clearTimeout(jitaSearchTimer); }
+            jitaSearchTimer = setTimeout(jitaApplyLogFilter, 120);   // debounce for large logs
         });
         // Re-apply the text filter after any toggle / Only-Exceptions / Show-All click so the two compose.
-        $('#gpanel a').on('click', function () { setTimeout(ejfApplyLogFilter, 0); });
+        $('#gpanel a').on('click', function () { setTimeout(jitaApplyLogFilter, 0); });
     }
 };
 
@@ -1357,7 +1357,7 @@ function ParseLogs() {
             messageCell = row.insertCell(++cellIndex);
             messageCell.innerHTML = table[i][3];
             // (Known-exception highlighting is applied as a post-render pass in ParseLogs via
-            //  EJF_SD.logsig.applyToTable(), since the signature index is built async from IndexedDB.)
+            //  JiTA.logsig.applyToTable(), since the signature index is built async from IndexedDB.)
 
 
  /**
@@ -1392,17 +1392,17 @@ function ParseLogs() {
  /**
  * "Group Repeats": segment the rendered rows into line / exception-block units and collapse consecutive
  * identical ones into a single row with an "Nx" badge. Built BEFORE the async signature pass (so signatures
- * are read from pristine message text) and grouped once for the initial (unfiltered) view; ejfApplyLogFilter
+ * are read from pristine message text) and grouped once for the initial (unfiltered) view; jitaApplyLogFilter
  * re-runs the collapse after every filter / toggle so the batching tracks what's currently visible.
  */
-    ejfBuildLogGroups();
-    ejfRegroupLog();
+    jitaBuildLogGroups();
+    jitaRegroupLog();
 
  /**
  * Feature D: flag log lines that match a known exception signature mined from the defect DB, linking each
  * back to its defect. Runs async (index is built from IndexedDB) and patches the rendered rows in place.
  */
-    if (typeof EJF_SD !== 'undefined' && EJF_SD.logsig) { EJF_SD.logsig.applyToTable(); }
+    if (typeof JiTA !== 'undefined' && JiTA.logsig) { JiTA.logsig.applyToTable(); }
 };
 
 
@@ -1412,10 +1412,10 @@ function ParseLogs() {
  * message with the TIMESTAMP column excluded, so the same thing logged repeatedly (each with a different
  * time) still groups.
  *
- * Crucially the collapse is recomputed by ejfRegroupLog() AFTER every filter / toggle pass, not once at parse
+ * Crucially the collapse is recomputed by jitaRegroupLog() AFTER every filter / toggle pass, not once at parse
  * time: hiding a message type (e.g. Notices) can make two identical errors - previously separated by a notice
- * - become visually adjacent and therefore groupable. So ejfBuildLogGroups() runs ONCE (stamping each row with
- * a unit id + a timestamp-free signature), and ejfRegroupLog() re-derives the badges from the CURRENT
+ * - become visually adjacent and therefore groupable. So jitaBuildLogGroups() runs ONCE (stamping each row with
+ * a unit id + a timestamp-free signature), and jitaRegroupLog() re-derives the badges from the CURRENT
  * visibility on demand. A hidden unit between two duplicates is skipped (it doesn't break the run), which is
  * exactly what makes "hide notices -> the errors around them batch together" work.
  *
@@ -1424,10 +1424,10 @@ function ParseLogs() {
  */
 
 // Segment the rendered rows into "units" (a single line, or a full exception block) and stamp each row with
-// its unit id (data-ejf-grp) + the unit's timestamp-free signature (data-ejf-gsig on the unit's first row).
+// its unit id (data-jita-grp) + the unit's timestamp-free signature (data-jita-gsig on the unit's first row).
 // Runs once, right after the table is filled and BEFORE applyToTable rewrites any message cell, so the
 // signature is computed from the pristine message text.
-function ejfBuildLogGroups() {
+function jitaBuildLogGroups() {
     var tbody = document.querySelector('#tableContent tbody');
     if (!tbody) { return; }
     var rows = tbody.rows, i = 0, unit = 0;
@@ -1451,7 +1451,7 @@ function ejfBuildLogGroups() {
         var start = i, sig;
         if (cellText(rows[i], 3).indexOf('EXCEPTION #') !== -1) {
             // Exception BLOCK: gather rows until EXCEPTION END (inclusive) or the next EXCEPTION # - the same
-            // segmentation EJF_SD.logsig uses - so a whole repeated dump collapses as one unit.
+            // segmentation JiTA.logsig uses - so a whole repeated dump collapses as one unit.
             var parts = [sigOf(rows[i])];
             i++;
             for (; i < rows.length; i++) {
@@ -1471,8 +1471,8 @@ function ejfBuildLogGroups() {
             sig = 'L:' + sigOf(rows[i]);          // single LINE
             i++;
         }
-        for (var r = start; r < i; r++) { rows[r].setAttribute('data-ejf-grp', unit); }
-        rows[start].setAttribute('data-ejf-gsig', sig);
+        for (var r = start; r < i; r++) { rows[r].setAttribute('data-jita-grp', unit); }
+        rows[start].setAttribute('data-jita-gsig', sig);
         unit++;
     }
 }
@@ -1480,16 +1480,16 @@ function ejfBuildLogGroups() {
 // Re-derive the "Nx" badges from the CURRENT row visibility. Walks units in order, skipping any whose rows
 // are all hidden (so a filtered-out unit does NOT break a run of duplicates around it), and collapses
 // consecutive units that share a signature: the followers are hidden and the leader gets a count badge.
-// Called at the end of ejfApplyLogFilter (after every toggle / search) and once from ParseLogs.
-function ejfRegroupLog() {
+// Called at the end of jitaApplyLogFilter (after every toggle / search) and once from ParseLogs.
+function jitaRegroupLog() {
     var tbody = document.querySelector('#tableContent tbody');
     if (!tbody) { return; }
     // Clear our previous badges idempotently (never touch applyToTable's [EDR-x] link - only our own spans).
-    var oldBadges = tbody.querySelectorAll('.ejf-rep-badge');
+    var oldBadges = tbody.querySelectorAll('.jita-rep-badge');
     for (var b = 0; b < oldBadges.length; b++) { if (oldBadges[b].parentNode) { oldBadges[b].parentNode.removeChild(oldBadges[b]); } }
     // Grouping disabled: the "Group Repeats" nav toggle carries .toggle when OFF. The rows already hold the
-    // filter's base visibility (ejfApplyLogFilter reset every row before calling us), so just leave them.
-    var btn = document.getElementById('ejf-group-toggle');
+    // filter's base visibility (jitaApplyLogFilter reset every row before calling us), so just leave them.
+    var btn = document.getElementById('jita-group-toggle');
     if (btn && btn.classList.contains('toggle')) { return; }
 
     var rows = tbody.rows;
@@ -1501,7 +1501,7 @@ function ejfRegroupLog() {
         var msg = runLeaderRow.cells[runLeaderRow.cells.length - 1];
         if (!msg) { return; }
         var badge = document.createElement('span');
-        badge.className = 'ejf-rep-badge';
+        badge.className = 'jita-rep-badge';
         badge.textContent = runCount + '×';   // informational count only (not a toggle)
         var span = (runFirstTime && runLastTime && runFirstTime !== runLastTime) ? (runFirstTime + ' → ' + runLastTime) : (runFirstTime || '');
         badge.title = runCount + ' identical in a row' + (span ? ' · ' + span : '');
@@ -1510,11 +1510,11 @@ function ejfRegroupLog() {
 
     var i = 0;
     while (i < rows.length) {
-        // Collect this unit's rows (the consecutive run sharing one data-ejf-grp); its signature lives on the
+        // Collect this unit's rows (the consecutive run sharing one data-jita-grp); its signature lives on the
         // first row.
-        var g = rows[i].getAttribute('data-ejf-grp'), unitRows = [], sig = null;
-        while (i < rows.length && rows[i].getAttribute('data-ejf-grp') === g) {
-            if (sig === null) { sig = rows[i].getAttribute('data-ejf-gsig'); }
+        var g = rows[i].getAttribute('data-jita-grp'), unitRows = [], sig = null;
+        while (i < rows.length && rows[i].getAttribute('data-jita-grp') === g) {
+            if (sig === null) { sig = rows[i].getAttribute('data-jita-gsig'); }
             unitRows.push(rows[i]);
             i++;
         }
@@ -1863,7 +1863,7 @@ var cssLogParser = `
       margin-left: 10px;
     }
 
-    #ejf-log-search {
+    #jita-log-search {
       height: 26px;
       padding: 0 8px;
       border: 1px solid #555;
@@ -1874,7 +1874,7 @@ var cssLogParser = `
       outline: none;
     }
 
-    #ejf-log-search:focus {
+    #jita-log-search:focus {
       border-color: #4c9aff;
     }
 
@@ -1886,7 +1886,7 @@ var cssLogParser = `
       box-shadow: inset 4px 0 0 #6b7785 !important;
     }
 
-    .ejf-rep-badge {
+    .jita-rep-badge {
       display: inline-block;
       margin-right: 6px;
       padding: 0 6px;
@@ -1963,9 +1963,9 @@ var html = parserShell('Logfile Parser', `
             <li id="button">
                <a href="#" id = "showAll">Show All</a>
             <li id="button">
-               <a href="#" id = "ejf-group-toggle" class="" title="Collapse consecutive identical lines / exceptions into one row with an Nx count. Recomputed as you filter, so hiding a message type re-batches whatever becomes adjacent.">Group Repeats</a>
+               <a href="#" id = "jita-group-toggle" class="" title="Collapse consecutive identical lines / exceptions into one row with an Nx count. Recomputed as you filter, so hiding a message type re-batches whatever becomes adjacent.">Group Repeats</a>
             <li id="searchli">
-               <input id="ejf-log-search" type="text" placeholder="Filter…" autocomplete="off">
+               <input id="jita-log-search" type="text" placeholder="Filter…" autocomplete="off">
          </ul>
       </nav>
    </header>`
@@ -2557,20 +2557,20 @@ var dxdiagHtml = `
  * keyword similarity (fully local, no model); a later phase swaps in local semantic embeddings,
  * which is why records already reserve `embedding` / `embeddingModelVersion` fields.
  *
- * Everything lives under the EJF_SD namespace to avoid polluting globals. Plain var/function +
+ * Everything lives under the JiTA namespace to avoid polluting globals. Plain var/function +
  * Promises + jQuery, matching the rest of this file. Jira REST calls are same-origin and rely on
  * the browser session cookie (no auth header / no GM_xmlhttpRequest needed), exactly like the
  * existing Translate / Convert-to-Defect calls.
  * ========================================================================================= */
-var EJF_SD = {
+var JiTA = {
     HOST: 'https://fenriscreations.atlassian.net',
     SCOPE: 'project in (EDR, EO, PLAT)',           // defect dataset (crawled + embedded); shown as similar-defect candidates on EBR pages
     EBR_SCOPE: 'project = EBR AND statusCategory != Done',  // open bug reports, for the EDR "matching reports" view
     // "EO - GameMasters" team id (Team field = customfield_10001). Bug reports assigned to the GM team are being
-    // handled BY the GMs, so they're excluded from the "matching bug reports" view (see EJF_SD.rank EBR indexes).
+    // handled BY the GMs, so they're excluded from the "matching bug reports" view (see JiTA.rank EBR indexes).
     GM_TEAM_ID: 'ef4edd53-c099-4431-82af-9b4bd717cb88-38',
     FIELDS: ['summary', 'description', 'status', 'resolution', 'resolutiondate', 'created', 'components', 'updated', 'project', 'customfield_10001'],  // customfield_10001 = Team
-    DB_NAME: 'EJF_SimilarDefects',
+    DB_NAME: 'EJF_SimilarDefects',   // legacy IndexedDB name - renamed identifiers to JiTA but kept this value so existing users keep their synced defect DB
     DB_VERSION: 1,
     PAGE_SIZE: 100,
     PAGE_DELAY_MS: 250,                            // polite gap between search pages
@@ -2578,7 +2578,7 @@ var EJF_SD = {
     MAX_RETRIES: 5,
     // How many related issues the panel lists (similar defects / matching bug reports). User-configurable
     // from the settings menu, persisted in the GM flag 'sdTopN'; default 8, clamped 1..30 (kept below
-    // EJF_SD.rank.CAND so the fusion candidate pool is never the limiting factor). Read live at query time,
+    // JiTA.rank.CAND so the fusion candidate pool is never the limiting factor). Read live at query time,
     // so changing it from the menu re-renders with the new count without a reload.
     TOP_N: (function () {
         var v = parseInt(gmGet('sdTopN', 8), 10);
@@ -2591,7 +2591,7 @@ var EJF_SD = {
                                                     // adds/changes a FIELD on stored records - OR widens the crawl
                                                     // SCOPE - that a plain incremental catch-up can't backfill (it
                                                     // only re-fetches CHANGED issues, so old rows / newly-in-scope
-                                                    // projects are missed). On load EJF_SD.migrate auto-re-fetches
+                                                    // projects are missed). On load JiTA.migrate auto-re-fetches
                                                     // any dataset stamped below this. (v1 = added the `created`
                                                     // field; v2 = added PLAT to SCOPE -> full refetch backfills
                                                     // existing PLAT defects; v3 = added the `team` field
@@ -2611,7 +2611,7 @@ var EJF_SD = {
  * (log -> defect) AND grouping duplicate defects (the "Same exception" / "Exception clusters" views). The
  * index rebuilds whenever the defect DB changes.
  */
-EJF_SD.logsig = {
+JiTA.logsig = {
     // _index: {
     //   sigMap:    { sig -> { sig, label, members:[{key,status,resolution,resolutiondate,created}] } },  // EXACT (full chain)
     //   keyToSigs: { key -> [sig,...] },
@@ -2674,15 +2674,15 @@ EJF_SD.logsig = {
             .replace(/([(\[{,]\s*)\d+/g, '$1#')        // tuple/list/dict element (leading edge: after ( [ { or ,)
             .replace(/\d+(\s*[)\]},])/g, '#$1')        // ...and trailing edge (before ) ] } or ,)
             .replace(/\b\d{4,}\b/g, '#');              // other long numeric ids (a bare scalar < 4 digits survives)
-        var sig = (frames.length >= EJF_SD.logsig.MIN_FRAMES)
+        var sig = (frames.length >= JiTA.logsig.MIN_FRAMES)
             ? (nmsg + '|' + frames.join('>')).toLowerCase()
             : null;
         // Crash-site signature: message + only the INNERMOST CRASH_FRAMES frames (where the exception was
         // actually thrown). Two defects that crash at the SAME place with the SAME message but were reached by
         // a DIFFERENT call path share this even though their full `sig` differs - it drives the looser
         // "possibly related" hint (never an exact cluster). Same null condition as `sig` (needs >= MIN_FRAMES).
-        var crashSig = (frames.length >= EJF_SD.logsig.MIN_FRAMES)
-            ? (nmsg + '|' + frames.slice(-EJF_SD.logsig.CRASH_FRAMES).join('>')).toLowerCase()
+        var crashSig = (frames.length >= JiTA.logsig.MIN_FRAMES)
+            ? (nmsg + '|' + frames.slice(-JiTA.logsig.CRASH_FRAMES).join('>')).toLowerCase()
             : null;
         return { sig: sig, crashSig: crashSig, msg: msg };
     },
@@ -2693,9 +2693,9 @@ EJF_SD.logsig = {
     // a cluster can show "already fixed in EDR-x" / regression. keyToSigs lets a single issue find its
     // cluster(s) cheaply. The (key, sig) pair is deduped so one defect counts once per signature.
     ensure: function () {
-        if (EJF_SD.logsig._index && !EJF_SD.logsig._dirty) { return Promise.resolve(EJF_SD.logsig._index); }
-        if (EJF_SD.logsig._building) { return EJF_SD.logsig._building; }
-        EJF_SD.logsig._building = EJF_SD.db.allDefects().then(function (recs) {
+        if (JiTA.logsig._index && !JiTA.logsig._dirty) { return Promise.resolve(JiTA.logsig._index); }
+        if (JiTA.logsig._building) { return JiTA.logsig._building; }
+        JiTA.logsig._building = JiTA.db.allDefects().then(function (recs) {
             var sigMap = {}, keyToSigs = {}, crashMap = {}, keyToCrash = {}, nSig = 0;
             for (var i = 0; i < recs.length; i++) {
                 if (recs[i].project === 'EBR') { continue; }   // mine exception signatures from DEFECTS only, not bug reports
@@ -2704,9 +2704,9 @@ EJF_SD.logsig = {
                 var key = recs[i].key;
                 // One member record per defect, shared (by reference) across whatever clusters it lands in.
                 var member = { key: key, status: recs[i].status || '', resolution: recs[i].resolution || null, resolutiondate: recs[i].resolutiondate || null, created: recs[i].created || null };
-                var blocks = EJF_SD.logsig._splitBlocks(desc);
+                var blocks = JiTA.logsig._splitBlocks(desc);
                 for (var b = 0; b < blocks.length; b++) {
-                    var fp = EJF_SD.logsig._fingerprint(blocks[b]);
+                    var fp = JiTA.logsig._fingerprint(blocks[b]);
                     if (!fp.sig) { continue; }
                     // EXACT cluster: keyed on the full stack-frame chain (precise).
                     var c = sigMap[fp.sig];
@@ -2741,21 +2741,21 @@ EJF_SD.logsig = {
             }
             Object.keys(sigMap).forEach(function (s) { sigMap[s].members.sort(memberSort); });
             Object.keys(crashMap).forEach(function (s) { crashMap[s].members.sort(memberSort); });
-            EJF_SD.logsig._index = { sigMap: sigMap, keyToSigs: keyToSigs, crashMap: crashMap, keyToCrash: keyToCrash };
-            EJF_SD.logsig._dirty = false;
-            EJF_SD.logsig._building = null;
+            JiTA.logsig._index = { sigMap: sigMap, keyToSigs: keyToSigs, crashMap: crashMap, keyToCrash: keyToCrash };
+            JiTA.logsig._dirty = false;
+            JiTA.logsig._building = null;
             var nClusters = 0;
             Object.keys(sigMap).forEach(function (s) { if (sigMap[s].members.length >= 2) { nClusters++; } });
-            console.log('[EJF-SD] log signatures: ' + nSig + ' stack signatures (' + nClusters + ' shared across ≥2 defects) mined from ' + recs.length + ' defects');
-            return EJF_SD.logsig._index;
-        }).catch(function (e) { EJF_SD.logsig._building = null; throw e; });
-        return EJF_SD.logsig._building;
+            console.log('[JiTA-SD] log signatures: ' + nSig + ' stack signatures (' + nClusters + ' shared across ≥2 defects) mined from ' + recs.length + ' defects');
+            return JiTA.logsig._index;
+        }).catch(function (e) { JiTA.logsig._building = null; throw e; });
+        return JiTA.logsig._building;
     },
 
     // Every OTHER defect that shares a signature with `key` (deduped across all of the key's signatures),
     // each with its status/resolution. Drives the inline "Same exception" section on a defect. [] when none.
     siblingsForKey: function (key) {
-        return EJF_SD.logsig.ensure().then(function (idx) {
+        return JiTA.logsig.ensure().then(function (idx) {
             var out = [], seen = {};
             seen[key] = true;
             var sigs = (idx && idx.keyToSigs && idx.keyToSigs[key]) || [];
@@ -2777,7 +2777,7 @@ EJF_SD.logsig = {
     // sibling - i.e. the SAME bug reached via a DIFFERENT call path. Looser than siblingsForKey; drives the
     // "Possibly related" hint. [] when none.
     relatedForKey: function (key) {
-        return EJF_SD.logsig.ensure().then(function (idx) {
+        return JiTA.logsig.ensure().then(function (idx) {
             if (!idx) { return []; }
             var exclude = {};
             exclude[key] = true;
@@ -2813,7 +2813,7 @@ EJF_SD.logsig = {
             }
             return n;
         }
-        return EJF_SD.logsig.ensure().then(function (idx) {
+        return JiTA.logsig.ensure().then(function (idx) {
             var out = [];
             if (idx && idx.sigMap) {
                 Object.keys(idx.sigMap).forEach(function (sig) {
@@ -2832,22 +2832,22 @@ EJF_SD.logsig = {
     // One collapsible cluster row for the overview: "<count> <signature label>" that expands to its members.
     _clusterRow: function (c) {
         var wrap = document.createElement('div');
-        wrap.className = 'ejf-excl-cluster';
+        wrap.className = 'jita-excl-cluster';
         var headRow = document.createElement('div');
-        headRow.className = 'ejf-excl-head';
+        headRow.className = 'jita-excl-head';
         var cnt = document.createElement('span');
-        cnt.className = 'ejf-exc-badge open';
+        cnt.className = 'jita-exc-badge open';
         cnt.textContent = c.members.length;
         headRow.appendChild(cnt);
         var lbl = document.createElement('span');
-        lbl.className = 'ejf-excl-label';
+        lbl.className = 'jita-excl-label';
         lbl.textContent = c.label || c.sig;
         lbl.title = c.sig;
         headRow.appendChild(lbl);
         var members = document.createElement('div');
-        members.className = 'ejf-exc-members';
+        members.className = 'jita-exc-members';
         members.style.display = 'none';
-        c.members.forEach(function (m) { members.appendChild(EJF_SD.logsig._memberRowEl(m)); });
+        c.members.forEach(function (m) { members.appendChild(JiTA.logsig._memberRowEl(m)); });
         headRow.addEventListener('click', function () {
             members.style.display = (members.style.display === 'none') ? '' : 'none';
         });
@@ -2857,28 +2857,28 @@ EJF_SD.logsig = {
     },
 
     // The standalone "Exception clusters" overview: every signature shared by >=2 defects, newest defect
-    // first, each expandable to its members. Reuses the settings-menu overlay chrome (#ejf-menu-overlay / #ejf-menu).
+    // first, each expandable to its members. Reuses the settings-menu overlay chrome (#jita-menu-overlay / #jita-menu).
     openClustersView: function () {
-        EJF_SD.logsig._injectClusterCss();
-        var ov = EJF_SD.menu._openOverlay({ title: 'Exception clusters' });
+        JiTA.logsig._injectClusterCss();
+        var ov = JiTA.menu._openOverlay({ title: 'Exception clusters' });
         var $overlay = ov.$overlay;
-        var $sect = $('<div class="ejf-menu-sect"></div>').appendTo(ov.$menu);
-        $('<div class="ejf-menu-status">Loading clusters…</div>').appendTo($sect);
-        EJF_SD.logsig.clusters().then(function (clusters) {
+        var $sect = $('<div class="jita-menu-sect"></div>').appendTo(ov.$menu);
+        $('<div class="jita-menu-status">Loading clusters…</div>').appendTo($sect);
+        JiTA.logsig.clusters().then(function (clusters) {
             if (!document.body.contains($overlay[0])) { return; }   // closed before the build finished
             $sect.empty();
             if (!clusters.length) {
-                $('<div class="ejf-menu-status">No exception is shared by 2+ defects yet. (Sync the defect DB first if you haven’t.)</div>').appendTo($sect);
+                $('<div class="jita-menu-status">No exception is shared by 2+ defects yet. (Sync the defect DB first if you haven’t.)</div>').appendTo($sect);
                 return;
             }
-            $('<div class="ejf-menu-status"></div>')
+            $('<div class="jita-menu-status"></div>')
                 .text(clusters.length + ' exception' + (clusters.length === 1 ? '' : 's') + ' shared by 2+ defects · newest first')
                 .appendTo($sect);
-            clusters.forEach(function (c) { $sect.append(EJF_SD.logsig._clusterRow(c)); });
+            clusters.forEach(function (c) { $sect.append(JiTA.logsig._clusterRow(c)); });
         }, function () {
             if (!document.body.contains($overlay[0])) { return; }
             $sect.empty();
-            $('<div class="ejf-menu-status">Could not build clusters.</div>').appendTo($sect);
+            $('<div class="jita-menu-status">Could not build clusters.</div>').appendTo($sect);
         });
     },
 
@@ -2888,7 +2888,7 @@ EJF_SD.logsig = {
     // defect's cluster. Async (the index is built from IndexedDB); safe to call right after ParseLogs - it
     // patches the already-rendered rows.
     applyToTable: function () {
-        return EJF_SD.logsig.ensure().then(function (idx) {
+        return JiTA.logsig.ensure().then(function (idx) {
             if (!idx) { return; }
             var rows = document.querySelectorAll('#tableContent tbody tr');
             var found = {};   // defect -> { defect, count, rows:[anchor tr,...], raw (label), cluster:[sibling members] }
@@ -2959,7 +2959,7 @@ EJF_SD.logsig = {
             var i = 0;
             while (i < rows.length) {
                 var tr = rows[i];
-                var marked = tr.getAttribute('data-ejf-sig');
+                var marked = tr.getAttribute('data-jita-sig');
                 if (marked) {                                     // already processed in a previous pass
                     if (marked !== '0') {                          // ...re-count anchors for the panel
                         var lk = marked.charAt(0) === '~';        // '~' prefix = loose (crash-site) match
@@ -2968,7 +2968,7 @@ EJF_SD.logsig = {
                     i++;
                     continue;
                 }
-                if (cellText(tr).indexOf('EXCEPTION #') === -1) { tr.setAttribute('data-ejf-sig', '0'); i++; continue; }
+                if (cellText(tr).indexOf('EXCEPTION #') === -1) { tr.setAttribute('data-jita-sig', '0'); i++; continue; }
                 // Gather the whole exception block: rows until EXCEPTION END (inclusive) or the next EXCEPTION #.
                 var blockRows = [tr], blockText = cellText(tr), j = i + 1;
                 for (; j < rows.length; j++) {
@@ -2978,7 +2978,7 @@ EJF_SD.logsig = {
                     blockText += '\n' + t2;
                     if (t2.indexOf('EXCEPTION END') !== -1) { j++; break; }
                 }
-                var fp = EJF_SD.logsig._fingerprint(blockText);
+                var fp = JiTA.logsig._fingerprint(blockText);
                 var defect = (fp.sig && idx.sigMap[fp.sig]) ? idx.sigMap[fp.sig].members[0].key : null;
                 var loose = false;
                 if (!defect && fp.crashSig && idx.crashMap[fp.crashSig]) {   // no exact hit -> same-crash-site fallback
@@ -2988,26 +2988,26 @@ EJF_SD.logsig = {
                 // Mark every block row as scanned; only the anchor (first row) carries the defect key (a '~'
                 // prefix flags a loose crash-site match so a re-pass keeps the right styling).
                 for (var b = 0; b < blockRows.length; b++) {
-                    if (!blockRows[b].getAttribute('data-ejf-sig')) {
-                        blockRows[b].setAttribute('data-ejf-sig', (b === 0 && defect) ? ((loose ? '~' : '') + defect) : '0');
+                    if (!blockRows[b].getAttribute('data-jita-sig')) {
+                        blockRows[b].setAttribute('data-jita-sig', (b === 0 && defect) ? ((loose ? '~' : '') + defect) : '0');
                     }
                 }
                 if (defect) { markAnchor(tr, defect, loose); tally(defect, tr, fp.msg, loose); }
                 i = j;
             }
-            EJF_SD.logsig.renderPanel(found);
-        }).catch(function (e) { console.log('[EJF-SD] log signature apply skipped:', e && e.message || e); });
+            JiTA.logsig.renderPanel(found);
+        }).catch(function (e) { console.log('[JiTA-SD] log signature apply skipped:', e && e.message || e); });
     },
 
     // Re-run the log->defect match against the CURRENT (possibly just-synced) signature index. Clears the
-    // per-row data-ejf-sig scan cache first so EVERY exception block is re-fingerprinted - otherwise rows
+    // per-row data-jita-sig scan cache first so EVERY exception block is re-fingerprinted - otherwise rows
     // marked '0' (no match) on the first pass would never re-match a defect that has since been synced in.
-    // No-op when no parsed log is open. Called after a sync completes (EJF_SD.sched.markSynced).
+    // No-op when no parsed log is open. Called after a sync completes (JiTA.sched.markSynced).
     rematch: function () {
         if (!document.getElementById('tableContent')) { return; }   // no parsed log open
         var rows = document.querySelectorAll('#tableContent tbody tr');
-        for (var i = 0; i < rows.length; i++) { rows[i].removeAttribute('data-ejf-sig'); }
-        EJF_SD.logsig.applyToTable();
+        for (var i = 0; i < rows.length; i++) { rows[i].removeAttribute('data-jita-sig'); }
+        JiTA.logsig.applyToTable();
     },
 
     // Match a RAW logs.txt (fetched straight from an EBR's attachments, WITHOUT opening it in the parser)
@@ -3019,7 +3019,7 @@ EJF_SD.logsig = {
     // swallow the whole rest of the log (hundreds of unrelated `file.py(NN) func` lines) and the stack
     // signature would never match the clean one in the index. Resolves to { defect -> { defect, count, msg } }.
     matchText: function (text) {
-        return EJF_SD.logsig.ensure().then(function (idx) {
+        return JiTA.logsig.ensure().then(function (idx) {
             var found = {};
             if (!idx || !text) { return found; }
             // Pull the message column out of every record (everything after the 3rd tab); keep prefix-less
@@ -3030,7 +3030,7 @@ EJF_SD.logsig = {
                 messages.push(parts.length >= 4 ? parts.slice(3).join('\t') : lines[li]);
             }
             function tallyBlock(blockText) {
-                var fp = EJF_SD.logsig._fingerprint(blockText);
+                var fp = JiTA.logsig._fingerprint(blockText);
                 var defect = (fp.sig && idx.sigMap[fp.sig]) ? idx.sigMap[fp.sig].members[0].key : null;
                 var loose = false;
                 if (!defect && fp.crashSig && idx.crashMap[fp.crashSig]) {   // no exact hit -> same-crash-site fallback
@@ -3073,61 +3073,61 @@ EJF_SD.logsig = {
     _panelIdx: {},        // defect -> next occurrence index to scroll to (for cycling)
 
     _injectCss: function () {
-        if (EJF_SD.logsig._cssInjected) { return; }
+        if (JiTA.logsig._cssInjected) { return; }
         GM_addStyle('\
-#ejf-logmatch-panel { position: fixed; top: 70px; right: 18px; width: 300px; max-height: 70vh; z-index: 9000;\
+#jita-logmatch-panel { position: fixed; top: 70px; right: 18px; width: 300px; max-height: 70vh; z-index: 9000;\
   background: #1D2125; color: #e6e6e6; border: 1px solid #3a434d; border-radius: 6px; box-shadow: 0 4px 18px rgba(0,0,0,.45);\
   font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif; font-size: 12px; display: flex; flex-direction: column; overflow: hidden; }\
-#ejf-logmatch-head { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: #282d33; cursor: move; user-select: none; }\
-#ejf-logmatch-panel.ejf-logmatch-dragging { opacity: .92; }\
-#ejf-logmatch-title { font-weight: 700; flex: 1; }\
-#ejf-logmatch-collapse { cursor: pointer; padding: 0 4px; font-weight: 700; }\
-#ejf-logmatch-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; }\
-#ejf-logmatch-panel.collapsed #ejf-logmatch-list { display: none; }\
-#ejf-logmatch-panel.ejf-logmatch-up { flex-direction: column-reverse; }\
-.ejf-logmatch-item { padding: 7px 10px; border-bottom: 1px solid #2c333a; cursor: pointer; }\
-.ejf-logmatch-item:hover { background: #22272b; }\
-.ejf-logmatch-item a { color: #4c9aff; font-weight: 700; text-decoration: none; }\
-.ejf-logmatch-item a:hover { text-decoration: underline; }\
-.ejf-logmatch-count { float: right; background: #3a434d; color: #cfd6dd; border-radius: 8px; padding: 0 7px; font-size: 10px; font-weight: 700; }\
-.ejf-logmatch-sig { margin-top: 3px; color: #9aa6b2; font-family: "Courier New",monospace; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }\
-.ejf-logmatch-flash > td { animation: ejfLogFlash 1.5s ease-out; }\
-@keyframes ejfLogFlash { 0%, 25% { background-color: rgba(255,181,71,.6); } 100% { background-color: transparent; } }');
-        EJF_SD.logsig._cssInjected = true;
+#jita-logmatch-head { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: #282d33; cursor: move; user-select: none; }\
+#jita-logmatch-panel.jita-logmatch-dragging { opacity: .92; }\
+#jita-logmatch-title { font-weight: 700; flex: 1; }\
+#jita-logmatch-collapse { cursor: pointer; padding: 0 4px; font-weight: 700; }\
+#jita-logmatch-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; }\
+#jita-logmatch-panel.collapsed #jita-logmatch-list { display: none; }\
+#jita-logmatch-panel.jita-logmatch-up { flex-direction: column-reverse; }\
+.jita-logmatch-item { padding: 7px 10px; border-bottom: 1px solid #2c333a; cursor: pointer; }\
+.jita-logmatch-item:hover { background: #22272b; }\
+.jita-logmatch-item a { color: #4c9aff; font-weight: 700; text-decoration: none; }\
+.jita-logmatch-item a:hover { text-decoration: underline; }\
+.jita-logmatch-count { float: right; background: #3a434d; color: #cfd6dd; border-radius: 8px; padding: 0 7px; font-size: 10px; font-weight: 700; }\
+.jita-logmatch-sig { margin-top: 3px; color: #9aa6b2; font-family: "Courier New",monospace; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }\
+.jita-logmatch-flash > td { animation: jitaLogFlash 1.5s ease-out; }\
+@keyframes jitaLogFlash { 0%, 25% { background-color: rgba(255,181,71,.6); } 100% { background-color: transparent; } }');
+        JiTA.logsig._cssInjected = true;
     },
 
     // Shared styling for cluster member rows + status badges, reused by all three surfaces (the log panel's
     // "+N related" expander, the inline "Same exception" section, and the "Exception clusters" overview).
     _clusterCssInjected: false,
     _injectClusterCss: function () {
-        if (EJF_SD.logsig._clusterCssInjected) { return; }
+        if (JiTA.logsig._clusterCssInjected) { return; }
         GM_addStyle('\
-.ejf-exc-related-toggle { display: inline-block; margin-top: 5px; color: #9aa6b2; font-size: 11px; cursor: pointer; user-select: none; }\
-.ejf-exc-related-toggle:hover { color: #cfd6dd; }\
-.ejf-exc-members { list-style: none; margin: 4px 0 0; padding: 4px 0 0 8px; border-left: 2px solid #2c333a; }\
-.ejf-exc-member { padding: 3px 0; display: flex; align-items: center; gap: 7px; }\
-.ejf-exc-member a { color: #4c9aff; text-decoration: none; font-weight: 700; }\
-.ejf-exc-member a:hover { text-decoration: underline; }\
-.ejf-exc-badge { font-size: 10px; font-weight: 700; border-radius: 8px; padding: 1px 7px; white-space: nowrap; }\
-.ejf-exc-badge.open { background: #3a434d; color: #cfd6dd; }\
-.ejf-exc-badge.fixed { background: #1f3d2e; color: #7fdca4; }\
-.ejf-exc-badge.warn { background: #5a3a1a; color: #ffb547; }\
-.ejf-exc-badge.rel { background: transparent; color: #9aa6b2; border: 1px solid #3a434d; }\
-.ejf-excl-cluster { border-bottom: 1px solid #2c333a; padding: 7px 0; }\
-.ejf-excl-head { display: flex; align-items: center; gap: 8px; cursor: pointer; }\
-.ejf-excl-head:hover .ejf-excl-label { color: #fff; }\
-.ejf-excl-label { flex: 1; font-family: "Courier New",monospace; font-size: 11px; color: #cfd6dd; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }\
+.jita-exc-related-toggle { display: inline-block; margin-top: 5px; color: #9aa6b2; font-size: 11px; cursor: pointer; user-select: none; }\
+.jita-exc-related-toggle:hover { color: #cfd6dd; }\
+.jita-exc-members { list-style: none; margin: 4px 0 0; padding: 4px 0 0 8px; border-left: 2px solid #2c333a; }\
+.jita-exc-member { padding: 3px 0; display: flex; align-items: center; gap: 7px; }\
+.jita-exc-member a { color: #4c9aff; text-decoration: none; font-weight: 700; }\
+.jita-exc-member a:hover { text-decoration: underline; }\
+.jita-exc-badge { font-size: 10px; font-weight: 700; border-radius: 8px; padding: 1px 7px; white-space: nowrap; }\
+.jita-exc-badge.open { background: #3a434d; color: #cfd6dd; }\
+.jita-exc-badge.fixed { background: #1f3d2e; color: #7fdca4; }\
+.jita-exc-badge.warn { background: #5a3a1a; color: #ffb547; }\
+.jita-exc-badge.rel { background: transparent; color: #9aa6b2; border: 1px solid #3a434d; }\
+.jita-excl-cluster { border-bottom: 1px solid #2c333a; padding: 7px 0; }\
+.jita-excl-head { display: flex; align-items: center; gap: 8px; cursor: pointer; }\
+.jita-excl-head:hover .jita-excl-label { color: #fff; }\
+.jita-excl-label { flex: 1; font-family: "Courier New",monospace; font-size: 11px; color: #cfd6dd; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }\
 /* Inline "Same exception" section: flow the members side-by-side (wrapping) to save vertical space. */\
-#ejf-sd-exccluster .ejf-exc-members { display: flex; flex-wrap: wrap; gap: 5px 14px; }\
-#ejf-sd-exccluster .ejf-exc-member { padding: 2px 0; }');
-        EJF_SD.logsig._clusterCssInjected = true;
+#jita-sd-exccluster .jita-exc-members { display: flex; flex-wrap: wrap; gap: 5px 14px; }\
+#jita-sd-exccluster .jita-exc-member { padding: 2px 0; }');
+        JiTA.logsig._clusterCssInjected = true;
     },
 
     // A status badge for a cluster member: "Fixed"/<resolution> (green) when resolved, else <status>/"Open".
     _statusBadgeEl: function (member) {
         var resolved = !!(member.resolution || member.resolutiondate);
         var badge = document.createElement('span');
-        badge.className = 'ejf-exc-badge ' + (resolved ? 'fixed' : 'open');
+        badge.className = 'jita-exc-badge ' + (resolved ? 'fixed' : 'open');
         badge.textContent = resolved ? (member.resolution || 'Fixed') : (member.status || 'Open');
         return badge;
     },
@@ -3137,41 +3137,41 @@ EJF_SD.logsig = {
     // (jQuery) issue/menu surfaces can use it.
     _memberRowEl: function (member, extraEl) {
         var row = document.createElement('div');
-        row.className = 'ejf-exc-member';
+        row.className = 'jita-exc-member';
         var a = document.createElement('a');
         a.href = '/browse/' + member.key;
         a.target = '_blank';
         a.textContent = member.key;
         a.addEventListener('click', function (ev) { ev.stopPropagation(); });
         row.appendChild(a);
-        row.appendChild(EJF_SD.logsig._statusBadgeEl(member));
+        row.appendChild(JiTA.logsig._statusBadgeEl(member));
         if (member.related) {   // crash-site peer (same bug, different call path) - flag it as looser
             var rel = document.createElement('span');
-            rel.className = 'ejf-exc-badge rel';
+            rel.className = 'jita-exc-badge rel';
             rel.textContent = '~ similar';
             rel.title = 'Same crash site, reached via a different call path - possibly related';
             row.appendChild(rel);
         }
         if (extraEl) { row.appendChild(extraEl); }
-        row.addEventListener('mouseenter', function () { EJF_SD.logsig._showDefectTip(member.key, row); });
+        row.addEventListener('mouseenter', function () { JiTA.logsig._showDefectTip(member.key, row); });
         row.addEventListener('mouseleave', function () {
-            EJF_SD.logsig._hoverKey = null;
-            if (EJF_SD.ui && EJF_SD.ui._hideTip) { EJF_SD.ui._hideTip(); }
+            JiTA.logsig._hoverKey = null;
+            if (JiTA.ui && JiTA.ui._hideTip) { JiTA.ui._hideTip(); }
         });
         return row;
     },
 
     // Remove the panel once the log viewer is gone (closed / navigated away). Called from the global observer.
     updateVisibility: function () {
-        var panel = document.getElementById('ejf-logmatch-panel');
+        var panel = document.getElementById('jita-logmatch-panel');
         if (panel && !document.getElementById('tableContent')) { panel.parentNode.removeChild(panel); }
     },
 
     renderPanel: function (found) {
         var keys = Object.keys(found || {});
-        var existing = document.getElementById('ejf-logmatch-panel');
+        var existing = document.getElementById('jita-logmatch-panel');
         if (!keys.length) { if (existing) { existing.parentNode.removeChild(existing); } return; }
-        EJF_SD.logsig._injectCss();
+        JiTA.logsig._injectCss();
 
         // Most-frequent first, then by key for a stable order.
         keys.sort(function (a, b) { return found[b].count - found[a].count || (a < b ? -1 : 1); });
@@ -3179,37 +3179,37 @@ EJF_SD.logsig = {
         var panel = existing;
         if (!panel) {
             panel = document.createElement('div');
-            panel.id = 'ejf-logmatch-panel';
+            panel.id = 'jita-logmatch-panel';
             document.body.appendChild(panel);
         }
         panel.innerHTML = '';
-        EJF_SD.logsig._panelIdx = {};
+        JiTA.logsig._panelIdx = {};
 
         var collapsed = false;
-        collapsed = !!gmGet(EJF_SD.logsig.COLLAPSE_KEY, false);
+        collapsed = !!gmGet(JiTA.logsig.COLLAPSE_KEY, false);
         panel.className = collapsed ? 'collapsed' : '';
 
         var head = document.createElement('div');
-        head.id = 'ejf-logmatch-head';
+        head.id = 'jita-logmatch-head';
         var title = document.createElement('span');
-        title.id = 'ejf-logmatch-title';
+        title.id = 'jita-logmatch-title';
         title.textContent = 'Defects in log · ' + keys.length;
         head.appendChild(title);
         var collapse = document.createElement('span');
-        collapse.id = 'ejf-logmatch-collapse';
+        collapse.id = 'jita-logmatch-collapse';
         collapse.title = 'Collapse / expand';
         collapse.textContent = collapsed ? '+' : '–';
         head.appendChild(collapse);
         panel.appendChild(head);
 
         var listEl = document.createElement('ul');
-        listEl.id = 'ejf-logmatch-list';
+        listEl.id = 'jita-logmatch-list';
         panel.appendChild(listEl);
 
         keys.forEach(function (key) {
             var entry = found[key];
             var li = document.createElement('li');
-            li.className = 'ejf-logmatch-item';
+            li.className = 'jita-logmatch-item';
             li.title = 'Click to scroll to an occurrence of ' + key + (entry.rows.length > 1 ? ' (click again for the next)' : '');
 
             // The "main" row content (key + count + signature). The hover preview for THIS defect is bound to
@@ -3217,7 +3217,7 @@ EJF_SD.logsig = {
             // re-fires mouseenter and re-shows the main defect's preview (a <li> mouseenter would not, since
             // the pointer never actually left the <li>).
             var mainEl = document.createElement('div');
-            mainEl.className = 'ejf-logmatch-main';
+            mainEl.className = 'jita-logmatch-main';
 
             var a = document.createElement('a');
             a.href = '/browse/' + key;
@@ -3227,13 +3227,13 @@ EJF_SD.logsig = {
             mainEl.appendChild(a);
 
             var badge = document.createElement('span');
-            badge.className = 'ejf-logmatch-count';
+            badge.className = 'jita-logmatch-count';
             badge.textContent = entry.count + '×';
             mainEl.appendChild(badge);
 
             if (entry.loose) {   // matched only by crash site (no exact stack match) - flag it as looser
                 var lt = document.createElement('span');
-                lt.className = 'ejf-logmatch-count';   // reuse the pill, but muted + transparent
+                lt.className = 'jita-logmatch-count';   // reuse the pill, but muted + transparent
                 lt.style.background = 'transparent';
                 lt.style.color = '#9aa6b2';
                 lt.style.marginRight = '6px';
@@ -3244,36 +3244,36 @@ EJF_SD.logsig = {
 
             if (entry.raw) {
                 var sig = document.createElement('div');
-                sig.className = 'ejf-logmatch-sig';
+                sig.className = 'jita-logmatch-sig';
                 sig.textContent = entry.raw;
                 mainEl.appendChild(sig);
             }
 
             // Hover preview: show what the defect is about (same styled card as the Similar Defects panel).
-            mainEl.addEventListener('mouseenter', function () { EJF_SD.logsig._showDefectTip(key, mainEl); });
+            mainEl.addEventListener('mouseenter', function () { JiTA.logsig._showDefectTip(key, mainEl); });
             mainEl.addEventListener('mouseleave', function () {
-                EJF_SD.logsig._hoverKey = null;
-                if (EJF_SD.ui && EJF_SD.ui._hideTip) { EJF_SD.ui._hideTip(); }
+                JiTA.logsig._hoverKey = null;
+                if (JiTA.ui && JiTA.ui._hideTip) { JiTA.ui._hideTip(); }
             });
             li.appendChild(mainEl);
 
             // The rest of this defect's cluster - every OTHER defect that reported the same exception - behind
             // a "+N related" expander, so a known logged exception shows all its variants, not just one.
             if (entry.cluster && entry.cluster.length) {
-                EJF_SD.logsig._injectClusterCss();
+                JiTA.logsig._injectClusterCss();
                 var members = document.createElement('div');
-                members.className = 'ejf-exc-members';
+                members.className = 'jita-exc-members';
                 members.style.display = 'none';
-                entry.cluster.forEach(function (m) { members.appendChild(EJF_SD.logsig._memberRowEl(m)); });
+                entry.cluster.forEach(function (m) { members.appendChild(JiTA.logsig._memberRowEl(m)); });
                 var toggle = document.createElement('div');
-                toggle.className = 'ejf-exc-related-toggle';
+                toggle.className = 'jita-exc-related-toggle';
                 toggle.textContent = '+' + entry.cluster.length + ' related ▸';
                 toggle.addEventListener('click', function (ev) {
                     ev.stopPropagation();   // don't trigger the row's scroll-to-occurrence
                     var open = members.style.display === 'none';
                     members.style.display = open ? '' : 'none';
                     toggle.textContent = '+' + entry.cluster.length + ' related ' + (open ? '▾' : '▸');
-                    EJF_SD.logsig._fitVertical(panel);
+                    JiTA.logsig._fitVertical(panel);
                 });
                 li.appendChild(toggle);
                 li.appendChild(members);
@@ -3282,13 +3282,13 @@ EJF_SD.logsig = {
             li.addEventListener('click', function () {
                 var rowsArr = entry.rows;
                 if (!rowsArr.length) { return; }
-                var i = EJF_SD.logsig._panelIdx[key] || 0;
+                var i = JiTA.logsig._panelIdx[key] || 0;
                 if (i >= rowsArr.length) { i = 0; }              // wrap around
-                EJF_SD.logsig._panelIdx[key] = i + 1;
+                JiTA.logsig._panelIdx[key] = i + 1;
                 var target = rowsArr[i];
                 target.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                target.classList.add('ejf-logmatch-flash');
-                setTimeout(function () { target.classList.remove('ejf-logmatch-flash'); }, 1500);
+                target.classList.add('jita-logmatch-flash');
+                setTimeout(function () { target.classList.remove('jita-logmatch-flash'); }, 1500);
             });
 
             listEl.appendChild(li);
@@ -3298,12 +3298,12 @@ EJF_SD.logsig = {
             ev.stopPropagation();
             var isCollapsed = panel.classList.toggle('collapsed');
             collapse.textContent = isCollapsed ? '+' : '–';
-            gmSet(EJF_SD.logsig.COLLAPSE_KEY, isCollapsed);
-            EJF_SD.logsig._fitVertical(panel);   // on expand, grow upward if there's no room below
+            gmSet(JiTA.logsig.COLLAPSE_KEY, isCollapsed);
+            JiTA.logsig._fitVertical(panel);   // on expand, grow upward if there's no room below
         });
 
-        EJF_SD.logsig._applyPos(panel);
-        EJF_SD.logsig._makeDraggable(panel, head, collapse);
+        JiTA.logsig._applyPos(panel);
+        JiTA.logsig._makeDraggable(panel, head, collapse);
     },
 
     // Hover preview for a panel entry: look up the defect in the local DB and show the SAME styled card the
@@ -3313,18 +3313,18 @@ EJF_SD.logsig = {
     _defCache: {},
     _hoverKey: null,
     _showDefectTip: function (key, anchor) {
-        if (!EJF_SD.ui || !EJF_SD.ui._showTip) { return; }
-        EJF_SD.logsig._hoverKey = key;
+        if (!JiTA.ui || !JiTA.ui._showTip) { return; }
+        JiTA.logsig._hoverKey = key;
         var show = function (rec) {
-            if (EJF_SD.logsig._hoverKey !== key) { return; }   // mouse already left before the read returned
+            if (JiTA.logsig._hoverKey !== key) { return; }   // mouse already left before the read returned
             rec = rec || { key: key };
             var meta = rec.status || '';
             if (rec.resolution) { meta += (meta ? ' · ' : '') + rec.resolution; }
-            EJF_SD.ui._showTip({ key: rec.key || key, summary: rec.summary, description: rec.description }, anchor, meta);
+            JiTA.ui._showTip({ key: rec.key || key, summary: rec.summary, description: rec.description }, anchor, meta);
         };
-        if (Object.prototype.hasOwnProperty.call(EJF_SD.logsig._defCache, key)) { show(EJF_SD.logsig._defCache[key]); return; }
-        EJF_SD.db.getDefect(key).then(function (rec) {
-            EJF_SD.logsig._defCache[key] = rec || null;
+        if (Object.prototype.hasOwnProperty.call(JiTA.logsig._defCache, key)) { show(JiTA.logsig._defCache[key]); return; }
+        JiTA.db.getDefect(key).then(function (rec) {
+            JiTA.logsig._defCache[key] = rec || null;
             show(rec);
         }, function () { show(null); });
     },
@@ -3332,7 +3332,7 @@ EJF_SD.logsig = {
     // Restore a saved {left, top}, clamped on-screen (same approach as the Similar Defects panel).
     _applyPos: function (panel) {
         var pos = null;
-        pos = gmGet(EJF_SD.logsig.POS_KEY, null);
+        pos = gmGet(JiTA.logsig.POS_KEY, null);
         if (!pos || typeof pos.left !== 'number' || typeof pos.top !== 'number') { return; }
         var w = panel.offsetWidth || 300, h = panel.offsetHeight || 60;
         var left = Math.min(Math.max(0, pos.left), Math.max(0, window.innerWidth - w));
@@ -3341,8 +3341,8 @@ EJF_SD.logsig = {
         panel.style.top = top + 'px';
         panel.style.right = 'auto';
         panel.style.bottom = 'auto';
-        panel._ejfTop = top;              // remember the intended top so _fitVertical can re-anchor on expand
-        EJF_SD.logsig._fitVertical(panel);
+        panel._jitaTop = top;              // remember the intended top so _fitVertical can re-anchor on expand
+        JiTA.logsig._fitVertical(panel);
     },
 
     // Keep the (expanded) panel on-screen vertically (same "drop-up" approach as the Similar Defects panel):
@@ -3351,34 +3351,34 @@ EJF_SD.logsig = {
     // when we manage the position via top (dragged / restored), not in the default placement.
     _fitVertical: function (panel) {
         if (!panel) { return; }
-        if (typeof panel._ejfTop !== 'number') { return; }
+        if (typeof panel._jitaTop !== 'number') { return; }
         if (panel.classList.contains('collapsed')) {
-            panel.classList.remove('ejf-logmatch-up');
+            panel.classList.remove('jita-logmatch-up');
             panel.style.maxHeight = '';
             panel.style.bottom = 'auto';
-            panel.style.top = panel._ejfTop + 'px';
+            panel.style.top = panel._jitaTop + 'px';
             return;
         }
         var margin = 8, vh = window.innerHeight;
-        panel.classList.remove('ejf-logmatch-up');
+        panel.classList.remove('jita-logmatch-up');
         panel.style.maxHeight = '';
         panel.style.bottom = 'auto';
-        panel.style.top = panel._ejfTop + 'px';
-        var headEl = document.getElementById('ejf-logmatch-head');
+        panel.style.top = panel._jitaTop + 'px';
+        var headEl = document.getElementById('jita-logmatch-head');
         var headerH = headEl ? headEl.offsetHeight : 34;
         var fullH = panel.offsetHeight;
-        if (panel._ejfTop + fullH <= vh - margin) { return; }   // fits growing down -> keep normal layout
-        var headerBottom = panel._ejfTop + headerH;
+        if (panel._jitaTop + fullH <= vh - margin) { return; }   // fits growing down -> keep normal layout
+        var headerBottom = panel._jitaTop + headerH;
         panel.style.top = 'auto';
         panel.style.bottom = (vh - headerBottom) + 'px';
         panel.style.maxHeight = Math.max(80, Math.min(Math.round(vh * 0.70), headerBottom - margin)) + 'px';
-        panel.classList.add('ejf-logmatch-up');
+        panel.classList.add('jita-logmatch-up');
     },
 
     // Drag by the header; persist the dropped position. The collapse control is excluded so it still toggles.
     _makeDraggable: function (panel, head, collapse) {
         var dragging = false, startX = 0, startY = 0, baseLeft = 0, baseTop = 0;
-        // We drag by the HEADER's intended top (panel._ejfTop) and let _fitVertical decide, on every move,
+        // We drag by the HEADER's intended top (panel._jitaTop) and let _fitVertical decide, on every move,
         // whether the list grows down (room below) or flips to "drop-up" (no room) - so the flip happens
         // live while dragging, not only on release. We clamp the header top by the header height (not the
         // full panel height) so the header can be moved right down to the bottom edge to trigger drop-up.
@@ -3390,20 +3390,20 @@ EJF_SD.logsig = {
             var top = Math.min(Math.max(0, baseTop + (e.clientY - startY)), Math.max(0, window.innerHeight - headerH));
             panel.style.left = left + 'px';
             panel.style.right = 'auto';
-            panel._ejfTop = top;                 // _fitVertical sets top/bottom from this (anchor or drop-up)
-            EJF_SD.logsig._fitVertical(panel);
+            panel._jitaTop = top;                 // _fitVertical sets top/bottom from this (anchor or drop-up)
+            JiTA.logsig._fitVertical(panel);
             e.preventDefault();
         }
         function onUp() {
             if (!dragging) { return; }
             dragging = false;
-            panel.classList.remove('ejf-logmatch-dragging');
+            panel.classList.remove('jita-logmatch-dragging');
             document.removeEventListener('mousemove', onMove, true);
             document.removeEventListener('mouseup', onUp, true);
             var rect = panel.getBoundingClientRect();
-            var top = (typeof panel._ejfTop === 'number') ? panel._ejfTop : Math.round(rect.top);
-            gmSet(EJF_SD.logsig.POS_KEY, { left: Math.round(rect.left), top: top });
-            EJF_SD.logsig._fitVertical(panel);
+            var top = (typeof panel._jitaTop === 'number') ? panel._jitaTop : Math.round(rect.top);
+            gmSet(JiTA.logsig.POS_KEY, { left: Math.round(rect.left), top: top });
+            JiTA.logsig._fitVertical(panel);
         }
         head.addEventListener('mousedown', function (e) {
             if (e.which && e.which !== 1) { return; }            // left button only
@@ -3412,10 +3412,10 @@ EJF_SD.logsig = {
             // so the header tracks the cursor and _fitVertical re-evaluates up/down on every move.
             var hTop = head.getBoundingClientRect().top;
             baseLeft = panel.getBoundingClientRect().left; baseTop = hTop;
-            panel._ejfTop = hTop;
+            panel._jitaTop = hTop;
             startX = e.clientX; startY = e.clientY;
             dragging = true;
-            panel.classList.add('ejf-logmatch-dragging');
+            panel.classList.add('jita-logmatch-dragging');
             document.addEventListener('mousemove', onMove, true);
             document.addEventListener('mouseup', onUp, true);
             e.preventDefault();
@@ -3425,7 +3425,7 @@ EJF_SD.logsig = {
 
 
 /* ---- utilities ---- */
-EJF_SD.util = {
+JiTA.util = {
     // djb2 string hash -> short hex; used to detect whether an issue's TEXT changed (vs. metadata only)
     hash: function (str) {
         var h = 5381, i = str.length;
@@ -3518,10 +3518,10 @@ EJF_SD.util = {
     // True when a Team value is "EO - GameMasters". Matches the full id, the short numeric id ('38'), or any
     // "<prefix>-38" form, so it's robust to whichever shape the API / a stored record carries.
     isGmTeam: function (v) {
-        var id = EJF_SD.util.teamId(v);
+        var id = JiTA.util.teamId(v);
         if (!id) { return false; }
-        var short = String(EJF_SD.GM_TEAM_ID).split('-').pop();   // '38' - the short numeric team id
-        return id === EJF_SD.GM_TEAM_ID || id === short || id.slice(-(short.length + 1)) === ('-' + short);
+        var short = String(JiTA.GM_TEAM_ID).split('-').pop();   // '38' - the short numeric team id
+        return id === JiTA.GM_TEAM_ID || id === short || id.slice(-(short.length + 1)) === ('-' + short);
     },
 
     // Stale-match demotion factor. A defect that was FIXED long before this bug report was even filed is
@@ -3566,7 +3566,7 @@ EJF_SD.util = {
    storage (NOT IndexedDB) on purpose: GM values survive a script auto-update, whereas a DB rebuild/migration
    could wipe the store. Shape: { issueKey: expiryEpochMs }. The ranking layer skips hidden keys so they never
    take a result slot, and each entry auto-expires (lazily pruned) once its window passes. */
-EJF_SD.hidden = {
+JiTA.hidden = {
     KEY: 'sdHidden',     // GM flag holding the { key: expiryMs } map
     MAX_DAYS: 90,
     _map: null,          // in-memory cache of the parsed GM map (null = not loaded yet)
@@ -3580,21 +3580,21 @@ EJF_SD.hidden = {
     ],
 
     _load: function () {
-        if (EJF_SD.hidden._map) { return EJF_SD.hidden._map; }
+        if (JiTA.hidden._map) { return JiTA.hidden._map; }
         var m = {};
-        m = gmGet(EJF_SD.hidden.KEY, {}) || {};
+        m = gmGet(JiTA.hidden.KEY, {}) || {};
         if (!m || typeof m !== 'object') { m = {}; }
-        EJF_SD.hidden._map = m;
+        JiTA.hidden._map = m;
         return m;
     },
 
     _persist: function () {
-        gmSet(EJF_SD.hidden.KEY, EJF_SD.hidden._map || {});
+        gmSet(JiTA.hidden.KEY, JiTA.hidden._map || {});
     },
 
     // Drop expired entries from the in-memory map; returns true if anything was removed.
     _prune: function () {
-        var m = EJF_SD.hidden._load(), now = Date.now(), changed = false;
+        var m = JiTA.hidden._load(), now = Date.now(), changed = false;
         for (var k in m) {
             if (Object.prototype.hasOwnProperty.call(m, k) && !(m[k] > now)) { delete m[k]; changed = true; }
         }
@@ -3605,28 +3605,28 @@ EJF_SD.hidden = {
     // _prune()/count(), called when the settings menu opens or a hide is added).
     isHidden: function (key) {
         if (!key) { return false; }
-        var exp = EJF_SD.hidden._load()[key];
+        var exp = JiTA.hidden._load()[key];
         return !!exp && exp > Date.now();
     },
 
     hide: function (key, days) {
         if (!key) { return; }
-        var d = Math.max(1, Math.min(EJF_SD.hidden.MAX_DAYS, parseInt(days, 10) || 0));
-        var m = EJF_SD.hidden._load();
+        var d = Math.max(1, Math.min(JiTA.hidden.MAX_DAYS, parseInt(days, 10) || 0));
+        var m = JiTA.hidden._load();
         m[key] = Date.now() + d * 24 * 60 * 60 * 1000;
-        EJF_SD.hidden._prune();
-        EJF_SD.hidden._persist();
+        JiTA.hidden._prune();
+        JiTA.hidden._persist();
     },
 
     clear: function () {
-        EJF_SD.hidden._map = {};
-        EJF_SD.hidden._persist();
+        JiTA.hidden._map = {};
+        JiTA.hidden._persist();
     },
 
     // Count of currently-active (non-expired) hidden issues; prunes+persists any that have lapsed.
     count: function () {
-        if (EJF_SD.hidden._prune()) { EJF_SD.hidden._persist(); }
-        var m = EJF_SD.hidden._load(), n = 0;
+        if (JiTA.hidden._prune()) { JiTA.hidden._persist(); }
+        var m = JiTA.hidden._load(), n = 0;
         for (var k in m) { if (Object.prototype.hasOwnProperty.call(m, k)) { n++; } }
         return n;
     }
@@ -3635,11 +3635,11 @@ EJF_SD.hidden = {
 
 /* ---- canned ("default") responses repository (Zendesk Support panel) ----
    A small repository of reusable reply texts, surfaced as a dropdown in the Zendesk Support activity panel -
-   which renders inside a cross-origin Forge iframe (see EJF_IS_FORGE_FRAME). Picking one REPLACES the comment
+   which renders inside a cross-origin Forge iframe (see JITA_IS_FORGE_FRAME). Picking one REPLACES the comment
    editor's content. Ships a built-in default set; the list is editable from the settings menu and persisted in
    GM storage (shared across frames, survives script updates). */
-EJF_SD.responses = {
-    GM_KEY: 'ejfCannedResponses',
+JiTA.responses = {
+    GM_KEY: 'ejfCannedResponses',   // legacy storage key kept as-is (renaming would drop users' saved responses)
     DEFAULTS: [
         { title: 'Support Ticket - General', body: 'We do appreciate you taking the time to contact us. The information for this issue is likely best submitted as a support ticket. I have already assigned this issue to Customer Support. In the future, should you wish to do so, that can be done at the following location: https://support.eveonline.com/hc/requests/new' },
         { title: 'Support Ticket - General (Alternative)', body: 'Thank you for your bug report. Unfortunately it appears that this issue is for our Customer Support department. Please resubmit your issue as a support ticket via the following link: https://support.eveonline.com/hc/requests/new' },
@@ -3689,9 +3689,9 @@ EJF_SD.responses = {
     // deletion. (A default whose wording changed in a script update will look "edited" here - Restore
     // defaults clears the overlay if you want the fresh text.)
     _legacyToOverlay: function (arr) {
-        var defs = EJF_SD.responses.DEFAULTS, dByTitle = {}, i;
+        var defs = JiTA.responses.DEFAULTS, dByTitle = {}, i;
         for (i = 0; i < defs.length; i++) { dByTitle[defs[i].title] = defs[i]; }
-        var ov = EJF_SD.responses._emptyOverlay(), present = {};
+        var ov = JiTA.responses._emptyOverlay(), present = {};
         for (i = 0; i < arr.length; i++) {
             var r = arr[i] || {}, d = dByTitle[r.title];
             if (d) {
@@ -3709,25 +3709,25 @@ EJF_SD.responses = {
     // well-formed { overrides, deleted, added }.
     _overlay: function () {
         var raw = null;
-        raw = gmGet(EJF_SD.responses.GM_KEY, null);
-        if (!raw) { return EJF_SD.responses._emptyOverlay(); }
-        if (EJF_SD.responses._isArr(raw)) {                 // legacy full snapshot -> migrate once
-            var ov = EJF_SD.responses._legacyToOverlay(raw);
-            EJF_SD.responses._saveOverlay(ov);
+        raw = gmGet(JiTA.responses.GM_KEY, null);
+        if (!raw) { return JiTA.responses._emptyOverlay(); }
+        if (JiTA.responses._isArr(raw)) {                 // legacy full snapshot -> migrate once
+            var ov = JiTA.responses._legacyToOverlay(raw);
+            JiTA.responses._saveOverlay(ov);
             return ov;
         }
         if (typeof raw === 'object') {
             return {
                 overrides: (raw.overrides && typeof raw.overrides === 'object') ? raw.overrides : {},
-                deleted: EJF_SD.responses._isArr(raw.deleted) ? raw.deleted : [],
-                added: EJF_SD.responses._isArr(raw.added) ? raw.added : []
+                deleted: JiTA.responses._isArr(raw.deleted) ? raw.deleted : [],
+                added: JiTA.responses._isArr(raw.added) ? raw.added : []
             };
         }
-        return EJF_SD.responses._emptyOverlay();
+        return JiTA.responses._emptyOverlay();
     },
 
     _saveOverlay: function (ov) {
-        gmSet(EJF_SD.responses.GM_KEY, { v: 2, overrides: ov.overrides || {}, deleted: ov.deleted || [], added: ov.added || [] });
+        gmSet(JiTA.responses.GM_KEY, { v: 2, overrides: ov.overrides || {}, deleted: ov.deleted || [], added: ov.added || [] });
     },
 
     // The effective list = DEFAULTS (minus deletions, with overrides applied) + user additions. Each item is
@@ -3735,7 +3735,7 @@ EJF_SD.responses = {
     // default from an edit; added items have no `_orig`. New defaults from a script update appear automatically
     // (they're in DEFAULTS, not deleted, not overridden).
     load: function () {
-        var defs = EJF_SD.responses.DEFAULTS, ov = EJF_SD.responses._overlay(), i;
+        var defs = JiTA.responses.DEFAULTS, ov = JiTA.responses._overlay(), i;
         var del = {};
         for (i = 0; i < ov.deleted.length; i++) { del[ov.deleted[i]] = true; }
         var usedOverride = {}, out = [];
@@ -3762,9 +3762,9 @@ EJF_SD.responses = {
     // with no `_orig` -> an addition; a default with no surviving row -> a deletion.
     save: function (rows) {
         rows = rows || [];
-        var defs = EJF_SD.responses.DEFAULTS, dByTitle = {}, i;
+        var defs = JiTA.responses.DEFAULTS, dByTitle = {}, i;
         for (i = 0; i < defs.length; i++) { dByTitle[defs[i].title] = defs[i]; }
-        var ov = EJF_SD.responses._emptyOverlay(), present = {};
+        var ov = JiTA.responses._emptyOverlay(), present = {};
         for (i = 0; i < rows.length; i++) {
             var r = rows[i] || {}, orig = (r._orig === undefined || r._orig === null) ? null : r._orig;
             var d = (orig != null) ? dByTitle[orig] : null;
@@ -3778,31 +3778,31 @@ EJF_SD.responses = {
             }
         }
         for (i = 0; i < defs.length; i++) { if (!present[defs[i].title]) { ov.deleted.push(defs[i].title); } }
-        EJF_SD.responses._saveOverlay(ov);
+        JiTA.responses._saveOverlay(ov);
     },
 
     // Restore the built-in defaults (clears the whole overlay so load() returns pure DEFAULTS).
     reset: function () {
-        gmSet(EJF_SD.responses.GM_KEY, null);
+        gmSet(JiTA.responses.GM_KEY, null);
     },
 
     // Optional opening + closing lines the user configures once (e.g. "Greetings Capsuleer," /
     // "Thank you and fly safe o7"). They are wrapped around EVERY picked response on insert, so the canned
     // bodies stay greeting-free and reusable. Persisted in GM (shared across frames, survive script updates);
     // either can be left blank to skip it.
-    OPENER_KEY: 'ejfRespOpener',
-    CLOSING_KEY: 'ejfRespClosing',
-    loadOpener: function () { return gmGet(EJF_SD.responses.OPENER_KEY, '') || ''; },
-    loadClosing: function () { return gmGet(EJF_SD.responses.CLOSING_KEY, '') || ''; },
+    OPENER_KEY: 'ejfRespOpener',   // legacy storage key kept as-is for backward compat
+    CLOSING_KEY: 'ejfRespClosing',   // legacy storage key kept as-is for backward compat
+    loadOpener: function () { return gmGet(JiTA.responses.OPENER_KEY, '') || ''; },
+    loadClosing: function () { return gmGet(JiTA.responses.CLOSING_KEY, '') || ''; },
     saveAffixes: function (opener, closing) {
-        gmSet(EJF_SD.responses.OPENER_KEY, opener || '');
-        gmSet(EJF_SD.responses.CLOSING_KEY, closing || '');
+        gmSet(JiTA.responses.OPENER_KEY, opener || '');
+        gmSet(JiTA.responses.CLOSING_KEY, closing || '');
     },
 
     // Wrap `body` with the configured opener / closing, each on its own line (a single line break after the
     // greeting and before the closing line; omitted when blank).
     _compose: function (body) {
-        var opener = EJF_SD.responses.loadOpener(), closing = EJF_SD.responses.loadClosing();
+        var opener = JiTA.responses.loadOpener(), closing = JiTA.responses.loadClosing();
         var parts = [];
         if (opener) { parts.push(opener); }
         parts.push(body || '');
@@ -3812,39 +3812,39 @@ EJF_SD.responses = {
 
     // Standalone, roomier editor for the canned responses, opened by the settings menu's "Customize
     // responses" button (the menu itself just shows that button + Restore defaults now, so it stays compact).
-    // Reuses the settings-menu overlay chrome (#ejf-menu-overlay / #ejf-menu) widened via .ejf-menu-wide, and
-    // the same .ejf-resp-* row styling. Edits persist to GM (shared across frames, survive script updates).
+    // Reuses the settings-menu overlay chrome (#jita-menu-overlay / #jita-menu) widened via .jita-menu-wide, and
+    // the same .jita-resp-* row styling. Edits persist to GM (shared across frames, survive script updates).
     _editorCssInjected: false,
     _injectEditorCss: function () {
-        if (EJF_SD.responses._editorCssInjected) { return; }
+        if (JiTA.responses._editorCssInjected) { return; }
         // Flex column layout so the header + the action footer stay pinned while only the middle scrolls,
         // plus collapsible section groups and collapsible response rows (body hidden until the row is opened).
-        try { GM_addStyle('#ejf-menu.ejf-menu-wide { width: 560px; max-width: 92vw; display: flex; flex-direction: column; overflow: hidden; }\
-#ejf-menu.ejf-menu-wide .ejf-menu-head { flex: 0 0 auto; }\
-#ejf-menu .ejf-resp-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 4px 14px 10px; }\
-#ejf-menu .ejf-resp-foot { flex: 0 0 auto; display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 14px; border-top: 1px solid #3a434d; background: #282d33; }\
-#ejf-menu .ejf-resp-subhead { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: #7a8694; margin: 12px 0 4px; }\
-#ejf-menu .ejf-resp-affix { display: flex; flex-direction: column; gap: 6px; padding: 2px 0 4px; }\
-#ejf-menu .ejf-resp-caret { color: #9aa6b2; font-size: 10px; width: 12px; flex: 0 0 auto; text-align: center; }\
-#ejf-menu .ejf-resp-group { border: 1px solid #2c333a; border-radius: 6px; margin-bottom: 8px; overflow: hidden; }\
-#ejf-menu .ejf-resp-group-head { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: #22272b; cursor: pointer; user-select: none; font-weight: 700; font-size: 12px; }\
-#ejf-menu .ejf-resp-group-head:hover { background: #262c31; }\
-#ejf-menu .ejf-resp-group-head .ejf-resp-gname { flex: 1 1 auto; }\
-#ejf-menu .ejf-resp-group-head .ejf-resp-gcount { color: #7a8694; font-weight: 400; font-size: 11px; }\
-#ejf-menu .ejf-resp-gadd { flex: 0 0 auto; font-size: 11px; font-weight: 400; color: #9aa6b2; background: #2c333a; border: 1px solid #3a434d; border-radius: 4px; padding: 2px 8px; cursor: pointer; }\
-#ejf-menu .ejf-resp-gadd:hover { color: #fff; border-color: #4c9aff; }\
-#ejf-menu .ejf-resp-gdel { flex: 0 0 auto; width: 22px; height: 22px; line-height: 1; font-size: 16px; color: #9aa6b2; background: transparent; border: 1px solid #3a434d; border-radius: 4px; cursor: pointer; }\
-#ejf-menu .ejf-resp-gdel:hover { color: #fff; background: #5a2a2a; border-color: #a85a5a; }\
-#ejf-menu .ejf-resp-group.collapsed .ejf-resp-group-body { display: none; }\
-#ejf-menu .ejf-resp-group-body { padding: 6px 8px; display: flex; flex-direction: column; gap: 6px; }\
-#ejf-menu .ejf-resp-item { display: block; position: static; padding: 0; margin: 0; gap: 0; border: 1px solid #2c333a; border-radius: 6px; overflow: hidden; }\
-#ejf-menu .ejf-resp-item-head { display: flex; align-items: center; gap: 6px; padding: 6px 6px 6px 8px; background: #14181b; cursor: pointer; }\
-#ejf-menu .ejf-resp-item .ejf-resp-title { flex: 1 1 auto; padding: 5px 8px; cursor: text; }\
-#ejf-menu .ejf-resp-del { position: static; width: 22px; height: 22px; flex: 0 0 auto; }\
-#ejf-menu .ejf-resp-item-body { padding: 6px 8px; }\
-#ejf-menu .ejf-resp-item.collapsed .ejf-resp-item-body { display: none; }\
-#ejf-menu .ejf-resp-item .ejf-resp-body { width: 100%; box-sizing: border-box; }'); } catch (e) { /* ignore */ }
-        EJF_SD.responses._editorCssInjected = true;
+        try { GM_addStyle('#jita-menu.jita-menu-wide { width: 560px; max-width: 92vw; display: flex; flex-direction: column; overflow: hidden; }\
+#jita-menu.jita-menu-wide .jita-menu-head { flex: 0 0 auto; }\
+#jita-menu .jita-resp-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 4px 14px 10px; }\
+#jita-menu .jita-resp-foot { flex: 0 0 auto; display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 14px; border-top: 1px solid #3a434d; background: #282d33; }\
+#jita-menu .jita-resp-subhead { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: #7a8694; margin: 12px 0 4px; }\
+#jita-menu .jita-resp-affix { display: flex; flex-direction: column; gap: 6px; padding: 2px 0 4px; }\
+#jita-menu .jita-resp-caret { color: #9aa6b2; font-size: 10px; width: 12px; flex: 0 0 auto; text-align: center; }\
+#jita-menu .jita-resp-group { border: 1px solid #2c333a; border-radius: 6px; margin-bottom: 8px; overflow: hidden; }\
+#jita-menu .jita-resp-group-head { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: #22272b; cursor: pointer; user-select: none; font-weight: 700; font-size: 12px; }\
+#jita-menu .jita-resp-group-head:hover { background: #262c31; }\
+#jita-menu .jita-resp-group-head .jita-resp-gname { flex: 1 1 auto; }\
+#jita-menu .jita-resp-group-head .jita-resp-gcount { color: #7a8694; font-weight: 400; font-size: 11px; }\
+#jita-menu .jita-resp-gadd { flex: 0 0 auto; font-size: 11px; font-weight: 400; color: #9aa6b2; background: #2c333a; border: 1px solid #3a434d; border-radius: 4px; padding: 2px 8px; cursor: pointer; }\
+#jita-menu .jita-resp-gadd:hover { color: #fff; border-color: #4c9aff; }\
+#jita-menu .jita-resp-gdel { flex: 0 0 auto; width: 22px; height: 22px; line-height: 1; font-size: 16px; color: #9aa6b2; background: transparent; border: 1px solid #3a434d; border-radius: 4px; cursor: pointer; }\
+#jita-menu .jita-resp-gdel:hover { color: #fff; background: #5a2a2a; border-color: #a85a5a; }\
+#jita-menu .jita-resp-group.collapsed .jita-resp-group-body { display: none; }\
+#jita-menu .jita-resp-group-body { padding: 6px 8px; display: flex; flex-direction: column; gap: 6px; }\
+#jita-menu .jita-resp-item { display: block; position: static; padding: 0; margin: 0; gap: 0; border: 1px solid #2c333a; border-radius: 6px; overflow: hidden; }\
+#jita-menu .jita-resp-item-head { display: flex; align-items: center; gap: 6px; padding: 6px 6px 6px 8px; background: #14181b; cursor: pointer; }\
+#jita-menu .jita-resp-item .jita-resp-title { flex: 1 1 auto; padding: 5px 8px; cursor: text; }\
+#jita-menu .jita-resp-del { position: static; width: 22px; height: 22px; flex: 0 0 auto; }\
+#jita-menu .jita-resp-item-body { padding: 6px 8px; }\
+#jita-menu .jita-resp-item.collapsed .jita-resp-item-body { display: none; }\
+#jita-menu .jita-resp-item .jita-resp-body { width: 100%; box-sizing: border-box; }'); } catch (e) { /* ignore */ }
+        JiTA.responses._editorCssInjected = true;
     },
 
     // Section name for a response, derived from its title prefix ("Support Ticket - General" -> "Support
@@ -3862,46 +3862,46 @@ EJF_SD.responses = {
     },
 
     openEditor: function () {
-        EJF_SD.responses._injectEditorCss();
-        var ov = EJF_SD.menu._openOverlay({ title: 'Customize responses', wide: true });
+        JiTA.responses._injectEditorCss();
+        var ov = JiTA.menu._openOverlay({ title: 'Customize responses', wide: true });
         var $menu = ov.$menu, closeEditor = ov.close;
         // Scrollable middle region (header + footer stay pinned via the flex layout in _injectEditorCss).
-        var $scroll = $('<div class="ejf-resp-scroll"></div>').appendTo($menu);
-        $('<div class="ejf-menu-status">These appear in the dropdown in the Zendesk Support panel; picking one replaces the comment editor.</div>').appendTo($scroll);
+        var $scroll = $('<div class="jita-resp-scroll"></div>').appendTo($menu);
+        $('<div class="jita-menu-status">These appear in the dropdown in the Zendesk Support panel; picking one replaces the comment editor.</div>').appendTo($scroll);
         // Opening / closing lines wrapped around EVERY inserted response (left blank = skipped).
-        $('<div class="ejf-resp-subhead">Opening &amp; closing</div>').appendTo($scroll);
-        $('<div class="ejf-menu-status" style="padding:0 0 6px;">Added around every response on insert. Leave blank to skip.</div>').appendTo($scroll);
-        var $affix = $('<div class="ejf-resp-affix"></div>').appendTo($scroll);
+        $('<div class="jita-resp-subhead">Opening &amp; closing</div>').appendTo($scroll);
+        $('<div class="jita-menu-status" style="padding:0 0 6px;">Added around every response on insert. Leave blank to skip.</div>').appendTo($scroll);
+        var $affix = $('<div class="jita-resp-affix"></div>').appendTo($scroll);
         // Textareas (not single-line inputs) so the opener / closing can themselves span multiple lines.
-        var $openerIn = $('<textarea class="ejf-resp-body" rows="2" placeholder="Opening line - e.g. Greetings Capsuleer,"></textarea>').val(EJF_SD.responses.loadOpener()).appendTo($affix);
-        var $closingIn = $('<textarea class="ejf-resp-body" rows="2" placeholder="Closing line - e.g. Thank you and fly safe o7"></textarea>').val(EJF_SD.responses.loadClosing()).appendTo($affix);
-        $('<div class="ejf-resp-subhead">Responses</div>').appendTo($scroll);
-        var $groups = $('<div class="ejf-resp-groups"></div>').appendTo($scroll);
+        var $openerIn = $('<textarea class="jita-resp-body" rows="2" placeholder="Opening line - e.g. Greetings Capsuleer,"></textarea>').val(JiTA.responses.loadOpener()).appendTo($affix);
+        var $closingIn = $('<textarea class="jita-resp-body" rows="2" placeholder="Closing line - e.g. Thank you and fly safe o7"></textarea>').val(JiTA.responses.loadClosing()).appendTo($affix);
+        $('<div class="jita-resp-subhead">Responses</div>').appendTo($scroll);
+        var $groups = $('<div class="jita-resp-groups"></div>').appendTo($scroll);
 
         // Re-count each section header from the rows it currently holds (after add / delete).
         function updateCounts() {
-            $groups.children('.ejf-resp-group').each(function () {
-                var $g = $(this), n = $g.find('.ejf-resp-item').length;
-                $g.find('.ejf-resp-gcount').text(n + (n === 1 ? ' response' : ' responses'));
+            $groups.children('.jita-resp-group').each(function () {
+                var $g = $(this), n = $g.find('.jita-resp-item').length;
+                $g.find('.jita-resp-gcount').text(n + (n === 1 ? ' response' : ' responses'));
             });
         }
 
         // A collapsible response row: only the title bar shows by default; clicking it (anywhere but the title
         // input or the delete button) toggles the body textarea open for editing.
         function respRow(item, expanded) {
-            var $row = $('<div class="ejf-resp-item' + (expanded ? '' : ' collapsed') + '"></div>');
+            var $row = $('<div class="jita-resp-item' + (expanded ? '' : ' collapsed') + '"></div>');
             if (item && item._orig != null) { $row.attr('data-orig', item._orig); }   // provenance: which default this row derives from (so Save can diff)
-            var $head = $('<div class="ejf-resp-item-head"></div>');
-            var $caret = $('<span class="ejf-resp-caret"></span>').text(expanded ? '▾' : '▸');
-            var $title = $('<input type="text" class="ejf-resp-title" placeholder="Title">').val((item && item.title) || '');
-            var $del = $('<button class="ejf-resp-del" title="Remove">×</button>');
+            var $head = $('<div class="jita-resp-item-head"></div>');
+            var $caret = $('<span class="jita-resp-caret"></span>').text(expanded ? '▾' : '▸');
+            var $title = $('<input type="text" class="jita-resp-title" placeholder="Title">').val((item && item.title) || '');
+            var $del = $('<button class="jita-resp-del" title="Remove">×</button>');
             $head.append($caret).append($title).append($del);
-            var $body = $('<div class="ejf-resp-item-body"></div>');
-            $('<textarea class="ejf-resp-body" rows="6" placeholder="Response text"></textarea>').val((item && item.body) || '').appendTo($body);
+            var $body = $('<div class="jita-resp-item-body"></div>');
+            $('<textarea class="jita-resp-body" rows="6" placeholder="Response text"></textarea>').val((item && item.body) || '').appendTo($body);
             $row.append($head).append($body);
             function toggle() { $caret.text($row.toggleClass('collapsed').hasClass('collapsed') ? '▸' : '▾'); }
             $head.on('click', function (e) {
-                if ($(e.target).is('input') || $(e.target).closest('.ejf-resp-del').length) { return; }
+                if ($(e.target).is('input') || $(e.target).closest('.jita-resp-del').length) { return; }
                 toggle();
             });
             $del.on('click', function (e) { e.stopPropagation(); $row.remove(); updateCounts(); });
@@ -3914,13 +3914,13 @@ EJF_SD.responses = {
         var groupBodies = {};
         function ensureGroup(name) {
             if (groupBodies[name]) { return groupBodies[name]; }
-            var $g = $('<div class="ejf-resp-group collapsed"></div>');   // sections start collapsed
-            var $gh = $('<div class="ejf-resp-group-head"></div>');
-            var $gcaret = $('<span class="ejf-resp-caret"></span>').text('▸');
-            var $gadd = $('<button class="ejf-resp-gadd" title="Add a response to this section">+ Add</button>');
-            var $gdel = $('<button class="ejf-resp-gdel" title="Delete this section and all its responses">×</button>');
-            $gh.append($gcaret).append($('<span class="ejf-resp-gname"></span>').text(name)).append($('<span class="ejf-resp-gcount"></span>')).append($gadd).append($gdel);
-            var $gb = $('<div class="ejf-resp-group-body"></div>');
+            var $g = $('<div class="jita-resp-group collapsed"></div>');   // sections start collapsed
+            var $gh = $('<div class="jita-resp-group-head"></div>');
+            var $gcaret = $('<span class="jita-resp-caret"></span>').text('▸');
+            var $gadd = $('<button class="jita-resp-gadd" title="Add a response to this section">+ Add</button>');
+            var $gdel = $('<button class="jita-resp-gdel" title="Delete this section and all its responses">×</button>');
+            $gh.append($gcaret).append($('<span class="jita-resp-gname"></span>').text(name)).append($('<span class="jita-resp-gcount"></span>')).append($gadd).append($gdel);
+            var $gb = $('<div class="jita-resp-group-body"></div>');
             $gh.on('click', function () { $gcaret.text($g.toggleClass('collapsed').hasClass('collapsed') ? '▸' : '▾'); });
             // The "Other" bucket isn't a real prefix, so its new rows start title-less; named sections prefill
             // "<name> - " so the saved title keeps the row in this section (sections are derived from the title).
@@ -3928,7 +3928,7 @@ EJF_SD.responses = {
             // Delete the whole section (and every response in it). Confirm only when it actually holds rows.
             $gdel.on('click', function (e) {
                 e.stopPropagation();
-                var n = $gb.find('.ejf-resp-item').length;
+                var n = $gb.find('.jita-resp-item').length;
                 if (n && !confirm('Delete the "' + name + '" section and its ' + n + ' response' + (n === 1 ? '' : 's') + '?')) { return; }
                 $g.remove();
                 delete groupBodies[name];
@@ -3944,13 +3944,13 @@ EJF_SD.responses = {
         // control (per-section headers, the footer "Add response", and "Add section").
         function addRowTo(name, prefill) {
             var $gb = ensureGroup(name);
-            $gb.closest('.ejf-resp-group').removeClass('collapsed')
-               .find('.ejf-resp-group-head .ejf-resp-caret').first().text('▾');
+            $gb.closest('.jita-resp-group').removeClass('collapsed')
+               .find('.jita-resp-group-head .jita-resp-caret').first().text('▾');
             var $row = respRow(prefill ? { title: prefill, body: '' } : null, true);
             $gb.append($row);
             updateCounts();
             $row[0].scrollIntoView({ block: 'nearest' });
-            var $t = $row.find('.ejf-resp-title').focus();
+            var $t = $row.find('.jita-resp-title').focus();
             var el = $t[0];
             if (el && el.setSelectionRange) { var L = (el.value || '').length; try { el.setSelectionRange(L, L); } catch (e) { /* ignore */ } }
             return $row;
@@ -3959,14 +3959,14 @@ EJF_SD.responses = {
         function fillRows(list) {
             $groups.empty();
             groupBodies = {};
-            (list || []).forEach(function (it) { ensureGroup(EJF_SD.responses._sectionOf(it.title)).append(respRow(it, false)); });
+            (list || []).forEach(function (it) { ensureGroup(JiTA.responses._sectionOf(it.title)).append(respRow(it, false)); });
             updateCounts();
         }
-        fillRows(EJF_SD.responses.load());
+        fillRows(JiTA.responses.load());
 
         // Pinned action footer (always visible regardless of scroll position).
-        var $foot = $('<div class="ejf-resp-foot"></div>').appendTo($menu);
-        $('<button class="ejf-btn">Add section</button>')
+        var $foot = $('<div class="jita-resp-foot"></div>').appendTo($menu);
+        $('<button class="jita-btn">Add section</button>')
             .on('click', function () {
                 var name = (prompt('New section name (e.g. "Support Ticket", "Defect"):', '') || '').trim();
                 if (!name) { return; }
@@ -3975,28 +3975,28 @@ EJF_SD.responses = {
                 // Add the first response straight into the new section (prefix prefilled so it sticks there).
                 addRowTo(name, name + ' - ');
             }).appendTo($foot);
-        $('<button class="ejf-btn">Save</button>')
+        $('<button class="jita-btn">Save</button>')
             .on('click', function () {
                 var list = [];
-                $groups.find('.ejf-resp-item').each(function () {
+                $groups.find('.jita-resp-item').each(function () {
                     var $i = $(this);
-                    var t = ($i.find('.ejf-resp-title').val() || '').trim();
-                    var b = $i.find('.ejf-resp-body').val() || '';
+                    var t = ($i.find('.jita-resp-title').val() || '').trim();
+                    var b = $i.find('.jita-resp-body').val() || '';
                     if (t || b.trim()) {
                         var orig = $i.attr('data-orig');
                         list.push({ title: t || 'Untitled', body: b, _orig: (orig === undefined ? null : orig) });
                     }
                 });
-                EJF_SD.responses.save(list);
-                EJF_SD.responses.saveAffixes(($openerIn.val() || '').trim(), ($closingIn.val() || '').trim());
-                EJF_SD.ui.toast('Saved ' + list.length + ' canned response' + (list.length === 1 ? '' : 's') + '.');
+                JiTA.responses.save(list);
+                JiTA.responses.saveAffixes(($openerIn.val() || '').trim(), ($closingIn.val() || '').trim());
+                JiTA.ui.toast('Saved ' + list.length + ' canned response' + (list.length === 1 ? '' : 's') + '.');
                 closeEditor();
             }).appendTo($foot);
-        $('<button class="ejf-btn">Restore defaults</button>')
+        $('<button class="jita-btn">Restore defaults</button>')
             .on('click', function () {
                 if (!confirm('Restore the built-in default responses? Your custom edits will be lost.')) { return; }
-                EJF_SD.responses.reset();
-                fillRows(EJF_SD.responses.load());
+                JiTA.responses.reset();
+                fillRows(JiTA.responses.load());
             }).appendTo($foot);
     },
 
@@ -4009,7 +4009,7 @@ EJF_SD.responses = {
     // never clears), which is why the text landed in the wrong field AND why the post-success poll misfired.
     _composerEditor: function () {
         var SEL = 'div.ProseMirror[contenteditable="true"], [role="textbox"][contenteditable="true"]';
-        var anchor = document.getElementById('ejf-resp-col');
+        var anchor = document.getElementById('jita-resp-col');
         for (var node = anchor && anchor.parentNode; node && node.querySelector; node = node.parentNode) {
             var cand = node.querySelector(SEL);
             if (cand) { return cand; }   // nearest enclosing editor == the Zendesk panel's compose box
@@ -4018,7 +4018,7 @@ EJF_SD.responses = {
     },
 
     apply: function (body) {
-        var ed = EJF_SD.responses._composerEditor();
+        var ed = JiTA.responses._composerEditor();
         if (!ed) { return false; }
         ed.focus();
         try {
@@ -4048,10 +4048,10 @@ EJF_SD.responses = {
     // Populate (or repopulate) the dropdown's <option>s from the repository. Guarded by a signature so a
     // re-inject during the user's interaction doesn't clobber an in-progress selection.
     _fill: function (sel) {
-        var list = EJF_SD.responses.load();
+        var list = JiTA.responses.load();
         var sig = list.map(function (r) { return r.title; }).join('');
-        if (sel.getAttribute('data-ejf-sig') !== sig) {
-        sel.setAttribute('data-ejf-sig', sig);
+        if (sel.getAttribute('data-jita-sig') !== sig) {
+        sel.setAttribute('data-jita-sig', sig);
         sel.innerHTML = '';
         // Explicit dark colors on every option / optgroup so the native popup is readable in Chrome (which
         // otherwise paints unstyled options on a white system background).
@@ -4064,26 +4064,26 @@ EJF_SD.responses = {
         // Group into <optgroup>s by section (derived from the title prefix), showing the short tail inside.
         var groups = {};
         for (var i = 0; i < list.length; i++) {
-            var sec = EJF_SD.responses._sectionOf(list[i].title);
+            var sec = JiTA.responses._sectionOf(list[i].title);
             var grp = groups[sec];
             if (!grp) { grp = groups[sec] = document.createElement('optgroup'); grp.label = sec; grp.style.cssText = OPT_CSS; sel.appendChild(grp); }
             var o = document.createElement('option');
             o.value = String(i);
-            o.textContent = EJF_SD.responses._titleTail(list[i].title) || ('Response ' + (i + 1));
+            o.textContent = JiTA.responses._titleTail(list[i].title) || ('Response ' + (i + 1));
             o.style.cssText = OPT_CSS;
             grp.appendChild(o);
         }
         sel.value = '';
         }
-        EJF_SD.responses._setDisplay(list);
+        JiTA.responses._setDisplay(list);
     },
 
     // Reset the (cloned react-select) display text back to the placeholder. The dropdown is an ACTION menu, so
     // after each pick it returns to the placeholder rather than showing the last choice. No-op on the fallback
     // path (a plain <select> shows its own option text).
     _setDisplay: function (list) {
-        var v = document.querySelector('[data-ejf-respval]');
-        if (v) { v.textContent = (list || EJF_SD.responses.load()).length ? 'Insert a response…' : 'No responses configured'; }
+        var v = document.querySelector('[data-jita-respval]');
+        if (v) { v.textContent = (list || JiTA.responses.load()).length ? 'Insert a response…' : 'No responses configured'; }
     },
 
     // Switch the Zendesk composer to its "Add public reply" tab (it defaults to "Add internal note"). The
@@ -4105,17 +4105,17 @@ EJF_SD.responses = {
     // switching tabs swaps in the public-reply editor instance; a short delay lets React mount it before we
     // write into it (the editor lookup in apply() then targets the now-active public-reply box).
     _onPick: function () {
-        var sel = document.getElementById('ejf-resp-select');
+        var sel = document.getElementById('jita-resp-select');
         if (!sel) { return; }
         var i = parseInt(sel.value, 10);
-        var list = EJF_SD.responses.load();
+        var list = JiTA.responses.load();
         if (!isNaN(i) && list[i]) {
-            var body = EJF_SD.responses._compose(list[i].body);   // wrap with the configured opener / closing
-            var switched = EJF_SD.responses._selectPublicReply();
-            setTimeout(function () { EJF_SD.responses.apply(body); }, switched ? 80 : 0);
+            var body = JiTA.responses._compose(list[i].body);   // wrap with the configured opener / closing
+            var switched = JiTA.responses._selectPublicReply();
+            setTimeout(function () { JiTA.responses.apply(body); }, switched ? 80 : 0);
         }
         sel.value = '';
-        EJF_SD.responses._setDisplay(list);
+        JiTA.responses._setDisplay(list);
     },
 
     // True once a react-select column has finished rendering its chrome (the styled control box + the chevron
@@ -4139,12 +4139,12 @@ EJF_SD.responses = {
         if (!srcLabel || !srcLabel.parentNode || !srcLabel.parentNode.parentNode) { return; }
         var srcCol = srcLabel.parentNode;                  // the subdomain-select column (label + react-select)
         var row = srcCol.parentNode;                       // flex row holding the subdomain + ticket columns
-        var sel = document.getElementById('ejf-resp-select');
-        if (!document.getElementById('ejf-resp-col')) {
-            if (!EJF_SD.responses._ready(srcCol)) { return; }   // wait for the source select to finish rendering
-            sel = EJF_SD.responses._build(srcCol, row);
+        var sel = document.getElementById('jita-resp-select');
+        if (!document.getElementById('jita-resp-col')) {
+            if (!JiTA.responses._ready(srcCol)) { return; }   // wait for the source select to finish rendering
+            sel = JiTA.responses._build(srcCol, row);
         }
-        if (sel) { EJF_SD.responses._fill(sel); }
+        if (sel) { JiTA.responses._fill(sel); }
     },
 
     // Build the dropdown column. Preferred path: CLONE the source react-select column (the subdomain selector)
@@ -4155,7 +4155,7 @@ EJF_SD.responses = {
         var sel = null, i;
         try {
             var col = srcCol.cloneNode(true);
-            col.id = 'ejf-resp-col';
+            col.id = 'jita-resp-col';
             col.style.marginLeft = '4px';
             var lbl = col.querySelector('label');
             if (lbl) { lbl.textContent = 'Insert default response'; lbl.removeAttribute('for'); }
@@ -4175,35 +4175,35 @@ EJF_SD.responses = {
             }
             var inputs = col.querySelectorAll('input');
             for (i = 0; i < inputs.length; i++) { if (inputs[i].parentNode) { inputs[i].parentNode.removeChild(inputs[i]); } }
-            if (valEl) { valEl.setAttribute('data-ejf-respval', '1'); valEl.textContent = 'Insert a response…'; }
+            if (valEl) { valEl.setAttribute('data-jita-respval', '1'); valEl.textContent = 'Insert a response…'; }
             box.style.position = 'relative';
             sel = document.createElement('select');
-            sel.id = 'ejf-resp-select';
+            sel.id = 'jita-resp-select';
             // The control box is opacity:0 (the cloned react-select chrome shows through), but Chrome draws
             // the NATIVE option popup from the <select>'s OWN colors - a transparent background makes that
             // popup render white. So give it a real dark background + color-scheme:dark; opacity:0 keeps the
             // box itself invisible, while the popup picks up the dark palette.
             sel.style.cssText = 'position:absolute; top:0; left:0; width:100%; height:100%; margin:0; padding:0; border:0; background:#1d2125; color:#e6e6e6; color-scheme:dark; opacity:0; cursor:pointer; z-index:2;';
-            sel.addEventListener('change', EJF_SD.responses._onPick);
+            sel.addEventListener('change', JiTA.responses._onPick);
             box.appendChild(sel);
             row.appendChild(col);
             return sel;
         } catch (e) {
             // Fallback: a plain styled select that approximates the native look.
-            if (document.getElementById('ejf-resp-col')) { return document.getElementById('ejf-resp-select'); }
+            if (document.getElementById('jita-resp-col')) { return document.getElementById('jita-resp-select'); }
             var fcol = document.createElement('div');
-            fcol.id = 'ejf-resp-col';
+            fcol.id = 'jita-resp-col';
             fcol.style.cssText = 'display:flex; flex-direction:column; margin-left:4px; min-width:220px; max-width:320px; box-sizing:border-box;';
             var flbl = document.createElement('label');
             flbl.textContent = 'Insert default response';
             flbl.style.cssText = 'font-size:12px; font-weight:600; color:var(--ds-text-subtle,#8c9bab); margin-bottom:4px;';
             fcol.appendChild(flbl);
             sel = document.createElement('select');
-            sel.id = 'ejf-resp-select';
+            sel.id = 'jita-resp-select';
             sel.style.cssText = 'height:40px; box-sizing:border-box; padding:0 8px; border-radius:3px;' +
                 ' border:1px solid var(--ds-border-input,#8590a2); background:var(--ds-surface,#22272b);' +
                 ' color:var(--ds-text,#c7d1db); color-scheme:dark; font-size:14px; outline:none; cursor:pointer;';
-            sel.addEventListener('change', EJF_SD.responses._onPick);
+            sel.addEventListener('change', JiTA.responses._onPick);
             fcol.appendChild(sel);
             row.appendChild(fcol);
             return sel;
@@ -4213,7 +4213,7 @@ EJF_SD.responses = {
 
 
 /* ---- storage layer: IndexedDB ---- */
-EJF_SD.db = {
+JiTA.db = {
     _db: null,
     _frame: null,
 
@@ -4226,15 +4226,15 @@ EJF_SD.db = {
     // stay attached for the lifetime of every DB connection (removing it would close the connection), so we
     // create it once and cache it. Falls back to the (possibly gated) main-window APIs if the iframe trick fails.
     _win: function () {
-        if (EJF_SD.db._frame && EJF_SD.db._frame.contentWindow && EJF_SD.db._frame.contentWindow.indexedDB) {
-            return EJF_SD.db._frame.contentWindow;
+        if (JiTA.db._frame && JiTA.db._frame.contentWindow && JiTA.db._frame.contentWindow.indexedDB) {
+            return JiTA.db._frame.contentWindow;
         }
         try {
             var f = document.createElement('iframe');
             f.style.display = 'none';
             f.setAttribute('aria-hidden', 'true');
             (document.documentElement || document.body).appendChild(f);
-            if (f.contentWindow && f.contentWindow.indexedDB) { EJF_SD.db._frame = f; return f.contentWindow; }
+            if (f.contentWindow && f.contentWindow.indexedDB) { JiTA.db._frame = f; return f.contentWindow; }
             if (f.parentNode) { f.parentNode.removeChild(f); }
         } catch (e) { /* fall through to the main window */ }
         return window;
@@ -4242,13 +4242,13 @@ EJF_SD.db = {
     // Native IDBFactory + IDBKeyRange from the pristine iframe realm (see _win). Use these EVERYWHERE instead
     // of window.indexedDB / IDBKeyRange, and keep the key-range from the SAME realm as the connection so a
     // cross-realm IDBKeyRange isn't rejected.
-    _idb: function () { return EJF_SD.db._win().indexedDB || window.indexedDB; },
-    _keyRange: function () { return EJF_SD.db._win().IDBKeyRange || window.IDBKeyRange; },
+    _idb: function () { return JiTA.db._win().indexedDB || window.indexedDB; },
+    _keyRange: function () { return JiTA.db._win().IDBKeyRange || window.IDBKeyRange; },
 
     open: function () {
-        if (EJF_SD.db._db) { return Promise.resolve(EJF_SD.db._db); }
+        if (JiTA.db._db) { return Promise.resolve(JiTA.db._db); }
         return new Promise(function (resolve, reject) {
-            var req = EJF_SD.db._idb().open(EJF_SD.DB_NAME, EJF_SD.DB_VERSION);
+            var req = JiTA.db._idb().open(JiTA.DB_NAME, JiTA.DB_VERSION);
             req.onupgradeneeded = function (e) {
                 var db = e.target.result;
                 if (!db.objectStoreNames.contains('defects')) {
@@ -4261,22 +4261,22 @@ EJF_SD.db = {
                     db.createObjectStore('meta', { keyPath: 'k' });
                 }
             };
-            req.onsuccess = function (e) { EJF_SD.db._db = e.target.result; resolve(EJF_SD.db._db); };
+            req.onsuccess = function (e) { JiTA.db._db = e.target.result; resolve(JiTA.db._db); };
             req.onerror = function (e) { reject(e.target.error); };
         });
     },
 
     _store: function (name, mode) {
-        return EJF_SD.db._db.transaction(name, mode).objectStore(name);
+        return JiTA.db._db.transaction(name, mode).objectStore(name);
     },
 
     // Open the DB, run a single IDBRequest built by mkReq(objectStore), and resolve mapRes(request.result)
     // (or undefined when mapRes is omitted). Collapses the identical open->Promise->onsuccess/onerror shape
     // shared by getDefect / allDefects / countDefects / countByProject / getMeta / setMeta.
     _req: function (name, mode, mkReq, mapRes) {
-        return EJF_SD.db.open().then(function () {
+        return JiTA.db.open().then(function () {
             return new Promise(function (resolve, reject) {
-                var r = mkReq(EJF_SD.db._store(name, mode));
+                var r = mkReq(JiTA.db._store(name, mode));
                 r.onsuccess = function () { resolve(mapRes ? mapRes(r.result) : undefined); };
                 r.onerror = function (e) { reject(e.target.error); };
             });
@@ -4286,7 +4286,7 @@ EJF_SD.db = {
     // Open the DB and run one readwrite transaction that applies `apply(store, item)` to every item, resolving
     // with the item count once the transaction commits. Shared by bulkPut / deleteDefects (empty -> resolve 0).
     _bulkTx: function (items, apply) {
-        return EJF_SD.db.open().then(function (db) {
+        return JiTA.db.open().then(function (db) {
             return new Promise(function (resolve, reject) {
                 if (!items || !items.length) { resolve(0); return; }
                 var tx = db.transaction('defects', 'readwrite'), store = tx.objectStore('defects');
@@ -4297,61 +4297,61 @@ EJF_SD.db = {
         });
     },
 
-    bulkPut: function (recs) { return EJF_SD.db._bulkTx(recs, function (store, rec) { store.put(rec); }); },
+    bulkPut: function (recs) { return JiTA.db._bulkTx(recs, function (store, rec) { store.put(rec); }); },
 
-    getDefect: function (key) { return EJF_SD.db._req('defects', 'readonly', function (s) { return s.get(key); }, function (v) { return v || null; }); },
+    getDefect: function (key) { return JiTA.db._req('defects', 'readonly', function (s) { return s.get(key); }, function (v) { return v || null; }); },
 
-    allDefects: function () { return EJF_SD.db._req('defects', 'readonly', function (s) { return s.getAll(); }, function (v) { return v || []; }); },
+    allDefects: function () { return JiTA.db._req('defects', 'readonly', function (s) { return s.getAll(); }, function (v) { return v || []; }); },
 
-    countDefects: function () { return EJF_SD.db._req('defects', 'readonly', function (s) { return s.count(); }, function (v) { return v || 0; }); },
+    countDefects: function () { return JiTA.db._req('defects', 'readonly', function (s) { return s.count(); }, function (v) { return v || 0; }); },
 
     // Clear the DEFECT records (EDR/EO) only, preserving any stored open bug reports (EBR). Used by the
     // "Rebuild defect database" action, which must not wipe the separately-synced bug-report dataset.
     clearDefects: function () {
-        return EJF_SD.db.allDefects().then(function (recs) {
+        return JiTA.db.allDefects().then(function (recs) {
             var keys = [];
             for (var i = 0; i < recs.length; i++) { if (recs[i].project !== 'EBR') { keys.push(recs[i].key); } }
-            return EJF_SD.db.deleteDefects(keys);
+            return JiTA.db.deleteDefects(keys);
         });
     },
 
     // Clear ONLY the stored open bug reports (EBR), preserving the defect records. The mirror of
     // clearDefects, used by the "Rebuild BR DB" action.
     clearEbr: function () {
-        return EJF_SD.db.allDefects().then(function (recs) {
+        return JiTA.db.allDefects().then(function (recs) {
             var keys = [];
             for (var i = 0; i < recs.length; i++) { if (recs[i].project === 'EBR') { keys.push(recs[i].key); } }
-            return EJF_SD.db.deleteDefects(keys);
+            return JiTA.db.deleteDefects(keys);
         });
     },
 
     // Delete records by key (used by the EBR incremental sync to drop reports that have since closed).
-    deleteDefects: function (keys) { return EJF_SD.db._bulkTx(keys, function (store, key) { store.delete(key); }); },
+    deleteDefects: function (keys) { return JiTA.db._bulkTx(keys, function (store, key) { store.delete(key); }); },
 
     // Count stored records whose project key === project (e.g. 'EBR'), via the by_project index.
     countByProject: function (project) {
-        return EJF_SD.db._req('defects', 'readonly', function (s) { return s.index('by_project').count(EJF_SD.db._keyRange().only(project)); }, function (v) { return v || 0; });
+        return JiTA.db._req('defects', 'readonly', function (s) { return s.index('by_project').count(JiTA.db._keyRange().only(project)); }, function (v) { return v || 0; });
     },
 
-    countEbr: function () { return EJF_SD.db.countByProject('EBR'); },
+    countEbr: function () { return JiTA.db.countByProject('EBR'); },
 
     // Number of DEFECT records (everything that isn't a bug report). Used by the defect-population checks
     // (sync decisions, "no data yet" messages) so the shared store's EBRs don't make the defect side think
     // it already has data.
     countDefectsOnly: function () {
-        return EJF_SD.db.countDefects().then(function (total) {
-            return EJF_SD.db.countEbr().then(function (ebr) { return total - ebr; });
+        return JiTA.db.countDefects().then(function (total) {
+            return JiTA.db.countEbr().then(function (ebr) { return total - ebr; });
         });
     },
 
-    getMeta: function (k) { return EJF_SD.db._req('meta', 'readonly', function (s) { return s.get(k); }, function (v) { return v ? v.v : null; }); },
+    getMeta: function (k) { return JiTA.db._req('meta', 'readonly', function (s) { return s.get(k); }, function (v) { return v ? v.v : null; }); },
 
-    setMeta: function (k, v) { return EJF_SD.db._req('meta', 'readwrite', function (s) { return s.put({ k: k, v: v }); }); }
+    setMeta: function (k, v) { return JiTA.db._req('meta', 'readwrite', function (s) { return s.put({ k: k, v: v }); }); }
 };
 
 
 /* ---- sync engine ---- */
-EJF_SD.sync = {
+JiTA.sync = {
     running: false,
 
     // POST to a Jira REST endpoint with the session cookie; retries on HTTP 429 honoring Retry-After.
@@ -4359,7 +4359,7 @@ EJF_SD.sync = {
         return new Promise(function (resolve, reject) {
             (function attempt(retries) {
                 $.ajax({
-                    url: EJF_SD.HOST + path,
+                    url: JiTA.HOST + path,
                     type: 'POST',
                     contentType: 'application/json',
                     dataType: 'json',
@@ -4376,7 +4376,7 @@ EJF_SD.sync = {
                         reject(new Error('Jira API ' + path + ' failed: HTTP ' + xhr.status));
                     }
                 });
-            })(EJF_SD.MAX_RETRIES);
+            })(JiTA.MAX_RETRIES);
         });
     },
 
@@ -4384,7 +4384,7 @@ EJF_SD.sync = {
     _mapIssue: function (issue) {
         var f = issue.fields || {};
         var summary = f.summary || '';
-        var description = EJF_SD.util.toPlainText(f.description);
+        var description = JiTA.util.toPlainText(f.description);
         var components = [];
         if (f.components) { for (var i = 0; i < f.components.length; i++) { components.push(f.components[i].name); } }
         return {
@@ -4398,10 +4398,10 @@ EJF_SD.sync = {
             created: f.created || null,                  // when the issue was created (shown in the suggestion row)
             components: components,
             updated: f.updated || '',
-            team: EJF_SD.util.teamId(f.customfield_10001),   // Team field; used to exclude GM-team bug reports
+            team: JiTA.util.teamId(f.customfield_10001),   // Team field; used to exclude GM-team bug reports
             embedding: null,
             embeddingModelVersion: null,
-            textHash: EJF_SD.util.hash(summary + '\n' + description)
+            textHash: JiTA.util.hash(summary + '\n' + description)
         };
     },
 
@@ -4422,14 +4422,14 @@ EJF_SD.sync = {
         var hwKey = 'lastSyncHighWater' + (opts.metaPrefix || '');
 
         function nextPage() {
-            var body = { jql: jql, fields: EJF_SD.FIELDS, maxResults: EJF_SD.PAGE_SIZE };
+            var body = { jql: jql, fields: JiTA.FIELDS, maxResults: JiTA.PAGE_SIZE };
             if (token) { body.nextPageToken = token; }
-            return EJF_SD.sync._apiPost('/rest/api/3/search/jql', body).then(function (r) {
+            return JiTA.sync._apiPost('/rest/api/3/search/jql', body).then(function (r) {
                 var data = r.data || {};
                 var issues = data.issues || [];
                 var recs = [];
                 for (var i = 0; i < issues.length; i++) {
-                    var rec = EJF_SD.sync._mapIssue(issues[i]);
+                    var rec = JiTA.sync._mapIssue(issues[i]);
                     if (rec.updated && rec.updated > maxUpdated) { maxUpdated = rec.updated; }
                     recs.push(rec);
                 }
@@ -4437,7 +4437,7 @@ EJF_SD.sync = {
                 // re-fetch (or a metadata-only update) does not throw away work the embed pass already did.
                 // (For an initial full sync the DB is empty, so these lookups all return null and are cheap.)
                 return Promise.all(recs.map(function (rec) {
-                    return EJF_SD.db.getDefect(rec.key).then(function (old) {
+                    return JiTA.db.getDefect(rec.key).then(function (old) {
                         if (old && old.embedding && old.textHash === rec.textHash) {
                             rec.embedding = old.embedding;
                             rec.embeddingModelVersion = old.embeddingModelVersion;
@@ -4451,34 +4451,34 @@ EJF_SD.sync = {
                     if (opts.pruneResolved) {
                         var keep = [], drop = [];
                         for (var k = 0; k < merged.length; k++) {
-                            if (EJF_SD.util.isClosedStatus(merged[k].status)) { drop.push(merged[k].key); }
+                            if (JiTA.util.isClosedStatus(merged[k].status)) { drop.push(merged[k].key); }
                             else { keep.push(merged[k]); }
                         }
-                        return EJF_SD.db.deleteDefects(drop).then(function () { return EJF_SD.db.bulkPut(keep); });
+                        return JiTA.db.deleteDefects(drop).then(function () { return JiTA.db.bulkPut(keep); });
                     }
-                    return EJF_SD.db.bulkPut(merged);
+                    return JiTA.db.bulkPut(merged);
                 }).then(function () {
                     stored += recs.length;
                     pages++;
                     if (opts.isEbr) {
-                        EJF_SD.rank._dirtyEbr = true;      // EBR keyword index depends on EBR records
-                        EJF_SD.rank._dirtyEbrVec = true;   // ...and the EBR vector index (new/removed reports)
+                        JiTA.rank._dirtyEbr = true;      // EBR keyword index depends on EBR records
+                        JiTA.rank._dirtyEbrVec = true;   // ...and the EBR vector index (new/removed reports)
                     } else {
-                        EJF_SD.rank._dirty = true;
-                        EJF_SD.rank._dirtyVec = true;
-                        if (EJF_SD.logsig) { EJF_SD.logsig._dirty = true; }   // re-mine exception signatures on next log open
+                        JiTA.rank._dirty = true;
+                        JiTA.rank._dirtyVec = true;
+                        if (JiTA.logsig) { JiTA.logsig._dirty = true; }   // re-mine exception signatures on next log open
                     }
                     var nextToken = data.nextPageToken || null;
                     // Persist progress so a reload mid-sync resumes rather than restarting.
-                    return EJF_SD.db.setMeta(resumeKey, (data.isLast || !nextToken) ? null : nextToken)
-                        .then(function () { return EJF_SD.db.setMeta(hwKey, maxUpdated); })
+                    return JiTA.db.setMeta(resumeKey, (data.isLast || !nextToken) ? null : nextToken)
+                        .then(function () { return JiTA.db.setMeta(hwKey, maxUpdated); })
                         .then(function () {
-                            EJF_SD.ui.setStatus('Syncing… ' + stored + ' issues fetched');
+                            JiTA.ui.setStatus('Syncing… ' + stored + ' issues fetched');
                             if (data.isLast || !nextToken) { return { stored: stored, highWater: maxUpdated }; }
                             if (nextToken === token) { throw new Error('nextPageToken did not advance – stopping (Jira API quirk).'); }
                             token = nextToken;
                             var near = (r.xhr.getResponseHeader('X-RateLimit-NearLimit') === 'true');
-                            return EJF_SD.util.delay(near ? EJF_SD.NEAR_LIMIT_DELAY_MS : EJF_SD.PAGE_DELAY_MS).then(nextPage);
+                            return JiTA.util.delay(near ? JiTA.NEAR_LIMIT_DELAY_MS : JiTA.PAGE_DELAY_MS).then(nextPage);
                         });
                 });
             });
@@ -4487,17 +4487,17 @@ EJF_SD.sync = {
     },
 
     fullSync: function () {
-        return EJF_SD.db.getMeta('resumeToken').then(function (rt) {
-            return EJF_SD.db.getMeta('lastSyncHighWater').then(function (hw) {
-                var jql = EJF_SD.SCOPE + ' ORDER BY updated ASC';
-                return EJF_SD.sync._run(jql, { startToken: rt || null, startHighWater: hw || '' }).then(function (res) {
+        return JiTA.db.getMeta('resumeToken').then(function (rt) {
+            return JiTA.db.getMeta('lastSyncHighWater').then(function (hw) {
+                var jql = JiTA.SCOPE + ' ORDER BY updated ASC';
+                return JiTA.sync._run(jql, { startToken: rt || null, startHighWater: hw || '' }).then(function (res) {
                     // A full crawl re-fetched every defect, so the whole dataset now carries the current field
-                    // set - stamp the schema version + build time (read by EJF_SD.migrate to auto-rebuild a
+                    // set - stamp the schema version + build time (read by JiTA.migrate to auto-rebuild a
                     // stale DB, and shown in the settings menu so you can see when the DB was built).
-                    return EJF_SD.db.setMeta('lastFullSyncAt', new Date().toISOString())
-                        .then(function () { return EJF_SD.db.setMeta('modelVersion', EJF_SD.MODEL_VERSION); })
-                        .then(function () { return EJF_SD.db.setMeta('dataVersionDefects', EJF_SD.DATA_VERSION); })
-                        .then(function () { return EJF_SD.db.setMeta('dbBuiltAtDefects', new Date().toISOString()); })
+                    return JiTA.db.setMeta('lastFullSyncAt', new Date().toISOString())
+                        .then(function () { return JiTA.db.setMeta('modelVersion', JiTA.MODEL_VERSION); })
+                        .then(function () { return JiTA.db.setMeta('dataVersionDefects', JiTA.DATA_VERSION); })
+                        .then(function () { return JiTA.db.setMeta('dbBuiltAtDefects', new Date().toISOString()); })
                         .then(function () { return res; });
                 });
             });
@@ -4505,65 +4505,65 @@ EJF_SD.sync = {
     },
 
     incrementalSync: function () {
-        return EJF_SD.db.getMeta('lastSyncHighWater').then(function (hw) {
-            if (!hw) { return EJF_SD.sync.fullSync(); }
-            var since = EJF_SD.util.toJqlTime(hw);
-            if (!since) { return EJF_SD.sync.fullSync(); }
-            var jql = EJF_SD.SCOPE + ' AND updated >= "' + since + '" ORDER BY updated ASC';
-            return EJF_SD.sync._run(jql, { startHighWater: hw });
+        return JiTA.db.getMeta('lastSyncHighWater').then(function (hw) {
+            if (!hw) { return JiTA.sync.fullSync(); }
+            var since = JiTA.util.toJqlTime(hw);
+            if (!since) { return JiTA.sync.fullSync(); }
+            var jql = JiTA.SCOPE + ' AND updated >= "' + since + '" ORDER BY updated ASC';
+            return JiTA.sync._run(jql, { startHighWater: hw });
         });
     },
 
     // Menu entry point: full sync if the DB is empty, otherwise an incremental catch-up.
     syncNow: function () {
-        if (EJF_SD.sync.running) { EJF_SD.ui.toast('A sync is already running…'); return Promise.resolve(); }
-        EJF_SD.sync.running = true;
-        EJF_SD.ui.toast('Starting defect sync…');
-        EJF_SD.ui.setStatus('Starting sync…');
-        return EJF_SD.db.countDefectsOnly().then(function (n) {
-            return n === 0 ? EJF_SD.sync.fullSync() : EJF_SD.sync.incrementalSync();
+        if (JiTA.sync.running) { JiTA.ui.toast('A sync is already running…'); return Promise.resolve(); }
+        JiTA.sync.running = true;
+        JiTA.ui.toast('Starting defect sync…');
+        JiTA.ui.setStatus('Starting sync…');
+        return JiTA.db.countDefectsOnly().then(function (n) {
+            return n === 0 ? JiTA.sync.fullSync() : JiTA.sync.incrementalSync();
         }).then(function (res) {
-            return EJF_SD.db.countDefectsOnly().then(function (total) {
-                EJF_SD.sync.running = false;
-                EJF_SD.ui.toast('Defect sync complete – ' + total + ' defects in local DB.');
-                EJF_SD.ui.setStatus(total + ' defects in database');
-                EJF_SD.sched.markSynced();   // a manual sync also resets the auto-sync 30-min clock
-                if (EJF_SD.ui.currentKey && /^EBR-/.test(EJF_SD.ui.currentKey)) { EJF_SD.ui.scheduleRender(); }   // defect data only affects the EBR (similar defects) view
-                EJF_SD.embed.prepare(true);   // embed new/changed defects in the background (no-op if model unavailable)
+            return JiTA.db.countDefectsOnly().then(function (total) {
+                JiTA.sync.running = false;
+                JiTA.ui.toast('Defect sync complete – ' + total + ' defects in local DB.');
+                JiTA.ui.setStatus(total + ' defects in database');
+                JiTA.sched.markSynced();   // a manual sync also resets the auto-sync 30-min clock
+                if (JiTA.ui.currentKey && /^EBR-/.test(JiTA.ui.currentKey)) { JiTA.ui.scheduleRender(); }   // defect data only affects the EBR (similar defects) view
+                JiTA.embed.prepare(true);   // embed new/changed defects in the background (no-op if model unavailable)
                 return res;
             });
         }).catch(function (e) {
-            EJF_SD.sync.running = false;
-            EJF_SD.db.setMeta('lastError', String(e && e.message || e));
-            EJF_SD.ui.setStatus('Sync error: ' + (e && e.message || e));
+            JiTA.sync.running = false;
+            JiTA.db.setMeta('lastError', String(e && e.message || e));
+            JiTA.ui.setStatus('Sync error: ' + (e && e.message || e));
             alert('Defect sync failed: ' + (e && e.message || e) + '\nReport issues to Schogol :).');
         });
     },
 
     // Wipe the local DB and rebuild from scratch (also used after a model-version change in Phase 2).
     rebuild: function () {
-        if (EJF_SD.sync.running) { EJF_SD.ui.toast('A sync is already running…'); return Promise.resolve(); }
+        if (JiTA.sync.running) { JiTA.ui.toast('A sync is already running…'); return Promise.resolve(); }
         if (!confirm('Rebuild the local defect database from scratch? This re-fetches every EDR/EO/PLAT issue.')) { return Promise.resolve(); }
-        EJF_SD.sync.running = true;
-        EJF_SD.ui.toast('Rebuilding defect database…');
-        return EJF_SD.db.clearDefects()
-            .then(function () { return EJF_SD.db.setMeta('resumeToken', null); })
-            .then(function () { return EJF_SD.db.setMeta('lastSyncHighWater', ''); })
-            .then(function () { EJF_SD.rank._dirty = true; return EJF_SD.sync.fullSync(); })
+        JiTA.sync.running = true;
+        JiTA.ui.toast('Rebuilding defect database…');
+        return JiTA.db.clearDefects()
+            .then(function () { return JiTA.db.setMeta('resumeToken', null); })
+            .then(function () { return JiTA.db.setMeta('lastSyncHighWater', ''); })
+            .then(function () { JiTA.rank._dirty = true; return JiTA.sync.fullSync(); })
             .then(function () {
-                return EJF_SD.db.countByProject('EBR').then(function (ebr) {
-                  return EJF_SD.db.countDefects().then(function (total) {
-                    EJF_SD.sync.running = false;
-                    EJF_SD.ui.toast('Rebuild complete – ' + (total - ebr) + ' defects.');   // EBRs are preserved, exclude them from the count
-                    EJF_SD.sched.markSynced();   // a rebuild also resets the auto-sync 30-min clock
-                    if (EJF_SD.ui.currentKey && /^EBR-/.test(EJF_SD.ui.currentKey)) { EJF_SD.ui.scheduleRender(); }   // defect data only affects the EBR (similar defects) view
-                    EJF_SD.embed.prepare(true);   // re-embed everything in the background
+                return JiTA.db.countByProject('EBR').then(function (ebr) {
+                  return JiTA.db.countDefects().then(function (total) {
+                    JiTA.sync.running = false;
+                    JiTA.ui.toast('Rebuild complete – ' + (total - ebr) + ' defects.');   // EBRs are preserved, exclude them from the count
+                    JiTA.sched.markSynced();   // a rebuild also resets the auto-sync 30-min clock
+                    if (JiTA.ui.currentKey && /^EBR-/.test(JiTA.ui.currentKey)) { JiTA.ui.scheduleRender(); }   // defect data only affects the EBR (similar defects) view
+                    JiTA.embed.prepare(true);   // re-embed everything in the background
                   });
                 });
             })
             .catch(function (e) {
-                EJF_SD.sync.running = false;
-                EJF_SD.ui.setStatus('Rebuild error: ' + (e && e.message || e));
+                JiTA.sync.running = false;
+                JiTA.ui.setStatus('Rebuild error: ' + (e && e.message || e));
                 alert('Rebuild failed: ' + (e && e.message || e));
             });
     },
@@ -4573,26 +4573,26 @@ EJF_SD.sync = {
     // Useful when the open-report set has drifted (closures missed between incremental syncs) and you want
     // a clean re-fetch, since "Sync bug reports now" only ever does an incremental catch-up once populated.
     rebuildEbr: function () {
-        if (EJF_SD.sync.running) { EJF_SD.ui.toast('A sync is already running…'); return Promise.resolve(); }
+        if (JiTA.sync.running) { JiTA.ui.toast('A sync is already running…'); return Promise.resolve(); }
         if (!confirm('Rebuild the local bug report database from scratch? This re-fetches every open EBR.')) { return Promise.resolve(); }
-        EJF_SD.sync.running = true;
-        EJF_SD.ui.toast('Rebuilding bug report database…');
-        return EJF_SD.db.clearEbr()
-            .then(function () { return EJF_SD.db.setMeta('resumeTokenEbr', null); })
-            .then(function () { return EJF_SD.db.setMeta('lastSyncHighWaterEbr', ''); })
-            .then(function () { EJF_SD.rank._dirtyEbr = true; EJF_SD.rank._dirtyEbrVec = true; return EJF_SD.sync.fullSyncEbr(); })
+        JiTA.sync.running = true;
+        JiTA.ui.toast('Rebuilding bug report database…');
+        return JiTA.db.clearEbr()
+            .then(function () { return JiTA.db.setMeta('resumeTokenEbr', null); })
+            .then(function () { return JiTA.db.setMeta('lastSyncHighWaterEbr', ''); })
+            .then(function () { JiTA.rank._dirtyEbr = true; JiTA.rank._dirtyEbrVec = true; return JiTA.sync.fullSyncEbr(); })
             .then(function () {
-                return EJF_SD.db.countEbr().then(function (total) {
-                    EJF_SD.sync.running = false;
-                    EJF_SD.ui.toast('Rebuild complete – ' + total + ' open bug reports.');
-                    EJF_SD.sched.markSynced();   // a rebuild also resets the auto-sync 30-min clock
-                    if (EJF_SD.ui.currentKey && EJF_SD.ui._isReportsKey(EJF_SD.ui.currentKey)) { EJF_SD.ui.scheduleRender(); }   // bug-report data only affects the EDR/EO (matching reports) view
-                    EJF_SD.embed.prepare(true);   // re-embed the bug reports in the background
+                return JiTA.db.countEbr().then(function (total) {
+                    JiTA.sync.running = false;
+                    JiTA.ui.toast('Rebuild complete – ' + total + ' open bug reports.');
+                    JiTA.sched.markSynced();   // a rebuild also resets the auto-sync 30-min clock
+                    if (JiTA.ui.currentKey && JiTA.ui._isReportsKey(JiTA.ui.currentKey)) { JiTA.ui.scheduleRender(); }   // bug-report data only affects the EDR/EO (matching reports) view
+                    JiTA.embed.prepare(true);   // re-embed the bug reports in the background
                 });
             })
             .catch(function (e) {
-                EJF_SD.sync.running = false;
-                EJF_SD.ui.setStatus('Bug report rebuild error: ' + (e && e.message || e));
+                JiTA.sync.running = false;
+                JiTA.ui.setStatus('Bug report rebuild error: ' + (e && e.message || e));
                 alert('Bug report rebuild failed: ' + (e && e.message || e));
             });
     },
@@ -4600,49 +4600,49 @@ EJF_SD.sync = {
     // Re-crawl a whole dataset from scratch WITHOUT clearing it first (unlike rebuild). Resetting the cursors
     // forces a full crawl; because the existing records stay put, _run's "preserve embedding when textHash is
     // unchanged" path keeps every vector while bulkPut overwrites each record with the current field set - so
-    // a newly-added field (e.g. `created`) is backfilled with NO re-embedding. Used by EJF_SD.migrate to
+    // a newly-added field (e.g. `created`) is backfilled with NO re-embedding. Used by JiTA.migrate to
     // upgrade a DB built before a field existed. Single-flight via `running`; quiet (no confirm dialog).
     refetchDefects: function () {
-        if (EJF_SD.sync.running) { return Promise.resolve(); }
-        EJF_SD.sync.running = true;
-        EJF_SD.ui.toast('Updating local defect database to the latest format…');
-        return EJF_SD.db.setMeta('resumeToken', null)
-            .then(function () { return EJF_SD.db.setMeta('lastSyncHighWater', ''); })
-            .then(function () { EJF_SD.rank._dirty = true; EJF_SD.rank._dirtyVec = true; return EJF_SD.sync.fullSync(); })
+        if (JiTA.sync.running) { return Promise.resolve(); }
+        JiTA.sync.running = true;
+        JiTA.ui.toast('Updating local defect database to the latest format…');
+        return JiTA.db.setMeta('resumeToken', null)
+            .then(function () { return JiTA.db.setMeta('lastSyncHighWater', ''); })
+            .then(function () { JiTA.rank._dirty = true; JiTA.rank._dirtyVec = true; return JiTA.sync.fullSync(); })
             .then(function () {
-                return EJF_SD.db.countDefectsOnly().then(function (total) {
-                    EJF_SD.sync.running = false;
-                    EJF_SD.ui.toast('Defect database updated – ' + total + ' defects.');
-                    EJF_SD.sched.markSynced();
-                    if (EJF_SD.ui.currentKey && /^EBR-/.test(EJF_SD.ui.currentKey)) { EJF_SD.ui.scheduleRender(); }
-                    EJF_SD.embed.prepare(true);
+                return JiTA.db.countDefectsOnly().then(function (total) {
+                    JiTA.sync.running = false;
+                    JiTA.ui.toast('Defect database updated – ' + total + ' defects.');
+                    JiTA.sched.markSynced();
+                    if (JiTA.ui.currentKey && /^EBR-/.test(JiTA.ui.currentKey)) { JiTA.ui.scheduleRender(); }
+                    JiTA.embed.prepare(true);
                 });
             })
             .catch(function (e) {
-                EJF_SD.sync.running = false;
-                console.log('[EJF-SD] defect refetch (migration) failed:', e && e.message || e);
+                JiTA.sync.running = false;
+                console.log('[JiTA-SD] defect refetch (migration) failed:', e && e.message || e);
             });
     },
 
     refetchEbr: function () {
-        if (EJF_SD.sync.running) { return Promise.resolve(); }
-        EJF_SD.sync.running = true;
-        EJF_SD.ui.toast('Updating local bug report database to the latest format…');
-        return EJF_SD.db.setMeta('resumeTokenEbr', null)
-            .then(function () { return EJF_SD.db.setMeta('lastSyncHighWaterEbr', ''); })
-            .then(function () { EJF_SD.rank._dirtyEbr = true; EJF_SD.rank._dirtyEbrVec = true; return EJF_SD.sync.fullSyncEbr(); })
+        if (JiTA.sync.running) { return Promise.resolve(); }
+        JiTA.sync.running = true;
+        JiTA.ui.toast('Updating local bug report database to the latest format…');
+        return JiTA.db.setMeta('resumeTokenEbr', null)
+            .then(function () { return JiTA.db.setMeta('lastSyncHighWaterEbr', ''); })
+            .then(function () { JiTA.rank._dirtyEbr = true; JiTA.rank._dirtyEbrVec = true; return JiTA.sync.fullSyncEbr(); })
             .then(function () {
-                return EJF_SD.db.countEbr().then(function (total) {
-                    EJF_SD.sync.running = false;
-                    EJF_SD.ui.toast('Bug report database updated – ' + total + ' open reports.');
-                    EJF_SD.sched.markSynced();
-                    if (EJF_SD.ui.currentKey && EJF_SD.ui._isReportsKey(EJF_SD.ui.currentKey)) { EJF_SD.ui.scheduleRender(); }
-                    EJF_SD.embed.prepare(true);
+                return JiTA.db.countEbr().then(function (total) {
+                    JiTA.sync.running = false;
+                    JiTA.ui.toast('Bug report database updated – ' + total + ' open reports.');
+                    JiTA.sched.markSynced();
+                    if (JiTA.ui.currentKey && JiTA.ui._isReportsKey(JiTA.ui.currentKey)) { JiTA.ui.scheduleRender(); }
+                    JiTA.embed.prepare(true);
                 });
             })
             .catch(function (e) {
-                EJF_SD.sync.running = false;
-                console.log('[EJF-SD] bug report refetch (migration) failed:', e && e.message || e);
+                JiTA.sync.running = false;
+                console.log('[JiTA-SD] bug report refetch (migration) failed:', e && e.message || e);
             });
     },
 
@@ -4651,13 +4651,13 @@ EJF_SD.sync = {
     // and the EBR keyword index as the dirty target. The FULL build uses the open-only scope; the
     // INCREMENTAL pass drops the open-filter and prunes (deletes) reports that have since closed.
     fullSyncEbr: function () {
-        return EJF_SD.db.getMeta('resumeTokenEbr').then(function (rt) {
-            return EJF_SD.db.getMeta('lastSyncHighWaterEbr').then(function (hw) {
-                var jql = EJF_SD.EBR_SCOPE + ' ORDER BY updated ASC';
-                return EJF_SD.sync._run(jql, { startToken: rt || null, startHighWater: hw || '', metaPrefix: 'Ebr', isEbr: true }).then(function (res) {
-                    // Full open-EBR crawl -> stamp the EBR schema version + build time (see fullSync / EJF_SD.migrate).
-                    return EJF_SD.db.setMeta('dataVersionEbr', EJF_SD.DATA_VERSION)
-                        .then(function () { return EJF_SD.db.setMeta('dbBuiltAtEbr', new Date().toISOString()); })
+        return JiTA.db.getMeta('resumeTokenEbr').then(function (rt) {
+            return JiTA.db.getMeta('lastSyncHighWaterEbr').then(function (hw) {
+                var jql = JiTA.EBR_SCOPE + ' ORDER BY updated ASC';
+                return JiTA.sync._run(jql, { startToken: rt || null, startHighWater: hw || '', metaPrefix: 'Ebr', isEbr: true }).then(function (res) {
+                    // Full open-EBR crawl -> stamp the EBR schema version + build time (see fullSync / JiTA.migrate).
+                    return JiTA.db.setMeta('dataVersionEbr', JiTA.DATA_VERSION)
+                        .then(function () { return JiTA.db.setMeta('dbBuiltAtEbr', new Date().toISOString()); })
                         .then(function () { return res; });
                 });
             });
@@ -4665,39 +4665,39 @@ EJF_SD.sync = {
     },
 
     incrementalSyncEbr: function () {
-        return EJF_SD.db.getMeta('lastSyncHighWaterEbr').then(function (hw) {
-            if (!hw) { return EJF_SD.sync.fullSyncEbr(); }
-            var since = EJF_SD.util.toJqlTime(hw);
-            if (!since) { return EJF_SD.sync.fullSyncEbr(); }
+        return JiTA.db.getMeta('lastSyncHighWaterEbr').then(function (hw) {
+            if (!hw) { return JiTA.sync.fullSyncEbr(); }
+            var since = JiTA.util.toJqlTime(hw);
+            if (!since) { return JiTA.sync.fullSyncEbr(); }
             // No open-filter here on purpose: we want updated-but-now-closed reports back so pruneResolved
             // can delete them from the open-report set.
             var jql = 'project = EBR AND updated >= "' + since + '" ORDER BY updated ASC';
-            return EJF_SD.sync._run(jql, { startHighWater: hw, metaPrefix: 'Ebr', pruneResolved: true, isEbr: true });
+            return JiTA.sync._run(jql, { startHighWater: hw, metaPrefix: 'Ebr', pruneResolved: true, isEbr: true });
         });
     },
 
     // Menu entry point for the bug-report dataset: full build if empty, otherwise an incremental catch-up.
     syncEbrNow: function () {
-        if (EJF_SD.sync.running) { EJF_SD.ui.toast('A sync is already running…'); return Promise.resolve(); }
-        EJF_SD.sync.running = true;
-        EJF_SD.ui.toast('Starting bug report sync…');
-        EJF_SD.ui.setStatus('Starting bug report sync…');
-        return EJF_SD.db.countEbr().then(function (n) {
-            return n === 0 ? EJF_SD.sync.fullSyncEbr() : EJF_SD.sync.incrementalSyncEbr();
+        if (JiTA.sync.running) { JiTA.ui.toast('A sync is already running…'); return Promise.resolve(); }
+        JiTA.sync.running = true;
+        JiTA.ui.toast('Starting bug report sync…');
+        JiTA.ui.setStatus('Starting bug report sync…');
+        return JiTA.db.countEbr().then(function (n) {
+            return n === 0 ? JiTA.sync.fullSyncEbr() : JiTA.sync.incrementalSyncEbr();
         }).then(function () {
-            return EJF_SD.db.countEbr().then(function (total) {
-                EJF_SD.sync.running = false;
-                EJF_SD.rank._dirtyEbr = true;
-                EJF_SD.rank._dirtyEbrVec = true;
-                EJF_SD.ui.toast('Bug report sync complete – ' + total + ' open reports in local DB.');
-                EJF_SD.sched.markSynced();   // a manual sync also resets the auto-sync 30-min clock
-                if (EJF_SD.ui.currentKey && EJF_SD.ui._isReportsKey(EJF_SD.ui.currentKey)) { EJF_SD.ui.scheduleRender(); }
-                EJF_SD.embed.prepare(true);   // embed the new/changed bug reports in the background (for hybrid)
+            return JiTA.db.countEbr().then(function (total) {
+                JiTA.sync.running = false;
+                JiTA.rank._dirtyEbr = true;
+                JiTA.rank._dirtyEbrVec = true;
+                JiTA.ui.toast('Bug report sync complete – ' + total + ' open reports in local DB.');
+                JiTA.sched.markSynced();   // a manual sync also resets the auto-sync 30-min clock
+                if (JiTA.ui.currentKey && JiTA.ui._isReportsKey(JiTA.ui.currentKey)) { JiTA.ui.scheduleRender(); }
+                JiTA.embed.prepare(true);   // embed the new/changed bug reports in the background (for hybrid)
             });
         }).catch(function (e) {
-            EJF_SD.sync.running = false;
-            EJF_SD.db.setMeta('lastError', String(e && e.message || e));
-            EJF_SD.ui.setStatus('Bug report sync error: ' + (e && e.message || e));
+            JiTA.sync.running = false;
+            JiTA.db.setMeta('lastError', String(e && e.message || e));
+            JiTA.ui.setStatus('Bug report sync error: ' + (e && e.message || e));
             alert('Bug report sync failed: ' + (e && e.message || e) + '\nReport issues to Schogol :).');
         });
     },
@@ -4706,47 +4706,47 @@ EJF_SD.sync = {
     // dataset, sequentially (each is single-flight via `running`, so we chain them). Each leg shows its own
     // toast / status as before. Guarded up front so a click while a sync is running is a no-op + toast.
     syncAllNow: function () {
-        if (EJF_SD.sync.running) { EJF_SD.ui.toast('A sync is already running…'); return Promise.resolve(); }
-        return EJF_SD.sync.syncNow().then(function () { return EJF_SD.sync.syncEbrNow(); });
+        if (JiTA.sync.running) { JiTA.ui.toast('A sync is already running…'); return Promise.resolve(); }
+        return JiTA.sync.syncNow().then(function () { return JiTA.sync.syncEbrNow(); });
     },
 
     // Quiet background catch-up used by the auto-sync scheduler. BOTH datasets AUTO-INITIALIZE on the first
     // run (full build when the DB is empty) and then run incremental catch-ups: DEFECTS (EDR/EO) and OPEN
     // BUG REPORTS (EBRs). No start/finish toasts; re-embeds / refreshes the open panel only on actual changes.
     autoSync: function () {
-        if (EJF_SD.sync.running) { return Promise.resolve(); }
-        EJF_SD.sync.running = true;
+        if (JiTA.sync.running) { return Promise.resolve(); }
+        JiTA.sync.running = true;
         var defectStored = 0, ebrChanged = false;
-        return EJF_SD.db.countDefectsOnly().then(function (n) {
+        return JiTA.db.countDefectsOnly().then(function (n) {
             // Auto-initialize the defect DB on the first run (full build), then incremental catch-up.
-            var run = (n === 0) ? EJF_SD.sync.fullSync() : EJF_SD.sync.incrementalSync();
+            var run = (n === 0) ? JiTA.sync.fullSync() : JiTA.sync.incrementalSync();
             return run.then(function (res) { defectStored = (res && res.stored) || 0; });
         }).then(function () {
-            return EJF_SD.db.countEbr().then(function (m) {
+            return JiTA.db.countEbr().then(function (m) {
                 // First run with no reports yet -> initialize the open-report DB once; otherwise catch up.
-                var run = (m === 0) ? EJF_SD.sync.fullSyncEbr() : EJF_SD.sync.incrementalSyncEbr();
+                var run = (m === 0) ? JiTA.sync.fullSyncEbr() : JiTA.sync.incrementalSyncEbr();
                 return run.then(function (res) { if (m === 0 || (res && res.stored)) { ebrChanged = true; } });
             });
         }).then(function () {
-            EJF_SD.sync.running = false;
-            console.log('[EJF-SD] auto-sync done (defects ' + defectStored + ' fetched; EBRs ' + (ebrChanged ? 'updated' : 'unchanged') + ')');
-            return EJF_SD.db.setMeta('lastAutoSyncAt', new Date().toISOString()).then(function () {
-                EJF_SD.sched.markSynced();   // start the 30-min clock so reloads don't re-fetch
-                if (defectStored > 0 || ebrChanged) { EJF_SD.embed.prepare(true); }   // embed any new/changed defects AND bug reports
-                if (defectStored > 0 && EJF_SD.ui.currentKey && /^EBR-/.test(EJF_SD.ui.currentKey)) { EJF_SD.ui.scheduleRender(); }
-                if (ebrChanged && EJF_SD.ui.currentKey && EJF_SD.ui._isReportsKey(EJF_SD.ui.currentKey)) { EJF_SD.ui.scheduleRender(); }
+            JiTA.sync.running = false;
+            console.log('[JiTA-SD] auto-sync done (defects ' + defectStored + ' fetched; EBRs ' + (ebrChanged ? 'updated' : 'unchanged') + ')');
+            return JiTA.db.setMeta('lastAutoSyncAt', new Date().toISOString()).then(function () {
+                JiTA.sched.markSynced();   // start the 30-min clock so reloads don't re-fetch
+                if (defectStored > 0 || ebrChanged) { JiTA.embed.prepare(true); }   // embed any new/changed defects AND bug reports
+                if (defectStored > 0 && JiTA.ui.currentKey && /^EBR-/.test(JiTA.ui.currentKey)) { JiTA.ui.scheduleRender(); }
+                if (ebrChanged && JiTA.ui.currentKey && JiTA.ui._isReportsKey(JiTA.ui.currentKey)) { JiTA.ui.scheduleRender(); }
             });
         }).catch(function (e) {
-            EJF_SD.sync.running = false;
-            EJF_SD.db.setMeta('lastError', String(e && e.message || e));
-            console.log('[EJF-SD] auto-sync error:', e && e.message || e);
+            JiTA.sync.running = false;
+            JiTA.db.setMeta('lastError', String(e && e.message || e));
+            console.log('[JiTA-SD] auto-sync error:', e && e.message || e);
         });
     }
 };
 
 
 /* ---- ranking: BM25 keyword similarity (Phase 1) ---- */
-EJF_SD.rank = {
+JiTA.rank = {
     _index: null,       // { N, avgdl, df:{}, docs:[{key,project,summary,status,tf:{},len}] }
     _dirty: true,       // set true whenever sync writes; triggers a rebuild on next query
     _building: null,
@@ -4766,7 +4766,7 @@ EJF_SD.rank = {
         var out = [];
         for (var i = 0; i < raw.length; i++) {
             var t = raw[i];
-            if (t.length >= 2 && !EJF_SD.rank.STOP[t]) { out.push(t); }
+            if (t.length >= 2 && !JiTA.rank.STOP[t]) { out.push(t); }
         }
         return out;
     },
@@ -4785,10 +4785,10 @@ EJF_SD.rank = {
     // build(records), clearing the dirty flag on success and the in-flight slot on both paths. State lives in
     // the named rank properties passed as string keys (e.g. '_index' / '_dirty' / '_building').
     _ensureCached: function (indexKey, dirtyKey, buildingKey, build) {
-        var R = EJF_SD.rank;
+        var R = JiTA.rank;
         if (R[indexKey] && !R[dirtyKey]) { return Promise.resolve(R[indexKey]); }
         if (R[buildingKey]) { return R[buildingKey]; }
-        R[buildingKey] = EJF_SD.db.allDefects().then(function (records) {
+        R[buildingKey] = JiTA.db.allDefects().then(function (records) {
             R[indexKey] = build(records);
             R[dirtyKey] = false;
             R[buildingKey] = null;
@@ -4798,15 +4798,15 @@ EJF_SD.rank = {
     },
 
     _ensureIndex: function () {
-        return EJF_SD.rank._ensureCached('_index', '_dirty', '_building', function (records) {
-            return EJF_SD.rank._buildKeywordIndex(records, function (rec) { return rec.project !== 'EBR'; });
+        return JiTA.rank._ensureCached('_index', '_dirty', '_building', function (records) {
+            return JiTA.rank._buildKeywordIndex(records, function (rec) { return rec.project !== 'EBR'; });
         });
     },
 
     // Rank stored defects against the query text. Returns up to `limit` (default TOP_N) scored results.
     suggest: function (text, excludeKey, limit, filterTerms) {
-        return EJF_SD.rank._ensureIndex().then(function (idx) {
-            return EJF_SD.rank._bm25Score(idx, text, excludeKey, limit, filterTerms);
+        return JiTA.rank._ensureIndex().then(function (idx) {
+            return JiTA.rank._bm25Score(idx, text, excludeKey, limit, filterTerms);
         });
     },
 
@@ -4814,16 +4814,16 @@ EJF_SD.rank = {
     // shape and tokenizer as the defect index; closed reports are skipped defensively (the EBR sync prunes
     // them, but a stale record could linger between syncs).
     _ensureEbrIndex: function () {
-        return EJF_SD.rank._ensureCached('_ebrIndex', '_dirtyEbr', '_buildingEbr', function (records) {
-            return EJF_SD.rank._buildKeywordIndex(records, function (rec) { return rec.project === 'EBR' && !EJF_SD.util.isClosedStatus(rec.status) && !EJF_SD.util.isGmTeam(rec.team); });
+        return JiTA.rank._ensureCached('_ebrIndex', '_dirtyEbr', '_buildingEbr', function (records) {
+            return JiTA.rank._buildKeywordIndex(records, function (rec) { return rec.project === 'EBR' && !JiTA.util.isClosedStatus(rec.status) && !JiTA.util.isGmTeam(rec.team); });
         });
     },
 
     // Rank OPEN bug reports against the query text (a defect's text). Returns up to `limit` scored results,
     // each with a display `pct` relative to the top score. Mirrors `suggest` but over the EBR index.
     suggestEbr: function (text, excludeKey, limit, filterTerms) {
-        return EJF_SD.rank._ensureEbrIndex().then(function (idx) {
-            var scored = EJF_SD.rank._bm25Score(idx, text, excludeKey, limit, filterTerms);
+        return JiTA.rank._ensureEbrIndex().then(function (idx) {
+            var scored = JiTA.rank._bm25Score(idx, text, excludeKey, limit, filterTerms);
             var top = (scored[0] && scored[0].score) || 0;
             for (var p = 0; p < scored.length; p++) { scored[p].pct = top > 0 ? Math.round(scored[p].score / top * 100) : 0; }
             return scored;
@@ -4834,12 +4834,12 @@ EJF_SD.rank = {
 // Shared body of the two keyword indexes (_ensureIndex / _ensureEbrIndex). `keep(rec)` selects which records
 // go in (defects = non-EBR; open reports = EBR & not closed). Returns { N, avgdl, df, docs } - identical shape
 // and tokenizer for both, so BM25 ranks the same over either corpus.
-EJF_SD.rank._buildKeywordIndex = function (records, keep) {
+JiTA.rank._buildKeywordIndex = function (records, keep) {
     var df = {}, docs = [], totalLen = 0;
     for (var i = 0; i < records.length; i++) {
         var rec = records[i];
         if (!keep(rec)) { continue; }
-        var toks = EJF_SD.rank._tokenize(EJF_SD.util.cleanForCompare(rec.summary, rec.description));
+        var toks = JiTA.rank._tokenize(JiTA.util.cleanForCompare(rec.summary, rec.description));
         var tf = {}, seen = {};
         for (var j = 0; j < toks.length; j++) {
             var tk = toks[j];
@@ -4856,14 +4856,14 @@ EJF_SD.rank._buildKeywordIndex = function (records, keep) {
 // every doc that passes the exclude-key / hidden / filter-box / session-filter gates. Returns up to `limit`
 // results sorted best-first (no display pct - suggestEbr layers its own top-relative pct on the result). A
 // filter-box match with no query-term overlap is still kept as a score-0 candidate (matches the original).
-EJF_SD.rank._bm25Score = function (idx, text, excludeKey, limit, filterTerms) {
+JiTA.rank._bm25Score = function (idx, text, excludeKey, limit, filterTerms) {
     if (!idx || !idx.N) { return []; }
-    var qTokens = EJF_SD.rank._tokenize(text);
+    var qTokens = JiTA.rank._tokenize(text);
     var qSet = {};
     for (var i = 0; i < qTokens.length; i++) { qSet[qTokens[i]] = true; }
     var terms = Object.keys(qSet);
     if (!terms.length) { return []; }
-    var k1 = EJF_SD.rank.K1, b = EJF_SD.rank.B, avgdl = idx.avgdl || 1;
+    var k1 = JiTA.rank.K1, b = JiTA.rank.B, avgdl = idx.avgdl || 1;
     var idf = {};
     for (var t = 0; t < terms.length; t++) {
         var n = idx.df[terms[t]] || 0;
@@ -4873,9 +4873,9 @@ EJF_SD.rank._bm25Score = function (idx, text, excludeKey, limit, filterTerms) {
     for (var d = 0; d < idx.docs.length; d++) {
         var doc = idx.docs[d];
         if (excludeKey && doc.key === excludeKey) { continue; }
-        if (EJF_SD.hidden.isHidden(doc.key)) { continue; }   // user-hidden suggestion (temporary, persisted across updates)
-        if (filterTerms && filterTerms.length && !EJF_SD.rank._matchTerms(doc.hay, filterTerms)) { continue; }   // filter box: restrict the whole corpus
-        if (!EJF_SD.ui.passesFilter(doc)) { continue; }   // session filters (status / recency)
+        if (JiTA.hidden.isHidden(doc.key)) { continue; }   // user-hidden suggestion (temporary, persisted across updates)
+        if (filterTerms && filterTerms.length && !JiTA.rank._matchTerms(doc.hay, filterTerms)) { continue; }   // filter box: restrict the whole corpus
+        if (!JiTA.ui.passesFilter(doc)) { continue; }   // session filters (status / recency)
         var score = 0;
         for (var q = 0; q < terms.length; q++) {
             var tf = doc.tf[terms[q]];
@@ -4887,7 +4887,7 @@ EJF_SD.rank._bm25Score = function (idx, text, excludeKey, limit, filterTerms) {
         else if (filterTerms && filterTerms.length) { scored.push({ key: doc.key, project: doc.project, summary: doc.summary, status: doc.status, resolution: doc.resolution, resolutiondate: doc.resolutiondate, score: 0 }); }   // filter match with no issue-text overlap - still a candidate
     }
     scored.sort(function (a, c) { return c.score - a.score; });
-    return scored.slice(0, limit || EJF_SD.TOP_N);
+    return scored.slice(0, limit || JiTA.TOP_N);
 };
 
 
@@ -4897,7 +4897,7 @@ EJF_SD.rank._bm25Score = function (idx, text, excludeKey, limit, filterTerms) {
  * WASM OK), so we load the library with a plain dynamic import() of a pinned CDN ESM build and let it
  * fetch model weights directly. Any failure flips `unavailable` and the ranking layer falls back to BM25.
  */
-EJF_SD.embed = {
+JiTA.embed = {
     MODEL: 'Xenova/gte-small',   // English, retrieval-tuned, 384-dim (better recall than all-MiniLM for dup-finding)
     LIB_URL: 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.5.2/dist/transformers.min.js',
     BATCH: 16,
@@ -4918,9 +4918,9 @@ EJF_SD.embed = {
 
     // Drop the current pipeline so the next embed call rebuilds it (used to recover from a lost GPU device).
     _resetPipe: function () {
-        EJF_SD.embed._pipe = null;
-        EJF_SD.embed._loading = null;
-        EJF_SD.embed.ready = false;
+        JiTA.embed._pipe = null;
+        JiTA.embed._loading = null;
+        JiTA.embed.ready = false;
     },
 
     // Load (once) the transformers.js pipeline. Resolves to the pipeline, or rejects and sets `unavailable`.
@@ -4928,11 +4928,11 @@ EJF_SD.embed = {
     // WASM fallback runs in its own worker via env.backends.onnx.wasm.proxy. We pick WebGPU if it actually
     // works (validated with a tiny warmup) and otherwise fall back to WASM.
     load: function () {
-        if (EJF_SD.embed._pipe) { return Promise.resolve(EJF_SD.embed._pipe); }
-        if (EJF_SD.embed.unavailable) { return Promise.reject(new Error('embeddings unavailable')); }
-        if (EJF_SD.embed._loading) { return EJF_SD.embed._loading; }
-        EJF_SD.embed._loading = (function () {
-            return import(EJF_SD.embed.LIB_URL).then(function (mod) {
+        if (JiTA.embed._pipe) { return Promise.resolve(JiTA.embed._pipe); }
+        if (JiTA.embed.unavailable) { return Promise.reject(new Error('embeddings unavailable')); }
+        if (JiTA.embed._loading) { return JiTA.embed._loading; }
+        JiTA.embed._loading = (function () {
+            return import(JiTA.embed.LIB_URL).then(function (mod) {
                 if (mod.env) {
                     mod.env.allowLocalModels = false;     // always fetch from the hub/CDN
                     mod.env.useBrowserCache = true;        // cache weights in CacheStorage after first download
@@ -4953,7 +4953,7 @@ EJF_SD.embed = {
                 // the menu toggle is the ONLY thing that switches backend - a GPU failure does NOT auto-fall
                 // back to CPU (it retries on GPU, then pauses). `sdForceCpu` is still honored if the menu sets
                 // it, but the embed/query paths no longer set it themselves.
-                var forceCpu = EJF_SD.embed._cpuFallback || gmGet('sdForceCpu', false);
+                var forceCpu = JiTA.embed._cpuFallback || gmGet('sdForceCpu', false);
                 var tryGpu = !forceCpu && gmGet('sdTryWebgpu', true);
                 var attempts = tryGpu
                     ? [{ device: 'webgpu', dtype: 'fp32' }, { device: 'wasm', dtype: 'q8' }]
@@ -4962,7 +4962,7 @@ EJF_SD.embed = {
                     // Validate with a realistic, longer input rather than a single word. fp16/overflow issues
                     // surface only on real-length text, so a tiny warmup would falsely "pass" and we'd store
                     // NaN vectors. Require a finite, properly-normalized vector (sum of squares ~= 1).
-                    return mod.pipeline('feature-extraction', EJF_SD.embed.MODEL, opts).then(function (pipe) {
+                    return mod.pipeline('feature-extraction', JiTA.embed.MODEL, opts).then(function (pipe) {
                         var probe = 'The quick brown fox jumps over the lazy dog. ' +
                             'Client crashes on undock with an access violation in the rendering thread after the latest patch.';
                         return pipe(probe, { pooling: 'mean', normalize: true }).then(function (out) {
@@ -4978,12 +4978,12 @@ EJF_SD.embed = {
                 function tryFrom(i) {
                     if (i >= attempts.length) { return Promise.reject(new Error('no usable embedding backend')); }
                     return buildWith(attempts[i]).then(function (pipe) {
-                        EJF_SD.embed.backend = attempts[i].device + '/' + attempts[i].dtype;
+                        JiTA.embed.backend = attempts[i].device + '/' + attempts[i].dtype;
                         // fp32 GPU memory ~ batch x sequence-length. With MAX_CHARS at 1500, a large batch can
                         // exhaust VRAM and trigger a device loss (the "BindGroup '...' is invalid" cascade), so
                         // WebGPU uses a conservative 8. CPU/WASM runs one at a time: batched (array) inference
                         // hangs the worker there, while the single-string path (same shape as the warmup) is reliable.
-                        EJF_SD.embed.BATCH = (attempts[i].device === 'webgpu') ? 8 : 1;
+                        JiTA.embed.BATCH = (attempts[i].device === 'webgpu') ? 8 : 1;
                         return pipe;
                     }, function () {
                         return tryFrom(i + 1);
@@ -4991,30 +4991,30 @@ EJF_SD.embed = {
                 }
                 return tryFrom(0);
             }).then(function (pipe) {
-                EJF_SD.embed._pipe = pipe;
-                EJF_SD.embed.ready = true;
-                console.log('[EJF-SD] embedding model ready (backend: ' + EJF_SD.embed.backend + ')');
+                JiTA.embed._pipe = pipe;
+                JiTA.embed.ready = true;
+                console.log('[JiTA-SD] embedding model ready (backend: ' + JiTA.embed.backend + ')');
                 return pipe;
             });
         })().catch(function (e) {
-            EJF_SD.embed.unavailable = true;
-            EJF_SD.embed._loading = null;
-            console.log('[EJF-SD] embedding model unavailable, using keyword ranking. Reason:', e && e.message || e);
+            JiTA.embed.unavailable = true;
+            JiTA.embed._loading = null;
+            console.log('[JiTA-SD] embedding model unavailable, using keyword ranking. Reason:', e && e.message || e);
             throw e;
         });
-        return EJF_SD.embed._loading;
+        return JiTA.embed._loading;
     },
 
     // Embed a single text -> normalized Float32Array(384). Delegates to embedBatch, whose single-item path is
     // the identical plain-string call (same input clamping + shape).
     embedOne: function (text) {
-        return EJF_SD.embed.embedBatch([text]).then(function (vecs) { return vecs[0]; });
+        return JiTA.embed.embedBatch([text]).then(function (vecs) { return vecs[0]; });
     },
 
     // Embed an array of texts -> array of normalized Float32Array(384).
     embedBatch: function (texts) {
-        return EJF_SD.embed.load().then(function (pipe) {
-            var inputs = texts.map(function (t) { return (t || ' ').slice(0, EJF_SD.embed.MAX_CHARS) || ' '; });
+        return JiTA.embed.load().then(function (pipe) {
+            var inputs = texts.map(function (t) { return (t || ' ').slice(0, JiTA.embed.MAX_CHARS) || ' '; });
             // Single item: use the plain-string call - the exact shape the warmup proves works. On CPU/WASM
             // here, passing an array (batched, padded) inference hangs the worker, but single strings are fine.
             if (inputs.length === 1) {
@@ -5036,33 +5036,33 @@ EJF_SD.embed = {
     // Embed every stored defect that lacks a current-version embedding, in batches, persisting as we go.
     // Resumable: if interrupted, the next run just continues with whatever is still missing.
     embedPass: function () {
-        return EJF_SD.embed.load().then(function () {
-            return EJF_SD.db.allDefects();
+        return JiTA.embed.load().then(function () {
+            return JiTA.db.allDefects();
         }).then(function (recs) {
             var todo = [], curVer = 0;
             for (var i = 0; i < recs.length; i++) {
                 // Embed BOTH defects and open bug reports (EBRs): hybrid ranking is used on both the EBR
                 // (similar defects) and EDR (matching reports) views. Skip closed EBRs and GM-team EBRs - neither
                 // is ranked in the "matching reports" view, so embedding them is wasted work.
-                if (recs[i].project === 'EBR' && (EJF_SD.util.isClosedStatus(recs[i].status) || EJF_SD.util.isGmTeam(recs[i].team))) { continue; }
-                if (recs[i].embedding && recs[i].embeddingModelVersion === EJF_SD.MODEL_VERSION) { curVer++; }
+                if (recs[i].project === 'EBR' && (JiTA.util.isClosedStatus(recs[i].status) || JiTA.util.isGmTeam(recs[i].team))) { continue; }
+                if (recs[i].embedding && recs[i].embeddingModelVersion === JiTA.MODEL_VERSION) { curVer++; }
                 else { todo.push(recs[i]); }
             }
-            console.log('[EJF-SD] embed pass: ' + todo.length + ' to embed, ' + curVer + ' already at ' +
-                EJF_SD.MODEL_VERSION + ' (of ' + recs.length + ' total, backend ' + EJF_SD.embed.backend + ')');
-            if (!todo.length) { EJF_SD.ui.setStatus('Embeddings up to date (' + curVer + ')'); return; }
-            EJF_SD.ui.toast('Embedding ' + todo.length + ' issues locally…');
+            console.log('[JiTA-SD] embed pass: ' + todo.length + ' to embed, ' + curVer + ' already at ' +
+                JiTA.MODEL_VERSION + ' (of ' + recs.length + ' total, backend ' + JiTA.embed.backend + ')');
+            if (!todo.length) { JiTA.ui.setStatus('Embeddings up to date (' + curVer + ')'); return; }
+            JiTA.ui.toast('Embedding ' + todo.length + ' issues locally…');
             var idx = 0, gpuRetries = 0;
             function nextBatch() {
-                if (idx >= todo.length) { console.log('[EJF-SD] embed pass complete (' + todo.length + ' embedded)'); EJF_SD.rank._dirtyVec = true; EJF_SD.rank._dirtyEbrVec = true; return Promise.resolve(); }
-                var size = EJF_SD.embed.BATCH;
+                if (idx >= todo.length) { console.log('[JiTA-SD] embed pass complete (' + todo.length + ' embedded)'); JiTA.rank._dirtyVec = true; JiTA.rank._dirtyEbrVec = true; return Promise.resolve(); }
+                var size = JiTA.embed.BATCH;
                 var slice = todo.slice(idx, idx + size);
-                var texts = slice.map(function (r) { return EJF_SD.util.cleanForCompare(r.summary, r.description); });
+                var texts = slice.map(function (r) { return JiTA.util.cleanForCompare(r.summary, r.description); });
                 // Watchdog: a WebGPU device loss can HANG the worker so embedBatch never resolves OR rejects,
                 // which would silently stall the whole pass. Race it against a timeout so a hung batch is
                 // treated as a failure and handled by the catch below (retry on the same backend, then pause).
                 var t0 = Date.now();
-                var batchVecs = EJF_SD.embed.embedBatch(texts);
+                var batchVecs = JiTA.embed.embedBatch(texts);
                 var watchdog = new Promise(function (_resolve, reject) {
                     setTimeout(function () { reject(new Error('embed batch timed out after 45s')); }, 45000);
                 });
@@ -5079,18 +5079,18 @@ EJF_SD.embed = {
                     }
                     for (var j = 0; j < slice.length; j++) {
                         slice[j].embedding = vecs[j];
-                        slice[j].embeddingModelVersion = EJF_SD.MODEL_VERSION;
+                        slice[j].embeddingModelVersion = JiTA.MODEL_VERSION;
                     }
-                    return EJF_SD.db.bulkPut(slice).then(function () {
+                    return JiTA.db.bulkPut(slice).then(function () {
                         idx += slice.length;   // advance by what we actually embedded
-                        EJF_SD.rank._dirtyVec = true;
-                        EJF_SD.rank._dirtyEbrVec = true;
+                        JiTA.rank._dirtyVec = true;
+                        JiTA.rank._dirtyEbrVec = true;
                         // Log throughput periodically so we can see the real CPU speed (first item always logs).
                         if (idx <= slice.length || idx % 50 === 0) {
-                            console.log('[EJF-SD] embedded ' + idx + '/' + todo.length + ' (' + size + ' in ' + dt + 'ms, ' + EJF_SD.embed.backend + ')');
+                            console.log('[JiTA-SD] embedded ' + idx + '/' + todo.length + ' (' + size + ' in ' + dt + 'ms, ' + JiTA.embed.backend + ')');
                         }
-                        EJF_SD.ui.setStatus('Embedding… ' + Math.min(idx, todo.length) + '/' + todo.length + ' (' + EJF_SD.embed.backend + ')');
-                        return EJF_SD.util.delay(0).then(nextBatch);   // yield to keep the UI responsive
+                        JiTA.ui.setStatus('Embedding… ' + Math.min(idx, todo.length) + '/' + todo.length + ' (' + JiTA.embed.backend + ')');
+                        return JiTA.util.delay(0).then(nextBatch);   // yield to keep the UI responsive
                     });
                 }).catch(function (e) {
                     // A batch failed (on WebGPU, usually a device loss). We deliberately do NOT auto-switch to
@@ -5098,13 +5098,13 @@ EJF_SD.embed = {
                     // no progress is lost: retry a few times on the SAME backend to ride out a transient blip,
                     // and if it keeps failing, pause the pass (it resumes on the next reload / scheduled sync)
                     // and tell the user they can switch backend from the menu.
-                    console.log('[EJF-SD] embed batch failed (' + EJF_SD.embed.backend + ', size ' + size + '):', e && e.message || e);
-                    EJF_SD.embed._resetPipe();
+                    console.log('[JiTA-SD] embed batch failed (' + JiTA.embed.backend + ', size ' + size + '):', e && e.message || e);
+                    JiTA.embed._resetPipe();
                     gpuRetries++;
                     if (gpuRetries <= 3) {
-                        return EJF_SD.util.delay(1500).then(nextBatch);
+                        return JiTA.util.delay(1500).then(nextBatch);
                     }
-                    EJF_SD.ui.toast('Embedding keeps failing on ' + (EJF_SD.embed.backend || 'GPU') + ' - paused. Reload to retry, or switch backend from the Tampermonkey menu.');
+                    JiTA.ui.toast('Embedding keeps failing on ' + (JiTA.embed.backend || 'GPU') + ' - paused. Reload to retry, or switch backend from the Tampermonkey menu.');
                     throw e;   // give up this pass (progress saved; ranking stays on BM25 meanwhile)
                 });
             }
@@ -5115,44 +5115,44 @@ EJF_SD.embed = {
     // Background entry point: load the model and embed anything outstanding, then refresh the panel.
     // Idempotent per session unless `force` is passed (used right after a sync brings in new/changed text).
     prepare: function (force) {
-        if (EJF_SD.embed.unavailable) { return Promise.resolve(); }
-        if (EJF_SD.embed._preparing) { return EJF_SD.embed._preparing; }
-        if (EJF_SD.embed._prepared && !force) { return Promise.resolve(); }
-        EJF_SD.embed._preparing = EJF_SD.db.countDefects().then(function (n) {
+        if (JiTA.embed.unavailable) { return Promise.resolve(); }
+        if (JiTA.embed._preparing) { return JiTA.embed._preparing; }
+        if (JiTA.embed._prepared && !force) { return Promise.resolve(); }
+        JiTA.embed._preparing = JiTA.db.countDefects().then(function (n) {
             if (!n) { return; }   // nothing synced yet (no defects AND no bug reports) - don't download a model
-            return EJF_SD.embed.embedPass().then(function () {
-                EJF_SD.embed._prepared = true;
-                EJF_SD.rank._dirtyVec = true;
-                EJF_SD.rank._dirtyEbrVec = true;
+            return JiTA.embed.embedPass().then(function () {
+                JiTA.embed._prepared = true;
+                JiTA.rank._dirtyVec = true;
+                JiTA.rank._dirtyEbrVec = true;
                 // Refresh whichever view is open (coalesced, so a sync + this embed-pass completion collapse
                 // into a single list rebuild instead of thrashing): EBR -> similar defects, EDR -> reports.
-                EJF_SD.ui.scheduleRender();
+                JiTA.ui.scheduleRender();
             });
         }).then(function () {
-            EJF_SD.embed._preparing = null;
+            JiTA.embed._preparing = null;
         }).catch(function (e) {
-            EJF_SD.embed._preparing = null;
-            console.log('[EJF-SD] embed prepare skipped:', e && e.message || e);
+            JiTA.embed._preparing = null;
+            console.log('[JiTA-SD] embed prepare skipped:', e && e.message || e);
         });
-        return EJF_SD.embed._preparing;
+        return JiTA.embed._preparing;
     }
 };
 
 
 /* ---- semantic ranking (Phase 2): cosine over stored embeddings, with BM25 fallback ---- */
-EJF_SD.rank._vecIndex = null;     // cached array of { key, project, summary, status, resolution, vec }
-EJF_SD.rank._dirtyVec = true;     // rebuild the in-memory vector cache on next semantic query
-EJF_SD.rank._buildingVec = null;
+JiTA.rank._vecIndex = null;     // cached array of { key, project, summary, status, resolution, vec }
+JiTA.rank._dirtyVec = true;     // rebuild the in-memory vector cache on next semantic query
+JiTA.rank._buildingVec = null;
 
 // Shared body of the two vector indexes (_ensureVecIndex / _ensureEbrVecIndex): the current-model embedded
 // docs, filtered by `keep` (defects = non-EBR; open reports = EBR & not closed). resolutiondate is carried
 // uniformly (unused on the EBR side, harmless).
-EJF_SD.rank._buildVecIndex = function (records, keep) {
+JiTA.rank._buildVecIndex = function (records, keep) {
     var docs = [];
     for (var i = 0; i < records.length; i++) {
         var r = records[i];
         if (!keep(r)) { continue; }
-        if (r.embedding && r.embeddingModelVersion === EJF_SD.MODEL_VERSION) {
+        if (r.embedding && r.embeddingModelVersion === JiTA.MODEL_VERSION) {
             docs.push({ key: r.key, project: r.project, summary: r.summary, status: r.status, resolution: r.resolution, resolutiondate: r.resolutiondate, created: r.created, vec: r.embedding, hay: ((r.key || '') + ' ' + (r.summary || '') + ' ' + (r.description || '')).toLowerCase() });
         }
     }
@@ -5160,31 +5160,31 @@ EJF_SD.rank._buildVecIndex = function (records, keep) {
 };
 
 // Build (and cache) the in-memory list of DEFECT vectors for the current model version.
-EJF_SD.rank._ensureVecIndex = function () {
-    return EJF_SD.rank._ensureCached('_vecIndex', '_dirtyVec', '_buildingVec', function (recs) {
-        return EJF_SD.rank._buildVecIndex(recs, function (r) { return r.project !== 'EBR'; });
+JiTA.rank._ensureVecIndex = function () {
+    return JiTA.rank._ensureCached('_vecIndex', '_dirtyVec', '_buildingVec', function (recs) {
+        return JiTA.rank._buildVecIndex(recs, function (r) { return r.project !== 'EBR'; });
     });
 };
 
 // Cosine similarity of two normalized vectors == dot product.
-EJF_SD.rank._dot = function (a, b) {
+JiTA.rank._dot = function (a, b) {
     var s = 0, n = Math.min(a.length, b.length);
     for (var i = 0; i < n; i++) { s += a[i] * b[i]; }
     return s;
 };
 
-EJF_SD.rank.CAND = 50;     // candidates pulled from each retriever before fusion
-EJF_SD.rank.RRF_K = 60;    // Reciprocal-Rank-Fusion constant (standard default)
+JiTA.rank.CAND = 50;     // candidates pulled from each retriever before fusion
+JiTA.rank.RRF_K = 60;    // Reciprocal-Rank-Fusion constant (standard default)
 
 // Fuse a semantic candidate list and a BM25 candidate list into the final TOP_N results via Reciprocal Rank
 // Fusion. RRF decides WHICH results make the cut (so strong keyword hits aren't lost even when their cosine
 // is middling); the kept rows are then presented sorted by the displayed cosine % so the panel reads high to
 // low. `demote` (optional, defect side only) is applied to each fused row before the cut, age-demoting stale
 // closed matches (it lowers both rrf and pct, so they fall in the cut AND read lower). Returns the TOP_N array.
-EJF_SD.rank._fuse = function (sem, bm, demote) {
-    var K = EJF_SD.rank.RRF_K;
+JiTA.rank._fuse = function (sem, bm, demote) {
+    var K = JiTA.rank.RRF_K;
     var rrf = {}, meta = {}, cosByKey = {};
-    var semTop = sem.slice(0, EJF_SD.rank.CAND);
+    var semTop = sem.slice(0, JiTA.rank.CAND);
     for (var i = 0; i < semTop.length; i++) { rrf[semTop[i].key] = (rrf[semTop[i].key] || 0) + 1 / (K + i); meta[semTop[i].key] = semTop[i]; }
     for (var j = 0; j < bm.length; j++) { rrf[bm[j].key] = (rrf[bm[j].key] || 0) + 1 / (K + j); if (!meta[bm[j].key]) { meta[bm[j].key] = bm[j]; } }
     for (var c = 0; c < sem.length; c++) { cosByKey[sem[c].key] = sem[c].score; }   // cosine for display (all docs)
@@ -5199,7 +5199,7 @@ EJF_SD.rank._fuse = function (sem, bm, demote) {
     });
     if (demote) { for (var s = 0; s < out.length; s++) { demote(out[s]); } }
     out.sort(function (a, c2) { return c2.rrf - a.rrf; });
-    var topN = out.slice(0, EJF_SD.TOP_N);
+    var topN = out.slice(0, JiTA.TOP_N);
     topN.sort(function (a, c2) { return c2.pct - a.pct; });
     return topN;
 };
@@ -5207,12 +5207,12 @@ EJF_SD.rank._fuse = function (sem, bm, demote) {
 // Embed the query text, caching the most recent (text -> vector) so filter-box keystrokes (which re-rank the
 // SAME issue text against a changing filter) don't re-run the transformer every time - only the filter +
 // scoring re-run, not the expensive inference.
-EJF_SD.rank._qvText = null;
-EJF_SD.rank._qvVec = null;
-EJF_SD.rank._embedQuery = function (text) {
-    if (EJF_SD.rank._qvText === text && EJF_SD.rank._qvVec) { return Promise.resolve(EJF_SD.rank._qvVec); }
-    return EJF_SD.embed.embedOne(text).then(function (qv) {
-        EJF_SD.rank._qvText = text; EJF_SD.rank._qvVec = qv; return qv;
+JiTA.rank._qvText = null;
+JiTA.rank._qvVec = null;
+JiTA.rank._embedQuery = function (text) {
+    if (JiTA.rank._qvText === text && JiTA.rank._qvVec) { return Promise.resolve(JiTA.rank._qvVec); }
+    return JiTA.embed.embedOne(text).then(function (qv) {
+        JiTA.rank._qvText = text; JiTA.rank._qvVec = qv; return qv;
     });
 };
 
@@ -5220,15 +5220,15 @@ EJF_SD.rank._embedQuery = function (text) {
 // the exclude / hidden / filter-box / session-filter gates, sorted best-first. [] if none embedded. Shared by
 // the defect and open-EBR semantic scorers (identical loop; resolutiondate is carried uniformly - unused on
 // the EBR side, harmless). `filterTerms` restricts to docs whose key+title+description contains them all.
-EJF_SD.rank._cosineScored = function (indexGetter, qv, excludeKey, filterTerms) {
+JiTA.rank._cosineScored = function (indexGetter, qv, excludeKey, filterTerms) {
     return indexGetter().then(function (docs) {
         var scored = [];
         for (var d = 0; d < docs.length; d++) {
             if (excludeKey && docs[d].key === excludeKey) { continue; }
-            if (EJF_SD.hidden.isHidden(docs[d].key)) { continue; }   // user-hidden suggestion (temporary, persisted across updates)
-            if (filterTerms && filterTerms.length && !EJF_SD.rank._matchTerms(docs[d].hay, filterTerms)) { continue; }
-            if (!EJF_SD.ui.passesFilter(docs[d])) { continue; }   // session filters (status / recency)
-            var sc = EJF_SD.rank._dot(qv, docs[d].vec);
+            if (JiTA.hidden.isHidden(docs[d].key)) { continue; }   // user-hidden suggestion (temporary, persisted across updates)
+            if (filterTerms && filterTerms.length && !JiTA.rank._matchTerms(docs[d].hay, filterTerms)) { continue; }
+            if (!JiTA.ui.passesFilter(docs[d])) { continue; }   // session filters (status / recency)
+            var sc = JiTA.rank._dot(qv, docs[d].vec);
             if (!isFinite(sc)) { continue; }   // defensively drop any corrupt (NaN/Inf) vector
             scored.push({ key: docs[d].key, project: docs[d].project, summary: docs[d].summary, status: docs[d].status, resolution: docs[d].resolution, resolutiondate: docs[d].resolutiondate, score: sc });
         }
@@ -5238,26 +5238,26 @@ EJF_SD.rank._cosineScored = function (indexGetter, qv, excludeKey, filterTerms) 
 };
 
 // Cosine-score the DEFECT vectors against the query. [] if none embedded.
-EJF_SD.rank._semanticScored = function (qv, excludeKey, filterTerms) {
-    return EJF_SD.rank._cosineScored(EJF_SD.rank._ensureVecIndex, qv, excludeKey, filterTerms);
+JiTA.rank._semanticScored = function (qv, excludeKey, filterTerms) {
+    return JiTA.rank._cosineScored(JiTA.rank._ensureVecIndex, qv, excludeKey, filterTerms);
 };
 
 /* ---- EBR semantic ranking (stage 2): cosine over OPEN bug-report embeddings ---- */
-EJF_SD.rank._ebrVecIndex = null;
-EJF_SD.rank._dirtyEbrVec = true;
-EJF_SD.rank._buildingEbrVec = null;
+JiTA.rank._ebrVecIndex = null;
+JiTA.rank._dirtyEbrVec = true;
+JiTA.rank._buildingEbrVec = null;
 
 // In-memory vector list over OPEN bug reports (project EBR) with a current-version embedding. Mirrors
 // _ensureVecIndex but keeps only open EBRs (closed ones aren't ranked and lose their slot).
-EJF_SD.rank._ensureEbrVecIndex = function () {
-    return EJF_SD.rank._ensureCached('_ebrVecIndex', '_dirtyEbrVec', '_buildingEbrVec', function (recs) {
-        return EJF_SD.rank._buildVecIndex(recs, function (r) { return r.project === 'EBR' && !EJF_SD.util.isClosedStatus(r.status) && !EJF_SD.util.isGmTeam(r.team); });
+JiTA.rank._ensureEbrVecIndex = function () {
+    return JiTA.rank._ensureCached('_ebrVecIndex', '_dirtyEbrVec', '_buildingEbrVec', function (recs) {
+        return JiTA.rank._buildVecIndex(recs, function (r) { return r.project === 'EBR' && !JiTA.util.isClosedStatus(r.status) && !JiTA.util.isGmTeam(r.team); });
     });
 };
 
 // Cosine-score the OPEN-EBR vectors against the query. [] if none embedded.
-EJF_SD.rank._semanticScoredEbr = function (qv, excludeKey, filterTerms) {
-    return EJF_SD.rank._cosineScored(EJF_SD.rank._ensureEbrVecIndex, qv, excludeKey, filterTerms);
+JiTA.rank._semanticScoredEbr = function (qv, excludeKey, filterTerms) {
+    return JiTA.rank._cosineScored(JiTA.rank._ensureEbrVecIndex, qv, excludeKey, filterTerms);
 };
 
 // Shared HYBRID body for suggestBest / suggestEbrBest: embed the query, cosine-score via semFn, fall back to
@@ -5265,16 +5265,16 @@ EJF_SD.rank._semanticScoredEbr = function (qv, excludeKey, filterTerms) {
 // RRF-fuse (with optional `demote`, defect side only). A query-time embed failure (e.g. a WebGPU device loss)
 // drops the possibly-dead pipeline - we do NOT auto-switch backend, that's the user's menu choice - and shows
 // keyword results for now.
-EJF_SD.rank._hybridResults = function (text, key, filterTerms, semFn, bmFn, keywordOnly, demote) {
-    return EJF_SD.rank._embedQuery(text).then(function (qv) {
+JiTA.rank._hybridResults = function (text, key, filterTerms, semFn, bmFn, keywordOnly, demote) {
+    return JiTA.rank._embedQuery(text).then(function (qv) {
         return semFn(qv, key, filterTerms).then(function (sem) {
             if (!sem.length) { return keywordOnly(); }
-            return bmFn(text, key, EJF_SD.rank.CAND, filterTerms).then(function (bm) {
-                return { mode: 'Hybrid', results: EJF_SD.rank._fuse(sem, bm, demote) };
+            return bmFn(text, key, JiTA.rank.CAND, filterTerms).then(function (bm) {
+                return { mode: 'Hybrid', results: JiTA.rank._fuse(sem, bm, demote) };
             });
         });
     }).catch(function () {
-        EJF_SD.embed._resetPipe();
+        JiTA.embed._resetPipe();
         return keywordOnly();
     });
 };
@@ -5283,15 +5283,15 @@ EJF_SD.rank._hybridResults = function (text, key, filterTerms, semFn, bmFn, keyw
 // keyword() when it's permanently unavailable, else kick off the warm-up and give the model a brief window
 // (WARM_WAIT_MS) - resolving to hybrid() if it loads in time (skipping the keyword->hybrid flicker), else
 // keyword() now (prepare()'s later re-render upgrades it once the model is ready).
-EJF_SD.rank._pickMode = function (forceMode, keywordOnly, hybrid) {
+JiTA.rank._pickMode = function (forceMode, keywordOnly, hybrid) {
     if (forceMode === 'Keyword') { return keywordOnly(); }
-    if (EJF_SD.embed.ready) { return hybrid(); }
-    if (EJF_SD.embed.unavailable) { return keywordOnly(); }
-    EJF_SD.embed.prepare();
+    if (JiTA.embed.ready) { return hybrid(); }
+    if (JiTA.embed.unavailable) { return keywordOnly(); }
+    JiTA.embed.prepare();
     return new Promise(function (resolve) {
         var settled = false;
-        var timer = setTimeout(function () { if (settled) { return; } settled = true; resolve(keywordOnly()); }, EJF_SD.embed.WARM_WAIT_MS);
-        EJF_SD.embed.load().then(function () {
+        var timer = setTimeout(function () { if (settled) { return; } settled = true; resolve(keywordOnly()); }, JiTA.embed.WARM_WAIT_MS);
+        JiTA.embed.load().then(function () {
             if (settled) { return; }
             settled = true; clearTimeout(timer);
             resolve(hybrid());
@@ -5308,28 +5308,28 @@ EJF_SD.rank._pickMode = function (forceMode, keywordOnly, hybrid) {
 // shared terms (item/module names, error strings) that embeddings smooth over are caught by BM25, while
 // paraphrases are caught by the embeddings, so the "obvious" duplicate surfaces far more reliably.
 // Returns { mode: 'Hybrid' | 'Keyword', results: [...] } with a display % already attached to each result.
-EJF_SD.rank.suggestBest = function (text, key, brCreated, forceMode, filterTerms) {
+JiTA.rank.suggestBest = function (text, key, brCreated, forceMode, filterTerms) {
     // Feature A: gently demote a Closed defect that was fixed long before this bug report was filed - it
     // is very unlikely to be the report's real duplicate. Scales whatever score fields the result carries
     // (score / rrf / pct) by the age factor and tags it so the panel can grey it and explain why.
     function demote(r) {
-        if (!brCreated || !r.resolutiondate || !EJF_SD.util.isResolved(r.status, r.resolution)) { return; }
-        var sf = EJF_SD.util.staleFactor(brCreated, r.resolutiondate);
+        if (!brCreated || !r.resolutiondate || !JiTA.util.isResolved(r.status, r.resolution)) { return; }
+        var sf = JiTA.util.staleFactor(brCreated, r.resolutiondate);
         if (sf.factor >= 1) { return; }
         if (typeof r.score === 'number') { r.score *= sf.factor; }
         if (typeof r.rrf === 'number') { r.rrf *= sf.factor; }
         if (typeof r.pct === 'number') { r.pct = Math.round(r.pct * sf.factor); }
         r.stale = true;
         // Note: the meta line already shows the status ("Closed"), so don't repeat it here - just the gap.
-        r.staleNote = 'fixed ' + EJF_SD.util.humanizeAge(sf.ageDays) + ' before report';
+        r.staleNote = 'fixed ' + JiTA.util.humanizeAge(sf.ageDays) + ' before report';
     }
     function keywordOnly() {
         // Pull a wider candidate set so the demotion can re-order before we cut to TOP_N (a stale match
         // shouldn't keep a slot a fresher one deserves).
-        return EJF_SD.rank.suggest(text, key, EJF_SD.rank.CAND, filterTerms).then(function (list) {
+        return JiTA.rank.suggest(text, key, JiTA.rank.CAND, filterTerms).then(function (list) {
             for (var d = 0; d < list.length; d++) { demote(list[d]); }
             list.sort(function (a, c) { return c.score - a.score; });
-            list = list.slice(0, EJF_SD.TOP_N);
+            list = list.slice(0, JiTA.TOP_N);
             var top = (list[0] && list[0].score) || 0;
             for (var i = 0; i < list.length; i++) { list[i].pct = top > 0 ? Math.round(list[i].score / top * 100) : 0; }
             return { mode: 'Keyword', results: list };
@@ -5337,31 +5337,31 @@ EJF_SD.rank.suggestBest = function (text, key, brCreated, forceMode, filterTerms
     }
     // HYBRID (semantic + keyword, RRF-fused) over the DEFECT indexes, with stale-match demotion.
     function hybrid() {
-        return EJF_SD.rank._hybridResults(text, key, filterTerms, EJF_SD.rank._semanticScored, EJF_SD.rank.suggest, keywordOnly, demote);
+        return JiTA.rank._hybridResults(text, key, filterTerms, JiTA.rank._semanticScored, JiTA.rank.suggest, keywordOnly, demote);
     }
-    return EJF_SD.rank._pickMode(forceMode, keywordOnly, hybrid);
+    return JiTA.rank._pickMode(forceMode, keywordOnly, hybrid);
 };
 
 // EDR (defect) -> matching OPEN bug reports, best available ranking. Same hybrid (semantic + BM25, fused
 // with RRF) approach as suggestBest, but over the EBR indexes and with no stale-demotion (open reports have
 // no fix date). Returns { mode: 'Hybrid' | 'Keyword', results: [...] } with a display % per result.
-EJF_SD.rank.suggestEbrBest = function (text, key, forceMode, filterTerms) {
+JiTA.rank.suggestEbrBest = function (text, key, forceMode, filterTerms) {
     function keywordOnly() {
         // suggestEbr already attaches a top-relative pct.
-        return EJF_SD.rank.suggestEbr(text, key, EJF_SD.TOP_N, filterTerms).then(function (list) {
+        return JiTA.rank.suggestEbr(text, key, JiTA.TOP_N, filterTerms).then(function (list) {
             return { mode: 'Keyword', results: list };
         });
     }
     // HYBRID over the OPEN-EBR indexes; no stale-demotion (open reports have no fix date).
     function hybrid() {
-        return EJF_SD.rank._hybridResults(text, key, filterTerms, EJF_SD.rank._semanticScoredEbr, EJF_SD.rank.suggestEbr, keywordOnly);
+        return JiTA.rank._hybridResults(text, key, filterTerms, JiTA.rank._semanticScoredEbr, JiTA.rank.suggestEbr, keywordOnly);
     }
-    return EJF_SD.rank._pickMode(forceMode, keywordOnly, hybrid);
+    return JiTA.rank._pickMode(forceMode, keywordOnly, hybrid);
 };
 
 
 /* ---- issue linking: "mark as duplicate" (Feature B) ---- */
-EJF_SD.link = {
+JiTA.link = {
     _info: null,   // cached { name, ebrSide } - the link-type name + which side the EBR goes on
     _me: null,     // cached current-user accountId (for the defect-side attach assignee gate)
 
@@ -5370,13 +5370,13 @@ EJF_SD.link = {
     // ajs-atlassian-account-id meta tag Jira renders into the page; fall back to /myself. Resolves null if
     // it can't be determined (callers then disallow attaching anything that IS assigned, to be safe).
     currentUser: function () {
-        if (EJF_SD.link._me) { return Promise.resolve(EJF_SD.link._me); }
+        if (JiTA.link._me) { return Promise.resolve(JiTA.link._me); }
         var meta = document.querySelector('meta[name="ajs-atlassian-account-id"]');
         var id = meta && meta.getAttribute('content');
-        if (id) { EJF_SD.link._me = id; return Promise.resolve(id); }
+        if (id) { JiTA.link._me = id; return Promise.resolve(id); }
         return new Promise(function (resolve) {
-            $.ajax({ url: EJF_SD.HOST + '/rest/api/2/myself', dataType: 'json' })
-                .done(function (d) { EJF_SD.link._me = (d && d.accountId) || null; resolve(EJF_SD.link._me); })
+            $.ajax({ url: JiTA.HOST + '/rest/api/2/myself', dataType: 'json' })
+                .done(function (d) { JiTA.link._me = (d && d.accountId) || null; resolve(JiTA.link._me); })
                 .fail(function () { resolve(null); });
         });
     },
@@ -5388,11 +5388,11 @@ EJF_SD.link = {
     // can't assume the standard direction, so this is discovered at runtime, cached in memory + GM. (Cache
     // key is versioned because an earlier build cached only the name and could link the wrong way round.)
     dupInfo: function () {
-        if (EJF_SD.link._info) { return Promise.resolve(EJF_SD.link._info); }
+        if (JiTA.link._info) { return Promise.resolve(JiTA.link._info); }
         var cached = gmGet('sdDupLink_v2', null);
-        if (cached && cached.name) { EJF_SD.link._info = cached; return Promise.resolve(cached); }
+        if (cached && cached.name) { JiTA.link._info = cached; return Promise.resolve(cached); }
         return new Promise(function (resolve) {
-            $.ajax({ url: EJF_SD.HOST + '/rest/api/3/issueLinkType', dataType: 'json' })
+            $.ajax({ url: JiTA.HOST + '/rest/api/3/issueLinkType', dataType: 'json' })
                 .done(function (d) {
                     var types = (d && d.issueLinkTypes) || [];
                     var info = null;
@@ -5402,7 +5402,7 @@ EJF_SD.link = {
                         else if (/^duplicates$/i.test(t.inward || '')) { info = { name: t.name, ebrSide: 'inward' }; }
                     }
                     if (!info) { info = { name: 'Duplicate', ebrSide: 'outward' }; }   // sensible default
-                    EJF_SD.link._info = info;
+                    JiTA.link._info = info;
                     gmSet('sdDupLink_v2', info);
                     resolve(info);
                 })
@@ -5416,7 +5416,7 @@ EJF_SD.link = {
     // dataType would mis-treat as a parse error. Resolves on any 2xx; rejects with the HTTP status
     // (403 ~ missing link permission).
     markDuplicate: function (ebrKey, otherKey) {
-        return EJF_SD.link.dupInfo().then(function (info) {
+        return JiTA.link.dupInfo().then(function (info) {
             var body = { type: { name: info.name } };
             // NOTE: on this instance the issue placed as `outwardIssue` ends up DISPLAYING the type's INWARD
             // text (and vice-versa) - the opposite of the documented direction. So to make the EBR read
@@ -5428,7 +5428,7 @@ EJF_SD.link = {
             }
             return new Promise(function (resolve, reject) {
                 $.ajax({
-                    url: EJF_SD.HOST + '/rest/api/3/issueLink',
+                    url: JiTA.HOST + '/rest/api/3/issueLink',
                     type: 'POST',
                     contentType: 'application/json',
                     headers: { 'X-Atlassian-Token': 'no-check' },
@@ -5463,9 +5463,9 @@ EJF_SD.link = {
     // link separately; if there's no such transition at all we just create the link. Resolves with
     // { attached: bool, linked: bool }.
     attachDuplicate: function (ebrKey, otherKey, statusName, preferredResolution, assigneeAccountId) {
-        return EJF_SD.link.dupInfo().then(function (info) {
+        return JiTA.link.dupInfo().then(function (info) {
             return new Promise(function (resolve, reject) {
-                $.ajax({ url: EJF_SD.HOST + '/rest/api/3/issue/' + ebrKey + '/transitions?expand=transitions.fields', dataType: 'json' })
+                $.ajax({ url: JiTA.HOST + '/rest/api/3/issue/' + ebrKey + '/transitions?expand=transitions.fields', dataType: 'json' })
                     .done(function (d) {
                         var trans = (d && d.transitions) || [];
                         var want = (statusName || '').toLowerCase(), t = null;
@@ -5476,7 +5476,7 @@ EJF_SD.link = {
                         }
                         // No such transition from the current state -> just create the link on its own.
                         if (!t) {
-                            EJF_SD.link.markDuplicate(ebrKey, otherKey)
+                            JiTA.link.markDuplicate(ebrKey, otherKey)
                                 .then(function () { resolve({ attached: false, linked: true }); }, reject);
                             return;
                         }
@@ -5502,17 +5502,17 @@ EJF_SD.link = {
                         }
                         // Linked Issues field on the screen: add the duplicate link inline (single call).
                         var hasLinkField = !!(t.fields && t.fields.issuelinks);
-                        if (hasLinkField) { payload.update = { issuelinks: [ EJF_SD.link._dupAddOp(info, otherKey) ] }; }
+                        if (hasLinkField) { payload.update = { issuelinks: [ JiTA.link._dupAddOp(info, otherKey) ] }; }
 
                         function done2xx() {
                             if (hasLinkField) { resolve({ attached: true, linked: true }); return; }
                             // Screen didn't carry the link field -> transition done, now link separately.
-                            EJF_SD.link.markDuplicate(ebrKey, otherKey)
+                            JiTA.link.markDuplicate(ebrKey, otherKey)
                                 .then(function () { resolve({ attached: true, linked: true }); },
                                       function () { resolve({ attached: true, linked: false }); });
                         }
                         $.ajax({
-                            url: EJF_SD.HOST + '/rest/api/3/issue/' + ebrKey + '/transitions',
+                            url: JiTA.HOST + '/rest/api/3/issue/' + ebrKey + '/transitions',
                             type: 'POST',
                             contentType: 'application/json',
                             headers: { 'X-Atlassian-Token': 'no-check' },
@@ -5532,180 +5532,180 @@ EJF_SD.link = {
 
 
 /* ---- UI: floating suggestions panel ---- */
-EJF_SD.ui = {
+JiTA.ui = {
     currentKey: null,
     _toastTimer: null,
 
     css: '\
-#ejf-sd-panel { position: fixed; right: 18px; bottom: 18px; width: 340px; max-height: 52vh; z-index: 9000;\
+#jita-sd-panel { position: fixed; right: 18px; bottom: 18px; width: 340px; max-height: 52vh; z-index: 9000;\
   background: #1D2125; color: #e6e6e6; border: 1px solid #3a434d; border-radius: 6px; box-shadow: 0 4px 18px rgba(0,0,0,.45);\
   font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif; font-size: 12px; display: flex; flex-direction: column; overflow: hidden; }\
-#ejf-sd-head { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: #282d33; cursor: move; user-select: none; }\
-#ejf-sd-panel.ejf-sd-dragging { opacity: .92; }\
-#ejf-sd-title { font-weight: 700; flex: 1; }\
-#ejf-sd-mode { font-size: 10px; background: #3a434d; padding: 1px 6px; border-radius: 8px; cursor: pointer; user-select: none; }\
-#ejf-sd-mode:hover { background: #4a545f; }\
-#ejf-sd-filter { flex: 1 1 60px; min-width: 0; height: 20px; box-sizing: border-box; padding: 0 6px; font-size: 11px; border: 1px solid #3a434d; border-radius: 8px; background: #14181b; color: #e6e6e6; outline: none; }\
-#ejf-sd-filter:focus { border-color: #4c9aff; }\
-#ejf-sd-collapse { cursor: pointer; padding: 0 4px; font-weight: 700; }\
-#ejf-sd-status { padding: 6px 10px; color: #aab3bd; border-bottom: 1px solid #2c333a; }\
-#ejf-sd-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; }\
-#ejf-sd-list li { padding: 7px 10px; border-bottom: 1px solid #2c333a; min-width: 0; overflow-wrap: anywhere; word-break: break-word; }\
-#ejf-sd-list a { color: #4c9aff; font-weight: 700; text-decoration: none; overflow-wrap: anywhere; }\
-#ejf-sd-list a:hover { text-decoration: underline; }\
-.ejf-sd-proj { font-size: 10px; background: #3a434d; padding: 0 5px; border-radius: 7px; margin-left: 6px; }\
-.ejf-sd-score { float: right; color: #7a8694; font-size: 10px; }\
-.ejf-sd-link { float: right; margin-right: 8px; font-size: 10px; color: #9fb4cc; cursor: pointer; user-select: none; }\
-.ejf-sd-link:hover { color: #4c9aff; text-decoration: underline; }\
-.ejf-sd-link.ejf-sd-linking { color: #7a8694; cursor: default; text-decoration: none; }\
-.ejf-sd-link.ejf-sd-linked { color: #4caf7d; cursor: default; text-decoration: none; }\
-.ejf-sd-link.ejf-sd-noattach { color: #7a8694 !important; cursor: default; text-decoration: none; }\
-.ejf-sd-hide { float: right; margin-right: 8px; cursor: pointer; color: #7a8694; display: inline-flex; align-items: center; user-select: none; }\
-.ejf-sd-hide:hover { color: #ff8f8f; }\
-.ejf-sd-hide svg { display: block; }\
-#ejf-sd-hidemenu { position: fixed; z-index: 10002; background: #14181b; color: #e6e6e6; border: 1px solid #3a434d; border-radius: 6px; box-shadow: 0 6px 24px rgba(0,0,0,.55); padding: 6px; font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif; font-size: 12px; min-width: 150px; }\
-#ejf-sd-hidemenu .ejf-sd-hidemenu-label { color: #9aa6b2; font-size: 10px; padding: 2px 6px 6px; white-space: nowrap; }\
-#ejf-sd-hidemenu .ejf-sd-hidemenu-btn { display: block; width: 100%; text-align: left; background: transparent; color: #e6e6e6; border: none; border-radius: 4px; padding: 6px 8px; cursor: pointer; font-size: 12px; }\
-#ejf-sd-hidemenu .ejf-sd-hidemenu-btn:hover { background: #2c333a; }\
-#ejf-sd-filterbtn { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; border-radius: 6px; color: #9aa6b2; cursor: pointer; user-select: none; position: relative; flex: 0 0 auto; }\
-#ejf-sd-filterbtn:hover { color: #e6e6e6; background: #3a434d; }\
-#ejf-sd-filterbtn.active { color: #4c9aff; }\
-#ejf-sd-filterbtn.active::after { content: ""; position: absolute; top: 1px; right: 1px; width: 5px; height: 5px; border-radius: 50%; background: #4c9aff; }\
-#ejf-sd-filtermenu { position: fixed; z-index: 10002; background: #14181b; color: #e6e6e6; border: 1px solid #3a434d; border-radius: 6px; box-shadow: 0 6px 24px rgba(0,0,0,.55); padding: 10px; font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif; font-size: 12px; min-width: 190px; }\
-#ejf-sd-filtermenu .ejf-fm-label { color: #9aa6b2; font-size: 10px; text-transform: uppercase; letter-spacing: .04em; margin: 2px 0 5px; }\
-#ejf-sd-filtermenu .ejf-fm-seg { display: flex; margin-bottom: 10px; border: 1px solid #3a434d; border-radius: 6px; overflow: hidden; }\
-#ejf-sd-filtermenu .ejf-fm-segbtn { flex: 1; background: transparent; color: #cfd6dd; border: none; border-right: 1px solid #3a434d; padding: 5px 6px; cursor: pointer; font-size: 12px; }\
-#ejf-sd-filtermenu .ejf-fm-segbtn:last-child { border-right: none; }\
-#ejf-sd-filtermenu .ejf-fm-segbtn:hover { background: #2c333a; }\
-#ejf-sd-filtermenu .ejf-fm-segbtn.on { background: #4c9aff; color: #fff; font-weight: 700; }\
-#ejf-sd-filtermenu .ejf-fm-created { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }\
-#ejf-sd-filtermenu .ejf-fm-num { width: 54px; background: #0f1316; color: #e6e6e6; border: 1px solid #3a434d; border-radius: 4px; padding: 4px 6px; font-size: 12px; outline: none; }\
-#ejf-sd-filtermenu .ejf-fm-num:focus { border-color: #4c9aff; }\
-#ejf-sd-filtermenu .ejf-fm-unit { color: #9aa6b2; margin-right: 2px; }\
-#ejf-sd-filtermenu .ejf-fm-chip { background: #2c333a; color: #cfd6dd; border: 1px solid #3a434d; border-radius: 10px; padding: 2px 8px; cursor: pointer; font-size: 11px; }\
-#ejf-sd-filtermenu .ejf-fm-chip:hover { border-color: #4c9aff; color: #fff; }\
-#ejf-sd-filtermenu .ejf-fm-reset { display: block; width: 100%; margin-top: 10px; background: transparent; color: #9aa6b2; border: 1px solid #3a434d; border-radius: 5px; padding: 5px; cursor: pointer; font-size: 11px; }\
-#ejf-sd-filtermenu .ejf-fm-reset:hover { color: #fff; border-color: #4c9aff; }\
-#ejf-sd-filtermenu .ejf-fm-view { display: block; width: 100%; margin: 0 0 10px; background: #2c333a; color: #cfd6dd; border: 1px solid #3a434d; border-radius: 5px; padding: 6px; cursor: pointer; font-size: 12px; text-align: center; }\
-#ejf-sd-filtermenu .ejf-fm-view:hover { color: #fff; border-color: #4c9aff; }\
-#ejf-sd-filtermenu .ejf-fm-view.on { background: #4c9aff; color: #fff; font-weight: 700; border-color: #4c9aff; }\
-.ejf-sd-list li.ejf-sd-stale { opacity: .6; }\
-.ejf-sd-sum { margin-top: 2px; color: #e6e6e6; overflow-wrap: anywhere; word-break: break-word; }\
-.ejf-sd-meta { margin-top: 2px; color: #7a8694; font-size: 10px; overflow-wrap: anywhere; word-break: break-word; }\
-.ejf-sd-date { margin-top: 2px; color: #7a8694; font-size: 10px; text-align: right; }\
-#ejf-sd-loglink { display: none; padding: 6px 10px; border-bottom: 1px solid #2c333a; background: #20262b; }\
-#ejf-sd-loglink.has-hits { display: block; }\
-#ejf-sd-loglink .ejf-sd-loglink-head { font-weight: 700; color: #ffb547; font-size: 11px; margin-bottom: 4px; }\
-#ejf-sd-loglink ul { list-style: none; margin: 0; padding: 0; }\
-#ejf-sd-loglink li { padding: 3px 0; cursor: default; }\
-#ejf-sd-loglink a { color: #4c9aff; font-weight: 700; text-decoration: none; }\
-#ejf-sd-loglink a:hover { text-decoration: underline; }\
-#ejf-sd-loglink .count { color: #cfd6dd; background: #3a434d; border-radius: 8px; padding: 0 7px; font-size: 10px; font-weight: 700; margin-left: 6px; }\
-.ejf-sd-loose { font-size: 10px; color: #9aa6b2; margin-left: 6px; }\
-#ejf-sd-exccluster { display: none; padding: 6px 10px; border-bottom: 1px solid #2c333a; background: #20262b; }\
-#ejf-sd-exccluster.has-hits { display: block; }\
-#ejf-sd-exccluster .ejf-sd-exccluster-head { font-weight: 700; color: #cfd6dd; font-size: 11px; margin-bottom: 4px; }\
-#ejf-sd-panel.collapsed #ejf-sd-status, #ejf-sd-panel.collapsed #ejf-sd-loglink, #ejf-sd-panel.collapsed #ejf-sd-exccluster, #ejf-sd-panel.collapsed #ejf-sd-list { display: none; }\
-#ejf-sd-panel.ejf-sd-up { flex-direction: column-reverse; }\
-#ejf-sd-toast { position: fixed; right: 18px; bottom: 18px; z-index: 9001; background: #333; color: #eee; padding: 8px 14px;\
+#jita-sd-head { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: #282d33; cursor: move; user-select: none; }\
+#jita-sd-panel.jita-sd-dragging { opacity: .92; }\
+#jita-sd-title { font-weight: 700; flex: 1; }\
+#jita-sd-mode { font-size: 10px; background: #3a434d; padding: 1px 6px; border-radius: 8px; cursor: pointer; user-select: none; }\
+#jita-sd-mode:hover { background: #4a545f; }\
+#jita-sd-filter { flex: 1 1 60px; min-width: 0; height: 20px; box-sizing: border-box; padding: 0 6px; font-size: 11px; border: 1px solid #3a434d; border-radius: 8px; background: #14181b; color: #e6e6e6; outline: none; }\
+#jita-sd-filter:focus { border-color: #4c9aff; }\
+#jita-sd-collapse { cursor: pointer; padding: 0 4px; font-weight: 700; }\
+#jita-sd-status { padding: 6px 10px; color: #aab3bd; border-bottom: 1px solid #2c333a; }\
+#jita-sd-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; }\
+#jita-sd-list li { padding: 7px 10px; border-bottom: 1px solid #2c333a; min-width: 0; overflow-wrap: anywhere; word-break: break-word; }\
+#jita-sd-list a { color: #4c9aff; font-weight: 700; text-decoration: none; overflow-wrap: anywhere; }\
+#jita-sd-list a:hover { text-decoration: underline; }\
+.jita-sd-proj { font-size: 10px; background: #3a434d; padding: 0 5px; border-radius: 7px; margin-left: 6px; }\
+.jita-sd-score { float: right; color: #7a8694; font-size: 10px; }\
+.jita-sd-link { float: right; margin-right: 8px; font-size: 10px; color: #9fb4cc; cursor: pointer; user-select: none; }\
+.jita-sd-link:hover { color: #4c9aff; text-decoration: underline; }\
+.jita-sd-link.jita-sd-linking { color: #7a8694; cursor: default; text-decoration: none; }\
+.jita-sd-link.jita-sd-linked { color: #4caf7d; cursor: default; text-decoration: none; }\
+.jita-sd-link.jita-sd-noattach { color: #7a8694 !important; cursor: default; text-decoration: none; }\
+.jita-sd-hide { float: right; margin-right: 8px; cursor: pointer; color: #7a8694; display: inline-flex; align-items: center; user-select: none; }\
+.jita-sd-hide:hover { color: #ff8f8f; }\
+.jita-sd-hide svg { display: block; }\
+#jita-sd-hidemenu { position: fixed; z-index: 10002; background: #14181b; color: #e6e6e6; border: 1px solid #3a434d; border-radius: 6px; box-shadow: 0 6px 24px rgba(0,0,0,.55); padding: 6px; font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif; font-size: 12px; min-width: 150px; }\
+#jita-sd-hidemenu .jita-sd-hidemenu-label { color: #9aa6b2; font-size: 10px; padding: 2px 6px 6px; white-space: nowrap; }\
+#jita-sd-hidemenu .jita-sd-hidemenu-btn { display: block; width: 100%; text-align: left; background: transparent; color: #e6e6e6; border: none; border-radius: 4px; padding: 6px 8px; cursor: pointer; font-size: 12px; }\
+#jita-sd-hidemenu .jita-sd-hidemenu-btn:hover { background: #2c333a; }\
+#jita-sd-filterbtn { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; border-radius: 6px; color: #9aa6b2; cursor: pointer; user-select: none; position: relative; flex: 0 0 auto; }\
+#jita-sd-filterbtn:hover { color: #e6e6e6; background: #3a434d; }\
+#jita-sd-filterbtn.active { color: #4c9aff; }\
+#jita-sd-filterbtn.active::after { content: ""; position: absolute; top: 1px; right: 1px; width: 5px; height: 5px; border-radius: 50%; background: #4c9aff; }\
+#jita-sd-filtermenu { position: fixed; z-index: 10002; background: #14181b; color: #e6e6e6; border: 1px solid #3a434d; border-radius: 6px; box-shadow: 0 6px 24px rgba(0,0,0,.55); padding: 10px; font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif; font-size: 12px; min-width: 190px; }\
+#jita-sd-filtermenu .jita-fm-label { color: #9aa6b2; font-size: 10px; text-transform: uppercase; letter-spacing: .04em; margin: 2px 0 5px; }\
+#jita-sd-filtermenu .jita-fm-seg { display: flex; margin-bottom: 10px; border: 1px solid #3a434d; border-radius: 6px; overflow: hidden; }\
+#jita-sd-filtermenu .jita-fm-segbtn { flex: 1; background: transparent; color: #cfd6dd; border: none; border-right: 1px solid #3a434d; padding: 5px 6px; cursor: pointer; font-size: 12px; }\
+#jita-sd-filtermenu .jita-fm-segbtn:last-child { border-right: none; }\
+#jita-sd-filtermenu .jita-fm-segbtn:hover { background: #2c333a; }\
+#jita-sd-filtermenu .jita-fm-segbtn.on { background: #4c9aff; color: #fff; font-weight: 700; }\
+#jita-sd-filtermenu .jita-fm-created { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }\
+#jita-sd-filtermenu .jita-fm-num { width: 54px; background: #0f1316; color: #e6e6e6; border: 1px solid #3a434d; border-radius: 4px; padding: 4px 6px; font-size: 12px; outline: none; }\
+#jita-sd-filtermenu .jita-fm-num:focus { border-color: #4c9aff; }\
+#jita-sd-filtermenu .jita-fm-unit { color: #9aa6b2; margin-right: 2px; }\
+#jita-sd-filtermenu .jita-fm-chip { background: #2c333a; color: #cfd6dd; border: 1px solid #3a434d; border-radius: 10px; padding: 2px 8px; cursor: pointer; font-size: 11px; }\
+#jita-sd-filtermenu .jita-fm-chip:hover { border-color: #4c9aff; color: #fff; }\
+#jita-sd-filtermenu .jita-fm-reset { display: block; width: 100%; margin-top: 10px; background: transparent; color: #9aa6b2; border: 1px solid #3a434d; border-radius: 5px; padding: 5px; cursor: pointer; font-size: 11px; }\
+#jita-sd-filtermenu .jita-fm-reset:hover { color: #fff; border-color: #4c9aff; }\
+#jita-sd-filtermenu .jita-fm-view { display: block; width: 100%; margin: 0 0 10px; background: #2c333a; color: #cfd6dd; border: 1px solid #3a434d; border-radius: 5px; padding: 6px; cursor: pointer; font-size: 12px; text-align: center; }\
+#jita-sd-filtermenu .jita-fm-view:hover { color: #fff; border-color: #4c9aff; }\
+#jita-sd-filtermenu .jita-fm-view.on { background: #4c9aff; color: #fff; font-weight: 700; border-color: #4c9aff; }\
+.jita-sd-list li.jita-sd-stale { opacity: .6; }\
+.jita-sd-sum { margin-top: 2px; color: #e6e6e6; overflow-wrap: anywhere; word-break: break-word; }\
+.jita-sd-meta { margin-top: 2px; color: #7a8694; font-size: 10px; overflow-wrap: anywhere; word-break: break-word; }\
+.jita-sd-date { margin-top: 2px; color: #7a8694; font-size: 10px; text-align: right; }\
+#jita-sd-loglink { display: none; padding: 6px 10px; border-bottom: 1px solid #2c333a; background: #20262b; }\
+#jita-sd-loglink.has-hits { display: block; }\
+#jita-sd-loglink .jita-sd-loglink-head { font-weight: 700; color: #ffb547; font-size: 11px; margin-bottom: 4px; }\
+#jita-sd-loglink ul { list-style: none; margin: 0; padding: 0; }\
+#jita-sd-loglink li { padding: 3px 0; cursor: default; }\
+#jita-sd-loglink a { color: #4c9aff; font-weight: 700; text-decoration: none; }\
+#jita-sd-loglink a:hover { text-decoration: underline; }\
+#jita-sd-loglink .count { color: #cfd6dd; background: #3a434d; border-radius: 8px; padding: 0 7px; font-size: 10px; font-weight: 700; margin-left: 6px; }\
+.jita-sd-loose { font-size: 10px; color: #9aa6b2; margin-left: 6px; }\
+#jita-sd-exccluster { display: none; padding: 6px 10px; border-bottom: 1px solid #2c333a; background: #20262b; }\
+#jita-sd-exccluster.has-hits { display: block; }\
+#jita-sd-exccluster .jita-sd-exccluster-head { font-weight: 700; color: #cfd6dd; font-size: 11px; margin-bottom: 4px; }\
+#jita-sd-panel.collapsed #jita-sd-status, #jita-sd-panel.collapsed #jita-sd-loglink, #jita-sd-panel.collapsed #jita-sd-exccluster, #jita-sd-panel.collapsed #jita-sd-list { display: none; }\
+#jita-sd-panel.jita-sd-up { flex-direction: column-reverse; }\
+#jita-sd-toast { position: fixed; right: 18px; bottom: 18px; z-index: 9001; background: #333; color: #eee; padding: 8px 14px;\
   border-radius: 6px; box-shadow: 0 4px 18px rgba(0,0,0,.45); font-family: -apple-system,Arial,sans-serif; font-size: 12px; max-width: 320px; }\
-#ejf-sd-tip { position: fixed; z-index: 10001; display: none; width: 420px; max-height: 60vh; overflow-y: auto;\
+#jita-sd-tip { position: fixed; z-index: 10001; display: none; width: 420px; max-height: 60vh; overflow-y: auto;\
   background: #14181b; color: #e6e6e6; border: 1px solid #3a434d; border-radius: 6px; box-shadow: 0 6px 24px rgba(0,0,0,.55);\
   padding: 10px 12px; font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif; font-size: 12px; line-height: 1.45; pointer-events: none; }\
-#ejf-sd-tip .ejf-sd-tip-title { font-weight: 700; color: #fff; margin-bottom: 4px; }\
-#ejf-sd-tip .ejf-sd-tip-meta { color: #9fb4cc; font-size: 10px; margin-bottom: 6px; }\
-#ejf-sd-tip .ejf-sd-tip-desc { color: #cfd6dd; white-space: pre-wrap; word-break: break-word; }\
-#ejf-sd-tip .ejf-sd-tip-dim { color: #7a8694; font-style: italic; }\
-#ejf-sd-tip .ejf-sd-tip-media { color: #9fb4cc; font-style: italic; padding: 6px 0; }\
-#ejf-sd-tip .ejf-sd-tip-html { white-space: normal; }\
-#ejf-sd-tip .ejf-sd-tip-html p { margin: 0 0 8px; }\
-#ejf-sd-tip .ejf-sd-tip-html p:last-child { margin-bottom: 0; }\
-#ejf-sd-tip .ejf-sd-tip-html ul, #ejf-sd-tip .ejf-sd-tip-html ol { margin: 4px 0; padding-left: 18px; }\
-#ejf-sd-tip .ejf-sd-tip-html h1, #ejf-sd-tip .ejf-sd-tip-html h2, #ejf-sd-tip .ejf-sd-tip-html h3, #ejf-sd-tip .ejf-sd-tip-html h4 { font-size: 12px; font-weight: 700; color: #fff; margin: 8px 0 4px; }\
-#ejf-sd-tip .ejf-sd-tip-html pre { white-space: pre-wrap; word-break: break-word; background: #0f1316; border: 1px solid #2c333a; border-radius: 4px; padding: 6px 8px; margin: 6px 0; font-family: "Courier New",monospace; font-size: 11px; }\
-#ejf-sd-tip .ejf-sd-tip-html code { font-family: "Courier New",monospace; }\
-#ejf-sd-tip .ejf-sd-tip-html img { max-width: 100%; height: auto; }\
-#ejf-sd-tip .ejf-sd-tip-html a { color: #4c9aff; }\
-#ejf-sd-tip .ejf-sd-tip-html table { border-collapse: collapse; margin: 6px 0; }\
-#ejf-sd-tip .ejf-sd-tip-html th, #ejf-sd-tip .ejf-sd-tip-html td { border: 1px solid #2c333a; padding: 2px 6px; }\
+#jita-sd-tip .jita-sd-tip-title { font-weight: 700; color: #fff; margin-bottom: 4px; }\
+#jita-sd-tip .jita-sd-tip-meta { color: #9fb4cc; font-size: 10px; margin-bottom: 6px; }\
+#jita-sd-tip .jita-sd-tip-desc { color: #cfd6dd; white-space: pre-wrap; word-break: break-word; }\
+#jita-sd-tip .jita-sd-tip-dim { color: #7a8694; font-style: italic; }\
+#jita-sd-tip .jita-sd-tip-media { color: #9fb4cc; font-style: italic; padding: 6px 0; }\
+#jita-sd-tip .jita-sd-tip-html { white-space: normal; }\
+#jita-sd-tip .jita-sd-tip-html p { margin: 0 0 8px; }\
+#jita-sd-tip .jita-sd-tip-html p:last-child { margin-bottom: 0; }\
+#jita-sd-tip .jita-sd-tip-html ul, #jita-sd-tip .jita-sd-tip-html ol { margin: 4px 0; padding-left: 18px; }\
+#jita-sd-tip .jita-sd-tip-html h1, #jita-sd-tip .jita-sd-tip-html h2, #jita-sd-tip .jita-sd-tip-html h3, #jita-sd-tip .jita-sd-tip-html h4 { font-size: 12px; font-weight: 700; color: #fff; margin: 8px 0 4px; }\
+#jita-sd-tip .jita-sd-tip-html pre { white-space: pre-wrap; word-break: break-word; background: #0f1316; border: 1px solid #2c333a; border-radius: 4px; padding: 6px 8px; margin: 6px 0; font-family: "Courier New",monospace; font-size: 11px; }\
+#jita-sd-tip .jita-sd-tip-html code { font-family: "Courier New",monospace; }\
+#jita-sd-tip .jita-sd-tip-html img { max-width: 100%; height: auto; }\
+#jita-sd-tip .jita-sd-tip-html a { color: #4c9aff; }\
+#jita-sd-tip .jita-sd-tip-html table { border-collapse: collapse; margin: 6px 0; }\
+#jita-sd-tip .jita-sd-tip-html th, #jita-sd-tip .jita-sd-tip-html td { border: 1px solid #2c333a; padding: 2px 6px; }\
 /* ---- integrated "Triage Assistant" context group (sidebar mode) ---- */\
 /* Styled with Atlassian design tokens so it blends into the native panel in both light + dark themes. */\
 /* Native-clone path (default): the cloned Details group already supplies the card / header / title font, so\
    we only need to hide its body and rotate its chevron on collapse. */\
-#ejf-side-group.collapsed [data-ejf-body] { display: none !important; }\
+#jita-side-group.collapsed [data-jita-body] { display: none !important; }\
 /* We clone a real context group (Development / More fields) for exact chrome, then swap the chevron path in\
    JS - down caret when open, right caret when collapsed - matching how Jira itself toggles it (no CSS rotate).\
    The cloned group ships without a full card border, so we draw our own complete bordered card and drop the\
    inner wrapper partial border so we do not double up. */\
-#ejf-side-group.ejf-ta-native { margin: 8px 0; border: 1px solid var(--ds-border, #091e4224); border-radius: 8px; box-sizing: border-box; overflow: hidden; }\
-#ejf-side-group.ejf-ta-native > div { border: none; }\
+#jita-side-group.jita-ta-native { margin: 8px 0; border: 1px solid var(--ds-border, #091e4224); border-radius: 8px; box-sizing: border-box; overflow: hidden; }\
+#jita-side-group.jita-ta-native > div { border: none; }\
 /* Kill the lingering focus ring on the (cloned) header button after a collapse-toggle click - the cloned\
    role=button keeps focus and Jira draws a blue outline/box-shadow around the whole card, which we do not\
    want on this static toggle. */\
-#ejf-side-group:focus, #ejf-side-group:focus-within, #ejf-side-group:focus-visible,\
-#ejf-side-group *:focus, #ejf-side-group *:focus-visible,\
-#ejf-side-header:focus, #ejf-side-header:focus-visible { outline: none !important; box-shadow: none !important; }\
+#jita-side-group:focus, #jita-side-group:focus-within, #jita-side-group:focus-visible,\
+#jita-side-group *:focus, #jita-side-group *:focus-visible,\
+#jita-side-header:focus, #jita-side-header:focus-visible { outline: none !important; box-shadow: none !important; }\
 /* Manual fallback path: drawn by hand to mimic the native group when the clone template is unavailable. */\
-#ejf-side-group.ejf-ta-manual { margin: 8px 0; padding: 0 16px 4px; border: 1px solid var(--ds-border, #091e4224); border-radius: 8px; }\
-#ejf-side-group.ejf-ta-manual.collapsed { padding-bottom: 0; }\
-#ejf-side-header { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; padding: 14px 0; }\
-#ejf-side-header .ejf-side-chevron { display: inline-flex; color: var(--ds-icon-subtle, #626f86); }\
-#ejf-side-header .ejf-side-chevron svg { width: 16px; height: 16px; }\
-#ejf-side-header .ejf-side-htitle { flex: 1; font-weight: 600; font-size: 16px; line-height: 1; color: var(--ds-text, #172b4d); }\
-#ejf-side-group .ejf-side-body { padding-bottom: 8px; padding-right: 14px; }\
-.ejf-side-subhead { display: flex; align-items: center; gap: 8px; margin: 2px 0 4px; }\
-.ejf-side-subhead #ejf-sd-title { flex: 1; font-weight: 600; font-size: 12px; color: var(--ds-text-subtle, #44546f); }\
-#ejf-side-group #ejf-sd-mode { font-size: 10px; background: var(--ds-background-neutral, #091e420f); color: var(--ds-text-subtle, #44546f); padding: 1px 6px; border-radius: 8px; }\
-#ejf-side-group #ejf-sd-filterbtn { color: var(--ds-text-subtle, #44546f); }\
-#ejf-side-group #ejf-sd-filterbtn:hover { color: var(--ds-text, #172b4d); background: var(--ds-background-neutral, #091e420f); }\
-#ejf-side-group #ejf-sd-filterbtn.active { color: var(--ds-link, #0c66e4); }\
-#ejf-side-group #ejf-sd-filterbtn.active::after { background: var(--ds-link, #0c66e4); }\
-#ejf-side-group #ejf-sd-filter { background: var(--ds-surface, #fff); color: var(--ds-text, #172b4d); border-color: var(--ds-border-input, #8590a2); }\
-#ejf-side-group #ejf-sd-filter:focus { border-color: var(--ds-border-focused, #388bff); }\
-#ejf-side-group #ejf-sd-status { padding: 4px 0; border-bottom: none; color: var(--ds-text-subtlest, #626f86); }\
-#ejf-side-group #ejf-sd-loglink { display: none; padding: 6px 0; border-bottom: 1px solid var(--ds-border, #091e4224); background: transparent; }\
-#ejf-side-group #ejf-sd-loglink.has-hits { display: block; }\
-#ejf-side-group #ejf-sd-loglink .ejf-sd-loglink-head { color: var(--ds-text-warning, #974f0c); }\
-#ejf-side-group #ejf-sd-exccluster { display: none; padding: 6px 0; border-bottom: 1px solid var(--ds-border, #091e4224); background: transparent; }\
-#ejf-side-group #ejf-sd-exccluster.has-hits { display: block; }\
-#ejf-side-group #ejf-sd-exccluster .ejf-sd-exccluster-head { color: var(--ds-text, #172b4d); }\
-#ejf-side-group #ejf-sd-exccluster .ejf-exc-member a { color: var(--ds-link, #0c66e4); }\
+#jita-side-group.jita-ta-manual { margin: 8px 0; padding: 0 16px 4px; border: 1px solid var(--ds-border, #091e4224); border-radius: 8px; }\
+#jita-side-group.jita-ta-manual.collapsed { padding-bottom: 0; }\
+#jita-side-header { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; padding: 14px 0; }\
+#jita-side-header .jita-side-chevron { display: inline-flex; color: var(--ds-icon-subtle, #626f86); }\
+#jita-side-header .jita-side-chevron svg { width: 16px; height: 16px; }\
+#jita-side-header .jita-side-htitle { flex: 1; font-weight: 600; font-size: 16px; line-height: 1; color: var(--ds-text, #172b4d); }\
+#jita-side-group .jita-side-body { padding-bottom: 8px; padding-right: 14px; }\
+.jita-side-subhead { display: flex; align-items: center; gap: 8px; margin: 2px 0 4px; }\
+.jita-side-subhead #jita-sd-title { flex: 1; font-weight: 600; font-size: 12px; color: var(--ds-text-subtle, #44546f); }\
+#jita-side-group #jita-sd-mode { font-size: 10px; background: var(--ds-background-neutral, #091e420f); color: var(--ds-text-subtle, #44546f); padding: 1px 6px; border-radius: 8px; }\
+#jita-side-group #jita-sd-filterbtn { color: var(--ds-text-subtle, #44546f); }\
+#jita-side-group #jita-sd-filterbtn:hover { color: var(--ds-text, #172b4d); background: var(--ds-background-neutral, #091e420f); }\
+#jita-side-group #jita-sd-filterbtn.active { color: var(--ds-link, #0c66e4); }\
+#jita-side-group #jita-sd-filterbtn.active::after { background: var(--ds-link, #0c66e4); }\
+#jita-side-group #jita-sd-filter { background: var(--ds-surface, #fff); color: var(--ds-text, #172b4d); border-color: var(--ds-border-input, #8590a2); }\
+#jita-side-group #jita-sd-filter:focus { border-color: var(--ds-border-focused, #388bff); }\
+#jita-side-group #jita-sd-status { padding: 4px 0; border-bottom: none; color: var(--ds-text-subtlest, #626f86); }\
+#jita-side-group #jita-sd-loglink { display: none; padding: 6px 0; border-bottom: 1px solid var(--ds-border, #091e4224); background: transparent; }\
+#jita-side-group #jita-sd-loglink.has-hits { display: block; }\
+#jita-side-group #jita-sd-loglink .jita-sd-loglink-head { color: var(--ds-text-warning, #974f0c); }\
+#jita-side-group #jita-sd-exccluster { display: none; padding: 6px 0; border-bottom: 1px solid var(--ds-border, #091e4224); background: transparent; }\
+#jita-side-group #jita-sd-exccluster.has-hits { display: block; }\
+#jita-side-group #jita-sd-exccluster .jita-sd-exccluster-head { color: var(--ds-text, #172b4d); }\
+#jita-side-group #jita-sd-exccluster .jita-exc-member a { color: var(--ds-link, #0c66e4); }\
 /* Responsive 2-up grid: two columns once the context column is wide enough (each cell >= 180px),\
    automatically collapsing to one column when narrow. The min track is 180px (not 280px) because the Jira\
    context column on a 1920-wide screen is only ~400px, so a 280px min never left room for a second column\
    there; 180px fits two columns (2*180 + 14px gap) in that width while still collapsing to one on a narrow\
    laptop. align-items:stretch so both cards in a row share the height of the taller one (columns line up). */\
-#ejf-side-group #ejf-sd-list { overflow: visible; display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); column-gap: 14px; align-items: stretch; }\
+#jita-side-group #jita-sd-list { overflow: visible; display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); column-gap: 14px; align-items: stretch; }\
 /* Each card is position:relative + bottom padding so the created date can be pinned to the bottom-right\
    (absolute) of the STRETCHED cell - so the dates line up across the two columns even when one card has\
    less content than the other (the short card no longer floats its date mid-card with a gap below it). */\
-#ejf-side-group #ejf-sd-list li { position: relative; padding: 7px 0 22px; border-bottom: 1px solid var(--ds-border, #091e4224); }\
-#ejf-side-group .ejf-sd-date { position: absolute; right: 0; bottom: 7px; margin-top: 0; }\
+#jita-side-group #jita-sd-list li { position: relative; padding: 7px 0 22px; border-bottom: 1px solid var(--ds-border, #091e4224); }\
+#jita-side-group .jita-sd-date { position: absolute; right: 0; bottom: 7px; margin-top: 0; }\
 /* With a grid the simple :last-child no-border rule is wrong (only kills one of the bottom row); leave\
    borders on every item - a faint divider under each card reads fine in either column count. */\
-#ejf-side-group #ejf-sd-list a, #ejf-side-group .ejf-sd-link { color: var(--ds-link, #0c66e4); }\
-#ejf-side-group .ejf-sd-sum { color: var(--ds-text, #172b4d); }\
-#ejf-side-group .ejf-sd-meta, #ejf-side-group .ejf-sd-score, #ejf-side-group .ejf-sd-date { color: var(--ds-text-subtlest, #626f86); }\
-#ejf-side-group .ejf-sd-proj { background: var(--ds-background-neutral, #091e420f); color: var(--ds-text-subtle, #44546f); }\
-#ejf-side-group .ejf-sd-hide { color: var(--ds-text-subtlest, #626f86); }\
-#ejf-side-group .ejf-sd-hide:hover { color: #c9372c; }\
-#ejf-side-group .ejf-sd-link.ejf-sd-linked { color: var(--ds-text-success, #216e4e); }',
+#jita-side-group #jita-sd-list a, #jita-side-group .jita-sd-link { color: var(--ds-link, #0c66e4); }\
+#jita-side-group .jita-sd-sum { color: var(--ds-text, #172b4d); }\
+#jita-side-group .jita-sd-meta, #jita-side-group .jita-sd-score, #jita-side-group .jita-sd-date { color: var(--ds-text-subtlest, #626f86); }\
+#jita-side-group .jita-sd-proj { background: var(--ds-background-neutral, #091e420f); color: var(--ds-text-subtle, #44546f); }\
+#jita-side-group .jita-sd-hide { color: var(--ds-text-subtlest, #626f86); }\
+#jita-side-group .jita-sd-hide:hover { color: #c9372c; }\
+#jita-side-group .jita-sd-link.jita-sd-linked { color: var(--ds-text-success, #216e4e); }',
 
     injectCss: function () {
-        if (!EJF_SD.ui._cssInjected) { GM_addStyle(EJF_SD.ui.css); EJF_SD.ui._cssInjected = true; }
+        if (!JiTA.ui._cssInjected) { GM_addStyle(JiTA.ui.css); JiTA.ui._cssInjected = true; }
     },
 
     // Brief transient message (e.g. sync started/finished), independent of the panel.
     toast: function (msg) {
-        EJF_SD.ui.injectCss();
-        var $t = $('#ejf-sd-toast');
-        if (!$t.length) { $t = $('<div id="ejf-sd-toast"></div>').appendTo(document.body); }
+        JiTA.ui.injectCss();
+        var $t = $('#jita-sd-toast');
+        if (!$t.length) { $t = $('<div id="jita-sd-toast"></div>').appendTo(document.body); }
         $t.text(msg).show();
-        if (EJF_SD.ui._toastTimer) { clearTimeout(EJF_SD.ui._toastTimer); }
-        EJF_SD.ui._toastTimer = setTimeout(function () { $('#ejf-sd-toast').fadeOut(400); }, 4000);
+        if (JiTA.ui._toastTimer) { clearTimeout(JiTA.ui._toastTimer); }
+        JiTA.ui._toastTimer = setTimeout(function () { $('#jita-sd-toast').fadeOut(400); }, 4000);
     },
 
-    setStatus: function (msg) { $('#ejf-sd-status').text(msg); },
+    setStatus: function (msg) { $('#jita-sd-status').text(msg); },
 
     // ---- live filter box + clickable ranking-mode badge (left of the Keyword/Hybrid label) ----
     // The filter re-QUERIES the whole local database (not just the rows already on screen): the typed word(s)
@@ -5719,26 +5719,26 @@ EJF_SD.ui = {
     reporterMode: false,       // EBR view: when on, the panel lists the reporter's OTHER reports instead of similar defects (session-only; reset on navigation)
     _filterTimer: null,
     _wireFilter: function () {
-        if (EJF_SD.ui._filterWired) { return; }   // one set of delegated handlers survives chrome re-mounts
-        EJF_SD.ui._filterWired = true;
-        $(document).on('click', '#ejf-sd-mode', function () { EJF_SD.ui._cycleMode(); });
+        if (JiTA.ui._filterWired) { return; }   // one set of delegated handlers survives chrome re-mounts
+        JiTA.ui._filterWired = true;
+        $(document).on('click', '#jita-sd-mode', function () { JiTA.ui._cycleMode(); });
         // Funnel button: toggle the filter popover (delegated so it survives the chrome re-mounting).
-        $(document).on('click', '#ejf-sd-filterbtn', function (e) {
+        $(document).on('click', '#jita-sd-filterbtn', function (e) {
             e.preventDefault(); e.stopPropagation();
-            if (document.getElementById('ejf-sd-filtermenu')) { EJF_SD.ui._closeFilterMenu(); }
-            else { EJF_SD.ui._showFilterMenu(this); }
+            if (document.getElementById('jita-sd-filtermenu')) { JiTA.ui._closeFilterMenu(); }
+            else { JiTA.ui._showFilterMenu(this); }
         });
         // Debounced re-query as the user types. (We previously tried to keep Jira from flagging the page as
         // having "unsubmitted changes" - it warns on reload because the filter input lives inside its issue
         // view - but the detection runs ahead of anything we can intercept, so we just accept the warning.)
-        $(document).on('input', '#ejf-sd-filter', function () {
-            if (EJF_SD.ui._filterTimer) { clearTimeout(EJF_SD.ui._filterTimer); }
-            EJF_SD.ui._filterTimer = setTimeout(function () { EJF_SD.ui._rerenderCurrent(); }, 200);
+        $(document).on('input', '#jita-sd-filter', function () {
+            if (JiTA.ui._filterTimer) { clearTimeout(JiTA.ui._filterTimer); }
+            JiTA.ui._filterTimer = setTimeout(function () { JiTA.ui._rerenderCurrent(); }, 200);
         });
     },
     // The active filter terms (lowercased, whitespace-split) from the box, or [] when empty.
     _filterTerms: function () {
-        var $inp = $('#ejf-sd-filter');
+        var $inp = $('#jita-sd-filter');
         if (!$inp.length) { return []; }
         var q = ($inp.val() || '').toLowerCase().replace(/\s+/g, ' ').trim();
         return q ? q.split(' ') : [];
@@ -5746,23 +5746,23 @@ EJF_SD.ui = {
     // Re-render whichever view is open (EBR -> similar defects, EDR/EO -> matching reports), re-reading the
     // filter terms + mode override. Used by the filter box and the mode-badge toggle.
     _rerenderCurrent: function () {
-        var k = EJF_SD.ui.currentKey;
+        var k = JiTA.ui.currentKey;
         if (!k) { return; }
-        if (/^EBR-/.test(k)) { EJF_SD.ui.render(k); }
-        else if (EJF_SD.ui._isReportsKey(k)) { EJF_SD.ui.renderReports(k); }
+        if (/^EBR-/.test(k)) { JiTA.ui.render(k); }
+        else if (JiTA.ui._isReportsKey(k)) { JiTA.ui.renderReports(k); }
     },
     // Toggle the session ranking-mode override (Hybrid <-> Keyword) and re-render. No-op (with a hint) when
     // semantic embeddings are unavailable, since Hybrid isn't possible then.
     _cycleMode: function () {
-        if (EJF_SD.embed && EJF_SD.embed.unavailable) { EJF_SD.ui.toast('Semantic embeddings unavailable - keyword ranking only.'); return; }
-        var cur = EJF_SD.ui.modeOverride;
-        if (cur === 'Keyword') { EJF_SD.ui.modeOverride = 'Hybrid'; }
-        else if (cur === 'Hybrid') { EJF_SD.ui.modeOverride = 'Keyword'; }
+        if (JiTA.embed && JiTA.embed.unavailable) { JiTA.ui.toast('Semantic embeddings unavailable - keyword ranking only.'); return; }
+        var cur = JiTA.ui.modeOverride;
+        if (cur === 'Keyword') { JiTA.ui.modeOverride = 'Hybrid'; }
+        else if (cur === 'Hybrid') { JiTA.ui.modeOverride = 'Keyword'; }
         else {   // automatic so far -> flip to the opposite of what's currently displayed
-            var shown = ($('#ejf-sd-mode').text() || '').toLowerCase();
-            EJF_SD.ui.modeOverride = (shown.indexOf('hybrid') >= 0) ? 'Keyword' : 'Hybrid';
+            var shown = ($('#jita-sd-mode').text() || '').toLowerCase();
+            JiTA.ui.modeOverride = (shown.indexOf('hybrid') >= 0) ? 'Keyword' : 'Hybrid';
         }
-        EJF_SD.ui._rerenderCurrent();
+        JiTA.ui._rerenderCurrent();
     },
 
     // ---- session filters (funnel popover): Status (Open/Fixed/All) + Created-within-N-days ----
@@ -5775,10 +5775,10 @@ EJF_SD.ui = {
     // bug reports are open by definition, so it's a no-op on the reports view even if 'fixed' is left set).
     // Created-within applies to any candidate carrying a `created` date.
     passesFilter: function (doc) {
-        var f = EJF_SD.ui.filters;
+        var f = JiTA.ui.filters;
         if (!f) { return true; }
         if (f.status && f.status !== 'all' && doc.project !== 'EBR') {
-            var resolved = EJF_SD.util.isResolved(doc.status, doc.resolution);
+            var resolved = JiTA.util.isResolved(doc.status, doc.resolution);
             if (f.status === 'open' && resolved) { return false; }
             if (f.status === 'fixed' && !resolved) { return false; }
         }
@@ -5792,10 +5792,10 @@ EJF_SD.ui = {
     // Whether any filter that AFFECTS the current view is active (drives the funnel's active dot). Status only
     // counts on the similar-defects (EBR) view; Created counts on both.
     _filtersActive: function () {
-        var f = EJF_SD.ui.filters;
+        var f = JiTA.ui.filters;
         if (!f) { return false; }
-        var onEbr = /^EBR-/.test(EJF_SD.ui.currentKey || '');
-        if (onEbr && EJF_SD.ui.reporterMode) { return true; }   // reporter's-other-reports view is active
+        var onEbr = /^EBR-/.test(JiTA.ui.currentKey || '');
+        if (onEbr && JiTA.ui.reporterMode) { return true; }   // reporter's-other-reports view is active
         return !!((onEbr && f.status && f.status !== 'all') || f.createdDays > 0);
     },
 
@@ -5803,89 +5803,89 @@ EJF_SD.ui = {
 
     // Reflect the active-filter state on the funnel button (colored + dot). Called on every render + change.
     _syncFilterBtn: function () {
-        var $b = $('#ejf-sd-filterbtn');
-        if ($b.length) { $b.toggleClass('active', EJF_SD.ui._filtersActive()); }
+        var $b = $('#jita-sd-filterbtn');
+        if ($b.length) { $b.toggleClass('active', JiTA.ui._filtersActive()); }
     },
 
     // Build + show the filter popover under the funnel button. Rebuilt each open so it can be view-aware
-    // (Status is only shown on the similar-defects view). Changes update EJF_SD.ui.filters + re-render live.
+    // (Status is only shown on the similar-defects view). Changes update JiTA.ui.filters + re-render live.
     _showFilterMenu: function (anchor) {
-        EJF_SD.ui._closeFilterMenu();
-        EJF_SD.ui._hideTip();
-        var f = EJF_SD.ui.filters;
-        var onEbr = /^EBR-/.test(EJF_SD.ui.currentKey || '');   // similar-defects view -> Status applies
+        JiTA.ui._closeFilterMenu();
+        JiTA.ui._hideTip();
+        var f = JiTA.ui.filters;
+        var onEbr = /^EBR-/.test(JiTA.ui.currentKey || '');   // similar-defects view -> Status applies
         var menu = document.createElement('div');
-        menu.id = 'ejf-sd-filtermenu';
+        menu.id = 'jita-sd-filtermenu';
 
         // Reporter's-other-reports toggle (EBR view only): swaps the similar-defects list for this reporter's
         // other synced reports, and back. In reporter mode the ranking filters below don't apply, so they're hidden.
         if (onEbr) {
             var vb = document.createElement('button');
             vb.type = 'button';
-            vb.className = 'ejf-fm-view' + (EJF_SD.ui.reporterMode ? ' on' : '');
-            vb.textContent = EJF_SD.ui.reporterMode ? '← Back to similar defects' : '⚑ This reporter’s other reports';
+            vb.className = 'jita-fm-view' + (JiTA.ui.reporterMode ? ' on' : '');
+            vb.textContent = JiTA.ui.reporterMode ? '← Back to similar defects' : '⚑ This reporter’s other reports';
             vb.addEventListener('click', function () {
-                EJF_SD.ui.reporterMode = !EJF_SD.ui.reporterMode;
-                EJF_SD.ui._closeFilterMenu();
-                EJF_SD.ui._syncFilterBtn();
-                EJF_SD.ui._rerenderCurrent();
+                JiTA.ui.reporterMode = !JiTA.ui.reporterMode;
+                JiTA.ui._closeFilterMenu();
+                JiTA.ui._syncFilterBtn();
+                JiTA.ui._rerenderCurrent();
             });
             menu.appendChild(vb);
         }
 
-        if (!(onEbr && EJF_SD.ui.reporterMode)) {
+        if (!(onEbr && JiTA.ui.reporterMode)) {
         if (onEbr) {
-            var sl = document.createElement('div'); sl.className = 'ejf-fm-label'; sl.textContent = 'Status'; menu.appendChild(sl);
-            var seg = document.createElement('div'); seg.className = 'ejf-fm-seg';
+            var sl = document.createElement('div'); sl.className = 'jita-fm-label'; sl.textContent = 'Status'; menu.appendChild(sl);
+            var seg = document.createElement('div'); seg.className = 'jita-fm-seg';
             [['open', 'Open'], ['fixed', 'Closed'], ['all', 'All']].forEach(function (o) {
                 var b = document.createElement('button');
                 b.type = 'button';
-                b.className = 'ejf-fm-segbtn' + (f.status === o[0] ? ' on' : '');
+                b.className = 'jita-fm-segbtn' + (f.status === o[0] ? ' on' : '');
                 b.textContent = o[1];
                 b.addEventListener('click', function () {
-                    EJF_SD.ui.filters.status = o[0];
-                    var bs = seg.querySelectorAll('.ejf-fm-segbtn');
+                    JiTA.ui.filters.status = o[0];
+                    var bs = seg.querySelectorAll('.jita-fm-segbtn');
                     for (var i = 0; i < bs.length; i++) { bs[i].classList.remove('on'); }
                     b.classList.add('on');
-                    EJF_SD.ui._syncFilterBtn();
-                    EJF_SD.ui._rerenderCurrent();
+                    JiTA.ui._syncFilterBtn();
+                    JiTA.ui._rerenderCurrent();
                 });
                 seg.appendChild(b);
             });
             menu.appendChild(seg);
         }
 
-        var cl = document.createElement('div'); cl.className = 'ejf-fm-label'; cl.textContent = 'Created within'; menu.appendChild(cl);
-        var crow = document.createElement('div'); crow.className = 'ejf-fm-created';
+        var cl = document.createElement('div'); cl.className = 'jita-fm-label'; cl.textContent = 'Created within'; menu.appendChild(cl);
+        var crow = document.createElement('div'); crow.className = 'jita-fm-created';
         var inp = document.createElement('input');
-        inp.type = 'number'; inp.min = '0'; inp.className = 'ejf-fm-num'; inp.placeholder = 'any';
+        inp.type = 'number'; inp.min = '0'; inp.className = 'jita-fm-num'; inp.placeholder = 'any';
         inp.value = f.createdDays > 0 ? String(f.createdDays) : '';
-        var unit = document.createElement('span'); unit.className = 'ejf-fm-unit'; unit.textContent = 'days';
+        var unit = document.createElement('span'); unit.className = 'jita-fm-unit'; unit.textContent = 'days';
         var ct = null;
         function commitDays() {
             var v = parseInt(inp.value, 10);
-            EJF_SD.ui.filters.createdDays = (!isNaN(v) && v > 0) ? v : 0;
-            EJF_SD.ui._syncFilterBtn();
-            EJF_SD.ui._rerenderCurrent();
+            JiTA.ui.filters.createdDays = (!isNaN(v) && v > 0) ? v : 0;
+            JiTA.ui._syncFilterBtn();
+            JiTA.ui._rerenderCurrent();
         }
         inp.addEventListener('input', function () { if (ct) { clearTimeout(ct); } ct = setTimeout(commitDays, 250); });
         inp.addEventListener('change', commitDays);
         crow.appendChild(inp);
         crow.appendChild(unit);
         [7, 30, 90].forEach(function (n) {
-            var p = document.createElement('button'); p.type = 'button'; p.className = 'ejf-fm-chip'; p.textContent = n + 'd';
+            var p = document.createElement('button'); p.type = 'button'; p.className = 'jita-fm-chip'; p.textContent = n + 'd';
             p.addEventListener('click', function () { inp.value = String(n); commitDays(); });
             crow.appendChild(p);
         });
         menu.appendChild(crow);
 
         var reset = document.createElement('button');
-        reset.type = 'button'; reset.className = 'ejf-fm-reset'; reset.textContent = 'Reset filters';
+        reset.type = 'button'; reset.className = 'jita-fm-reset'; reset.textContent = 'Reset filters';
         reset.addEventListener('click', function () {
-            EJF_SD.ui.filters = { status: 'all', createdDays: 0 };
-            EJF_SD.ui._closeFilterMenu();
-            EJF_SD.ui._syncFilterBtn();
-            EJF_SD.ui._rerenderCurrent();
+            JiTA.ui.filters = { status: 'all', createdDays: 0 };
+            JiTA.ui._closeFilterMenu();
+            JiTA.ui._syncFilterBtn();
+            JiTA.ui._rerenderCurrent();
         });
         menu.appendChild(reset);
         }   // end !reporterMode (ranking filters hidden while showing the reporter's other reports)
@@ -5901,24 +5901,24 @@ EJF_SD.ui = {
         menu.style.top = Math.max(6, top) + 'px';
         // Dismiss on outside click / Esc (registered next tick so the opening click doesn't self-close; the
         // funnel itself is excluded so its click handler can toggle the menu shut).
-        EJF_SD.ui._filterMenuDismiss = function (e) {
-            if (e.type === 'keydown') { if (e.key === 'Escape') { EJF_SD.ui._closeFilterMenu(); } return; }
+        JiTA.ui._filterMenuDismiss = function (e) {
+            if (e.type === 'keydown') { if (e.key === 'Escape') { JiTA.ui._closeFilterMenu(); } return; }
             if (menu.contains(e.target) || (anchor && anchor.contains && anchor.contains(e.target))) { return; }
-            EJF_SD.ui._closeFilterMenu();
+            JiTA.ui._closeFilterMenu();
         };
         setTimeout(function () {
-            document.addEventListener('mousedown', EJF_SD.ui._filterMenuDismiss, true);
-            document.addEventListener('keydown', EJF_SD.ui._filterMenuDismiss, true);
+            document.addEventListener('mousedown', JiTA.ui._filterMenuDismiss, true);
+            document.addEventListener('keydown', JiTA.ui._filterMenuDismiss, true);
         }, 0);
     },
 
     _closeFilterMenu: function () {
-        var m = document.getElementById('ejf-sd-filtermenu');
+        var m = document.getElementById('jita-sd-filtermenu');
         if (m && m.parentNode) { m.parentNode.removeChild(m); }
-        if (EJF_SD.ui._filterMenuDismiss) {
-            document.removeEventListener('mousedown', EJF_SD.ui._filterMenuDismiss, true);
-            document.removeEventListener('keydown', EJF_SD.ui._filterMenuDismiss, true);
-            EJF_SD.ui._filterMenuDismiss = null;
+        if (JiTA.ui._filterMenuDismiss) {
+            document.removeEventListener('mousedown', JiTA.ui._filterMenuDismiss, true);
+            document.removeEventListener('keydown', JiTA.ui._filterMenuDismiss, true);
+            JiTA.ui._filterMenuDismiss = null;
         }
     },
 
@@ -5963,14 +5963,14 @@ EJF_SD.ui = {
     // failure resolves '' WITHOUT caching so the next hover retries.
     _renderedCache: {},
     _getRendered: function (key) {
-        if (Object.prototype.hasOwnProperty.call(EJF_SD.ui._renderedCache, key)) {
-            return Promise.resolve(EJF_SD.ui._renderedCache[key]);
+        if (Object.prototype.hasOwnProperty.call(JiTA.ui._renderedCache, key)) {
+            return Promise.resolve(JiTA.ui._renderedCache[key]);
         }
         return new Promise(function (resolve) {
-            $.ajax({ url: EJF_SD.HOST + '/rest/api/2/issue/' + key + '?fields=description&expand=renderedFields', dataType: 'json' })
+            $.ajax({ url: JiTA.HOST + '/rest/api/2/issue/' + key + '?fields=description&expand=renderedFields', dataType: 'json' })
                 .done(function (d) {
                     var html = (d && d.renderedFields && d.renderedFields.description) || '';
-                    EJF_SD.ui._renderedCache[key] = html;
+                    JiTA.ui._renderedCache[key] = html;
                     resolve(html);
                 })
                 .fail(function () { resolve(''); });
@@ -5983,15 +5983,15 @@ EJF_SD.ui = {
     // the fetch returns. _tipKey guards the async swap so a slow fetch can't replace a tip we've moved off of.
     _tipKey: null,
     _showTip: function (r, anchor, meta) {
-        EJF_SD.ui.injectCss();
-        EJF_SD.ui._tipKey = r.key;
-        var $tip = $('#ejf-sd-tip');
-        if (!$tip.length) { $tip = $('<div id="ejf-sd-tip"></div>').appendTo(document.body); }
+        JiTA.ui.injectCss();
+        JiTA.ui._tipKey = r.key;
+        var $tip = $('#jita-sd-tip');
+        if (!$tip.length) { $tip = $('<div id="jita-sd-tip"></div>').appendTo(document.body); }
         $tip.empty();
-        EJF_SD.ui._watchMedia($tip[0]);   // arm the media killer for this tip (catches Jira's async hydration)
-        $('<div class="ejf-sd-tip-title"></div>').text(r.key + ' - ' + (r.summary || '')).appendTo($tip);
-        if (meta) { $('<div class="ejf-sd-tip-meta"></div>').text(meta).appendTo($tip); }
-        var $desc = $('<div class="ejf-sd-tip-desc"></div>').appendTo($tip);
+        JiTA.ui._watchMedia($tip[0]);   // arm the media killer for this tip (catches Jira's async hydration)
+        $('<div class="jita-sd-tip-title"></div>').text(r.key + ' - ' + (r.summary || '')).appendTo($tip);
+        if (meta) { $('<div class="jita-sd-tip-meta"></div>').text(meta).appendTo($tip); }
+        var $desc = $('<div class="jita-sd-tip-desc"></div>').appendTo($tip);
 
         function paintHtml($el, htmlStr) {
             // Jira's own rendered HTML; strip any <script>/<style> defensively before injecting.
@@ -6001,43 +6001,43 @@ EJF_SD.ui = {
             // (confirmed from renderedFields), which the browser autoplays. Replace those whole blocks - plus
             // any <video>/<audio>/<iframe> - with a static placeholder before injecting. (_killMedia below is
             // the belt-and-suspenders DOM pass for any other media shape, e.g. SDK-hydrated data-media nodes.)
-            var MEDIA_PH = '<div class="ejf-sd-tip-media">▶ media - open the issue to view</div>';
+            var MEDIA_PH = '<div class="jita-sd-tip-media">▶ media - open the issue to view</div>';
             clean = clean
                 .replace(/<object\b[\s\S]*?<\/object>/gi, MEDIA_PH)
                 .replace(/<(video|audio|iframe)\b[\s\S]*?<\/\1>/gi, MEDIA_PH)
                 .replace(/<(?:video|audio|iframe|embed|source)\b[^>]*\/?>/gi, '');   // stray self-closing/void media tags
-            $el.removeClass('ejf-sd-tip-dim').addClass('ejf-sd-tip-html').html(clean);
-            EJF_SD.ui._killMedia($tip[0]);   // belt-and-suspenders DOM pass (covers SDK-hydrated media, etc.)
+            $el.removeClass('jita-sd-tip-dim').addClass('jita-sd-tip-html').html(clean);
+            JiTA.ui._killMedia($tip[0]);   // belt-and-suspenders DOM pass (covers SDK-hydrated media, etc.)
         }
 
-        var cached = EJF_SD.ui._renderedCache[r.key];
+        var cached = JiTA.ui._renderedCache[r.key];
         if (typeof cached === 'string') {
             if (cached) { paintHtml($desc, cached); }
-            else { $desc.addClass('ejf-sd-tip-dim').text('(no description)'); }
-            EJF_SD.ui._positionTip($tip, anchor);
+            else { $desc.addClass('jita-sd-tip-dim').text('(no description)'); }
+            JiTA.ui._positionTip($tip, anchor);
             return;
         }
 
         // Placeholder: the flattened stored text, shown immediately so there's no hover lag.
         var flat = (r.description || '').replace(/\s+/g, ' ').trim();
-        if (flat) { $desc.text(flat); } else { $desc.addClass('ejf-sd-tip-dim').text('Loading…'); }
-        EJF_SD.ui._positionTip($tip, anchor);
+        if (flat) { $desc.text(flat); } else { $desc.addClass('jita-sd-tip-dim').text('Loading…'); }
+        JiTA.ui._positionTip($tip, anchor);
 
-        EJF_SD.ui._getRendered(r.key).then(function (htmlStr) {
-            if (EJF_SD.ui._tipKey !== r.key) { return; }   // mouse moved to another row already
-            var $live = $('#ejf-sd-tip');
-            var $d = $live.find('.ejf-sd-tip-desc');
+        JiTA.ui._getRendered(r.key).then(function (htmlStr) {
+            if (JiTA.ui._tipKey !== r.key) { return; }   // mouse moved to another row already
+            var $live = $('#jita-sd-tip');
+            var $d = $live.find('.jita-sd-tip-desc');
             if (!$d.length) { return; }
             if (htmlStr) { paintHtml($d, htmlStr); }
-            else if (!flat) { $d.addClass('ejf-sd-tip-dim').text('(no description)'); }
-            EJF_SD.ui._positionTip($live, anchor);
+            else if (!flat) { $d.addClass('jita-sd-tip-dim').text('(no description)'); }
+            JiTA.ui._positionTip($live, anchor);
         });
     },
 
     _hideTip: function () {
-        EJF_SD.ui._tipKey = null;
-        if (EJF_SD.ui._tipMediaObs) { try { EJF_SD.ui._tipMediaObs.disconnect(); } catch (e) { /* ignore */ } EJF_SD.ui._tipMediaObs = null; }
-        $('#ejf-sd-tip').css('display', 'none');
+        JiTA.ui._tipKey = null;
+        if (JiTA.ui._tipMediaObs) { try { JiTA.ui._tipMediaObs.disconnect(); } catch (e) { /* ignore */ } JiTA.ui._tipMediaObs = null; }
+        $('#jita-sd-tip').css('display', 'none');
     },
 
     // Strip any playing / hydratable media from the hover card, replacing each with a static placeholder.
@@ -6056,7 +6056,7 @@ EJF_SD.ui = {
             var tag = (el.tagName || '').toLowerCase();
             if (tag === 'video' || tag === 'audio' || tag === 'iframe' || tag === 'object' || tag === 'embed') { return true; }
             var cls = (typeof el.className === 'string') ? el.className : '';
-            if (/ejf-sd-tip-media/.test(cls)) { return false; }   // our own placeholder - never re-process
+            if (/jita-sd-tip-media/.test(cls)) { return false; }   // our own placeholder - never re-process
             if (/\bmedia/i.test(cls)) { return true; }
             var nt = el.getAttribute && el.getAttribute('data-node-type');
             if (nt && /media/i.test(nt)) { return true; }
@@ -6075,7 +6075,7 @@ EJF_SD.ui = {
             while (p && p !== root && isMedia(p)) { top = p; p = p.parentNode; }
             try { if (top.pause) { top.pause(); } } catch (e) { /* ignore */ }
             var ph = document.createElement('div');
-            ph.className = 'ejf-sd-tip-media';
+            ph.className = 'jita-sd-tip-media';
             ph.textContent = '▶ media - open the issue to view';
             if (top.parentNode) { top.parentNode.replaceChild(ph, top); }
         }
@@ -6086,12 +6086,12 @@ EJF_SD.ui = {
     // disconnects after a few seconds (hydration is near-instant) and on _hideTip.
     _tipMediaObs: null,
     _watchMedia: function (root) {
-        if (EJF_SD.ui._tipMediaObs) { try { EJF_SD.ui._tipMediaObs.disconnect(); } catch (e) { /* ignore */ } EJF_SD.ui._tipMediaObs = null; }
+        if (JiTA.ui._tipMediaObs) { try { JiTA.ui._tipMediaObs.disconnect(); } catch (e) { /* ignore */ } JiTA.ui._tipMediaObs = null; }
         if (!root || typeof MutationObserver !== 'function') { return; }
-        var obs = new MutationObserver(function () { EJF_SD.ui._killMedia(root); });
+        var obs = new MutationObserver(function () { JiTA.ui._killMedia(root); });
         try { obs.observe(root, { childList: true, subtree: true }); } catch (e) { return; }
-        EJF_SD.ui._tipMediaObs = obs;
-        setTimeout(function () { if (EJF_SD.ui._tipMediaObs === obs) { obs.disconnect(); EJF_SD.ui._tipMediaObs = null; } }, 5000);
+        JiTA.ui._tipMediaObs = obs;
+        setTimeout(function () { if (JiTA.ui._tipMediaObs === obs) { obs.disconnect(); JiTA.ui._tipMediaObs = null; } }, 5000);
     },
 
     POS_KEY: 'sdPanelPos',         // GM flag holding the user's chosen panel position { left, top }
@@ -6112,9 +6112,9 @@ EJF_SD.ui = {
 
     // Hide the panel while an attachment viewer is open; restore it (back to its CSS display:flex) afterwards.
     updateVisibility: function () {
-        var $p = $('#ejf-sd-panel');
+        var $p = $('#jita-sd-panel');
         if (!$p.length) { return; }
-        if (EJF_SD.ui._attachmentViewerOpen()) { $p.css('display', 'none'); }
+        if (JiTA.ui._attachmentViewerOpen()) { $p.css('display', 'none'); }
         else if ($p.css('display') === 'none') { $p.css('display', ''); }
     },
 
@@ -6123,7 +6123,7 @@ EJF_SD.ui = {
     // anchoring from the CSS. A null/invalid saved value leaves the default bottom-right placement alone.
     _applyPos: function ($p) {
         var pos = null;
-        pos = gmGet(EJF_SD.ui.POS_KEY, null);
+        pos = gmGet(JiTA.ui.POS_KEY, null);
         if (!pos || typeof pos.left !== 'number' || typeof pos.top !== 'number') { return; }
         var el = $p[0];
         var w = el.offsetWidth || 340, h = el.offsetHeight || 60;
@@ -6132,8 +6132,8 @@ EJF_SD.ui = {
         var left = Math.min(Math.max(0, pos.left), maxLeft);
         var top = Math.min(Math.max(0, pos.top), maxTop);
         $p.css({ left: left + 'px', top: top + 'px', right: 'auto', bottom: 'auto' });
-        el._ejfTop = top;                 // remember the intended top so _fitVertical can re-anchor on expand
-        EJF_SD.ui._fitVertical();
+        el._jitaTop = top;                 // remember the intended top so _fitVertical can re-anchor on expand
+        JiTA.ui._fitVertical();
     },
 
     // Keep the (expanded) panel on-screen vertically. When the panel is positioned by a dragged/saved top
@@ -6143,43 +6143,43 @@ EJF_SD.ui = {
     // via top (user dragged it, or a saved position was restored); the default bottom-anchored placement
     // already grows upward correctly and is left untouched.
     _fitVertical: function () {
-        var $p = $('#ejf-sd-panel');
+        var $p = $('#jita-sd-panel');
         if (!$p.length) { return; }
         var el = $p[0];
-        if (typeof el._ejfTop !== 'number') { return; }
+        if (typeof el._jitaTop !== 'number') { return; }
         if ($p.hasClass('collapsed')) {                 // collapsed: just keep the title at the intended top
-            $p.removeClass('ejf-sd-up');
+            $p.removeClass('jita-sd-up');
             el.style.maxHeight = '';
             el.style.bottom = 'auto';
-            el.style.top = el._ejfTop + 'px';
+            el.style.top = el._jitaTop + 'px';
             return;
         }
         var margin = 8, vh = window.innerHeight;
         // Reset to a plain top-anchored layout to measure the full expanded height at the intended top.
-        $p.removeClass('ejf-sd-up');
+        $p.removeClass('jita-sd-up');
         el.style.maxHeight = '';
         el.style.bottom = 'auto';
-        el.style.top = el._ejfTop + 'px';
-        var headEl = $p.find('#ejf-sd-head')[0];
+        el.style.top = el._jitaTop + 'px';
+        var headEl = $p.find('#jita-sd-head')[0];
         var headerH = headEl ? headEl.offsetHeight : 36;
         var fullH = el.offsetHeight;
-        if (el._ejfTop + fullH <= vh - margin) { return; }   // fits growing down -> keep the normal layout
+        if (el._jitaTop + fullH <= vh - margin) { return; }   // fits growing down -> keep the normal layout
         // Would overflow the bottom -> drop up: pin the panel bottom at the header's bottom edge.
-        var headerBottom = el._ejfTop + headerH;
+        var headerBottom = el._jitaTop + headerH;
         el.style.top = 'auto';
         el.style.bottom = (vh - headerBottom) + 'px';
         el.style.maxHeight = Math.max(80, Math.min(Math.round(vh * 0.52), headerBottom - margin)) + 'px';
-        $p.addClass('ejf-sd-up');
+        $p.addClass('jita-sd-up');
     },
 
     // Make the panel draggable by its header. Persists the final position to GM storage on drop so it is
     // restored on the next page load. The collapse "–" control is excluded so clicking it still toggles.
     _makeDraggable: function ($p) {
         var el = $p[0];
-        var $head = $p.find('#ejf-sd-head');
+        var $head = $p.find('#jita-sd-head');
         var dragging = false, startX = 0, startY = 0, baseLeft = 0, baseTop = 0;
 
-        // We drag by the HEADER's intended top (el._ejfTop) and let _fitVertical decide, on every move,
+        // We drag by the HEADER's intended top (el._jitaTop) and let _fitVertical decide, on every move,
         // whether the list grows down (room below) or flips to "drop-up" (no room) - so the flip happens
         // live while dragging, not only on release. The header top is clamped by the header height (not the
         // full panel height) so the header can be moved right down to the bottom edge to trigger drop-up.
@@ -6192,35 +6192,35 @@ EJF_SD.ui = {
             var top = Math.min(Math.max(0, baseTop + (e.clientY - startY)), Math.max(0, window.innerHeight - headerH));
             el.style.left = left + 'px';
             el.style.right = 'auto';
-            el._ejfTop = top;                 // _fitVertical sets top/bottom from this (anchor or drop-up)
-            EJF_SD.ui._fitVertical();
+            el._jitaTop = top;                 // _fitVertical sets top/bottom from this (anchor or drop-up)
+            JiTA.ui._fitVertical();
             e.preventDefault();
         }
         function onUp() {
             if (!dragging) { return; }
             dragging = false;
-            $p.removeClass('ejf-sd-dragging');
+            $p.removeClass('jita-sd-dragging');
             document.removeEventListener('mousemove', onMove, true);
             document.removeEventListener('mouseup', onUp, true);
             var rect = el.getBoundingClientRect();
-            var top = (typeof el._ejfTop === 'number') ? el._ejfTop : Math.round(rect.top);
-            gmSet(EJF_SD.ui.POS_KEY, { left: Math.round(rect.left), top: top });
-            EJF_SD.ui._fitVertical();
+            var top = (typeof el._jitaTop === 'number') ? el._jitaTop : Math.round(rect.top);
+            gmSet(JiTA.ui.POS_KEY, { left: Math.round(rect.left), top: top });
+            JiTA.ui._fitVertical();
         }
         $head.on('mousedown', function (e) {
             if (e.which && e.which !== 1) { return; }                 // left button only
-            if ($(e.target).closest('#ejf-sd-collapse').length) { return; }  // let the collapse toggle work
-            if ($(e.target).closest('#ejf-sd-filter').length) { return; }    // let the filter input take focus / select text
-            if ($(e.target).closest('#ejf-sd-filterbtn').length) { return; } // let the funnel open the filter popover
-            if ($(e.target).closest('#ejf-sd-mode').length) { return; }      // let the mode badge toggle ranking
+            if ($(e.target).closest('#jita-sd-collapse').length) { return; }  // let the collapse toggle work
+            if ($(e.target).closest('#jita-sd-filter').length) { return; }    // let the filter input take focus / select text
+            if ($(e.target).closest('#jita-sd-filterbtn').length) { return; } // let the funnel open the filter popover
+            if ($(e.target).closest('#jita-sd-mode').length) { return; }      // let the mode badge toggle ranking
             // Drag relative to the HEADER's current top (works whether we're top-anchored or in drop-up),
             // so the header tracks the cursor and _fitVertical re-evaluates up/down on every move.
             var hTop = $head[0].getBoundingClientRect().top;
             baseLeft = el.getBoundingClientRect().left; baseTop = hTop;
-            el._ejfTop = hTop;
+            el._jitaTop = hTop;
             startX = e.clientX; startY = e.clientY;
             dragging = true;
-            $p.addClass('ejf-sd-dragging');
+            $p.addClass('jita-sd-dragging');
             document.addEventListener('mousemove', onMove, true);
             document.addEventListener('mouseup', onUp, true);
             e.preventDefault();
@@ -6235,19 +6235,19 @@ EJF_SD.ui = {
 
     // Flip the panel style and re-mount in the new location (no reload). Called from the settings overlay.
     toggleStyle: function () {
-        var next = (EJF_SD.ui.mode() === 'sidebar') ? 'floating' : 'sidebar';
+        var next = (JiTA.ui.mode() === 'sidebar') ? 'floating' : 'sidebar';
         gmSet('sdPanelStyle', next);
-        $('#ejf-sd-panel').remove();
-        $('#ejf-side-group').remove();
-        if (EJF_SD.ui.currentKey && /^EBR-/.test(EJF_SD.ui.currentKey)) { EJF_SD.ui.render(EJF_SD.ui.currentKey); }
-        else if (EJF_SD.ui.currentKey && EJF_SD.ui._isReportsKey(EJF_SD.ui.currentKey)) { EJF_SD.ui.renderReports(EJF_SD.ui.currentKey); }
+        $('#jita-sd-panel').remove();
+        $('#jita-side-group').remove();
+        if (JiTA.ui.currentKey && /^EBR-/.test(JiTA.ui.currentKey)) { JiTA.ui.render(JiTA.ui.currentKey); }
+        else if (JiTA.ui.currentKey && JiTA.ui._isReportsKey(JiTA.ui.currentKey)) { JiTA.ui.renderReports(JiTA.ui.currentKey); }
         refreshMenu();
     },
 
     // True once the panel chrome (specifically its shared inner list) is mounted in EITHER location. Used by
     // ensure() to decide whether a (re)render is needed - in sidebar mode Jira's React re-renders can wipe
     // our injected section, and this flips back to false so the observer re-mounts + repopulates it.
-    _chromePresent: function () { return !!document.getElementById('ejf-sd-list'); },
+    _chromePresent: function () { return !!document.getElementById('jita-sd-list'); },
 
     // SVG chevron matching Jira's native context-group caret (points down when expanded; CSS rotates it -90°
     // when collapsed). Same path Jira uses for its Details / Development group headers.
@@ -6259,58 +6259,58 @@ EJF_SD.ui = {
     _CHEV_RIGHT: 'm6.03 1.47 6 6a.75.75 0 0 1 .052 1.004l-.052.056-6 6-1.06-1.06L10.44 8 4.97 2.53z',
 
     // Point the group's chevron the right way (open = down, collapsed = right). Works for both the cloned
-    // native chevron and the hand-built one (both carry [data-ejf-chevron]).
+    // native chevron and the hand-built one (both carry [data-jita-chevron]).
     _setChevron: function (group, collapsed) {
-        var p = group && group.querySelector('[data-ejf-chevron] path');
-        if (p) { p.setAttribute('d', collapsed ? EJF_SD.ui._CHEV_RIGHT : EJF_SD.ui._CHEV_DOWN); }
+        var p = group && group.querySelector('[data-jita-chevron] path');
+        if (p) { p.setAttribute('d', collapsed ? JiTA.ui._CHEV_RIGHT : JiTA.ui._CHEV_DOWN); }
     },
 
-    // Ensure the panel chrome (shared inner ids: #ejf-sd-title, #ejf-sd-mode, #ejf-sd-status, #ejf-sd-loglink,
-    // #ejf-sd-list) exists in the active location. Sidebar by default; falls back to the floating box if the
+    // Ensure the panel chrome (shared inner ids: #jita-sd-title, #jita-sd-mode, #jita-sd-status, #jita-sd-loglink,
+    // #jita-sd-list) exists in the active location. Sidebar by default; falls back to the floating box if the
     // Jira context column / Details anchor isn't in the DOM (yet).
     _ensurePanel: function () {
-        EJF_SD.ui.injectCss();
-        EJF_SD.ui._wireFilter();   // bind the mode-badge click + window-level filter guards once
-        if (EJF_SD.ui.mode() === 'sidebar' && EJF_SD.ui._ensureSidebar()) {
-            if ($('#ejf-sd-panel').length) { $('#ejf-sd-panel').remove(); }   // drop a lingering floating box
+        JiTA.ui.injectCss();
+        JiTA.ui._wireFilter();   // bind the mode-badge click + window-level filter guards once
+        if (JiTA.ui.mode() === 'sidebar' && JiTA.ui._ensureSidebar()) {
+            if ($('#jita-sd-panel').length) { $('#jita-sd-panel').remove(); }   // drop a lingering floating box
             return;
         }
-        if ($('#ejf-side-group').length) { $('#ejf-side-group').remove(); }   // floating mode / no sidebar anchor
-        EJF_SD.ui._ensureFloating();
+        if ($('#jita-side-group').length) { $('#jita-side-group').remove(); }   // floating mode / no sidebar anchor
+        JiTA.ui._ensureFloating();
     },
 
     // The original floating, draggable panel on document.body (now opt-in / the fallback when the sidebar
     // anchor is missing). Lives outside Jira's React tree, so it survives re-renders without re-mounting.
     _ensureFloating: function () {
-        if ($('#ejf-sd-panel').length) { return; }
+        if ($('#jita-sd-panel').length) { return; }
         var $p = $(
-            '<div id="ejf-sd-panel">' +
-            '  <div id="ejf-sd-head"><span id="ejf-sd-title">Similar defects</span>' +
-            '    <input id="ejf-sd-filter" type="text" placeholder="Filter…" autocomplete="off" title="Filter the whole database by this text (key / title / description) and show the best matches">' +
-            '    <span id="ejf-sd-filterbtn" title="Filter results (status / recency)">' + EJF_SD.ui._funnelSvg + '</span>' +
-            '    <span id="ejf-sd-mode" title="Click to switch ranking mode (resets to automatic on reload)">Keyword</span>' +
-            '    <span id="ejf-sd-collapse" title="Collapse / expand">–</span></div>' +
-            '  <div id="ejf-sd-status"></div>' +
-            '  <div id="ejf-sd-loglink"></div>' +
-            '  <div id="ejf-sd-exccluster"></div>' +
-            '  <ul id="ejf-sd-list"></ul>' +
+            '<div id="jita-sd-panel">' +
+            '  <div id="jita-sd-head"><span id="jita-sd-title">Similar defects</span>' +
+            '    <input id="jita-sd-filter" type="text" placeholder="Filter…" autocomplete="off" title="Filter the whole database by this text (key / title / description) and show the best matches">' +
+            '    <span id="jita-sd-filterbtn" title="Filter results (status / recency)">' + JiTA.ui._funnelSvg + '</span>' +
+            '    <span id="jita-sd-mode" title="Click to switch ranking mode (resets to automatic on reload)">Keyword</span>' +
+            '    <span id="jita-sd-collapse" title="Collapse / expand">–</span></div>' +
+            '  <div id="jita-sd-status"></div>' +
+            '  <div id="jita-sd-loglink"></div>' +
+            '  <div id="jita-sd-exccluster"></div>' +
+            '  <ul id="jita-sd-list"></ul>' +
             '</div>'
         );
         // Restore the saved minimized state before showing the panel.
         var collapsed = false;
-        collapsed = !!gmGet(EJF_SD.ui.COLLAPSE_KEY, false);
+        collapsed = !!gmGet(JiTA.ui.COLLAPSE_KEY, false);
         if (collapsed) { $p.addClass('collapsed'); }
-        $p.find('#ejf-sd-collapse').text(collapsed ? '+' : '–');
-        $p.find('#ejf-sd-collapse').on('click', function () {
-            var isCollapsed = $('#ejf-sd-panel').toggleClass('collapsed').hasClass('collapsed');
+        $p.find('#jita-sd-collapse').text(collapsed ? '+' : '–');
+        $p.find('#jita-sd-collapse').on('click', function () {
+            var isCollapsed = $('#jita-sd-panel').toggleClass('collapsed').hasClass('collapsed');
             $(this).text(isCollapsed ? '+' : '–');   // reflect state in the control
-            gmSet(EJF_SD.ui.COLLAPSE_KEY, isCollapsed);
-            EJF_SD.ui._fitVertical();   // on expand, grow upward if there's no room below; on collapse, reset
+            gmSet(JiTA.ui.COLLAPSE_KEY, isCollapsed);
+            JiTA.ui._fitVertical();   // on expand, grow upward if there's no room below; on collapse, reset
         });
         $p.appendTo(document.body);
-        EJF_SD.ui._applyPos($p);          // restore the user's saved position (if any)
-        EJF_SD.ui._makeDraggable($p);     // wire up header dragging
-        EJF_SD.ui.updateVisibility();     // stay hidden if an attachment viewer is already open
+        JiTA.ui._applyPos($p);          // restore the user's saved position (if any)
+        JiTA.ui._makeDraggable($p);     // wire up header dragging
+        JiTA.ui.updateVisibility();     // stay hidden if an attachment viewer is already open
     },
 
     // Mount (or verify) the integrated "Triage Assistant" group in Jira's context column, immediately after
@@ -6321,14 +6321,14 @@ EJF_SD.ui = {
 
     // The inner body of the group (subhead + the shared chrome ids), shared by the clone and manual builders.
     _sidebarBodyHtml: function () {
-        return '<div class="ejf-side-subhead"><span id="ejf-sd-title">Similar defects</span>' +
-               '<input id="ejf-sd-filter" type="text" placeholder="Filter…" autocomplete="off" title="Filter the whole database by this text (key / title / description) and show the best matches">' +
-               '<span id="ejf-sd-filterbtn" title="Filter results (status / recency)">' + EJF_SD.ui._funnelSvg + '</span>' +
-               '<span id="ejf-sd-mode" title="Click to switch ranking mode (resets to automatic on reload)">Keyword</span></div>' +
-               '<div id="ejf-sd-status"></div>' +
-               '<div id="ejf-sd-loglink"></div>' +
-               '<div id="ejf-sd-exccluster"></div>' +
-               '<ul id="ejf-sd-list"></ul>';
+        return '<div class="jita-side-subhead"><span id="jita-sd-title">Similar defects</span>' +
+               '<input id="jita-sd-filter" type="text" placeholder="Filter…" autocomplete="off" title="Filter the whole database by this text (key / title / description) and show the best matches">' +
+               '<span id="jita-sd-filterbtn" title="Filter results (status / recency)">' + JiTA.ui._funnelSvg + '</span>' +
+               '<span id="jita-sd-mode" title="Click to switch ranking mode (resets to automatic on reload)">Keyword</span></div>' +
+               '<div id="jita-sd-status"></div>' +
+               '<div id="jita-sd-loglink"></div>' +
+               '<div id="jita-sd-exccluster"></div>' +
+               '<ul id="jita-sd-list"></ul>';
     },
 
     // Strip identifying attributes from a cloned subtree so it can't shadow Jira's own (or our) data-testid /
@@ -6347,7 +6347,7 @@ EJF_SD.ui = {
     },
 
     _ensureSidebar: function () {
-        if (document.getElementById('ejf-side-group') && document.getElementById('ejf-sd-list')) { return true; }
+        if (document.getElementById('jita-side-group') && document.getElementById('jita-sd-list')) { return true; }
         // The Details slot is our anchor (data-vc is stable; the atomic class names are not). Fall back to the
         // details-group container if the slot wrapper isn't present.
         var anchor = document.querySelector('[data-vc="issue-view-context-items-details-panel-slot"]')
@@ -6355,11 +6355,11 @@ EJF_SD.ui = {
         if (!anchor || !anchor.parentNode) { return false; }
 
         // Drop a stale wrapper React may have left behind (body wiped but shell kept) before re-mounting.
-        var old = document.getElementById('ejf-side-group');
+        var old = document.getElementById('jita-side-group');
         if (old && old.parentNode) { old.parentNode.removeChild(old); }
 
         var collapsed = false;
-        collapsed = !!gmGet(EJF_SD.ui.SIDE_COLLAPSE_KEY, false);
+        collapsed = !!gmGet(JiTA.ui.SIDE_COLLAPSE_KEY, false);
 
         var group = null, headerClickTarget = null;
 
@@ -6369,7 +6369,7 @@ EJF_SD.ui = {
         // slightly different header padding. We clone the group's inner wrapper (it stays in the DOM even when
         // collapsed - the body content just sits in a hidden div), gut the body, drop our content in, strip the
         // clone's identifying attributes, point the chevron the right way, and re-wire the collapse toggle (the
-        // clone is static DOM with no React handlers). Marked with [data-ejf-body] / [data-ejf-chevron].
+        // clone is static DOM with no React handlers). Marked with [data-jita-body] / [data-jita-chevron].
         var tmpl = null;
         var inners = document.querySelectorAll('[data-vc^="issue-view-context-group-"][data-vc$="-inner"]');
         for (var ti = 0; ti < inners.length; ti++) {
@@ -6388,8 +6388,8 @@ EJF_SD.ui = {
                 var chevronEl = clone.querySelector('[data-vc="issue-view-group-chevron"]');
                 var btnEl = clone.querySelector('[role="button"]');
                 if (titleEl && bodyEl && bodyEl.parentNode) {
-                    EJF_SD.ui._stripAttrs(clone);                 // (keeps element refs above valid)
-                    if (chevronEl) { chevronEl.setAttribute('data-ejf-chevron', '1'); }
+                    JiTA.ui._stripAttrs(clone);                 // (keeps element refs above valid)
+                    if (chevronEl) { chevronEl.setAttribute('data-jita-chevron', '1'); }
                     titleEl.textContent = 'Triage Assistant';
                     // We cloned a COLLAPSED group, whose body wrapper carries Jira's collapse machinery (a
                     // `hidden` attribute, a nested `<div hidden>`, and/or inline height:0 / overflow on
@@ -6398,9 +6398,9 @@ EJF_SD.ui = {
                     // drop in a clean, baggage-free body element in its place. Our own `.collapsed` class is
                     // then the only thing that hides/shows it.
                     var freshBody = document.createElement('div');
-                    freshBody.setAttribute('data-ejf-body', '1');
-                    freshBody.className = 'ejf-side-body';
-                    freshBody.innerHTML = EJF_SD.ui._sidebarBodyHtml();
+                    freshBody.setAttribute('data-jita-body', '1');
+                    freshBody.className = 'jita-side-body';
+                    freshBody.innerHTML = JiTA.ui._sidebarBodyHtml();
                     var bodyParent = bodyEl.parentNode;
                     bodyParent.replaceChild(freshBody, bodyEl);
                     // The cloned group was COLLAPSED, so its body is suppressed by the wrapper's collapse
@@ -6475,16 +6475,16 @@ EJF_SD.ui = {
                     // The actual culprit behind the intermittent top gap: a cloned <section> carries an inline
                     // `top: 49px` (a positioned offset that survives the clone). Sweep EVERY section in the
                     // clone - not just the body-wrapper chain - back to static flow so nothing is pushed down.
-                    var ejfSecs = clone.querySelectorAll('section');
-                    for (var ejfSi = 0; ejfSi < ejfSecs.length; ejfSi++) {
-                        var sec = ejfSecs[ejfSi];
+                    var jitaSecs = clone.querySelectorAll('section');
+                    for (var jitaSi = 0; jitaSi < jitaSecs.length; jitaSi++) {
+                        var sec = jitaSecs[jitaSi];
                         if (sec.style && sec.style.setProperty) {
                             sec.style.setProperty('position', 'static', 'important');
                             sec.style.setProperty('top', 'auto', 'important');
                         }
                     }
-                    clone.id = 'ejf-side-group';
-                    clone.classList.add('ejf-ta-native');
+                    clone.id = 'jita-side-group';
+                    clone.classList.add('jita-ta-native');
                     headerClickTarget = btnEl || clone;
                     group = clone;
                 }
@@ -6494,20 +6494,20 @@ EJF_SD.ui = {
         // Fallback: hand-built group (used only if the native template wasn't found / clone failed).
         if (!group) {
             var $g = $(
-                '<div id="ejf-side-group" class="ejf-ta-manual">' +
-                '  <div id="ejf-side-header" role="button" tabindex="0" aria-expanded="true">' +
-                '    <span class="ejf-side-chevron" data-ejf-chevron="1">' + EJF_SD.ui._chevronSvg + '</span>' +
-                '    <span class="ejf-side-htitle">Triage Assistant</span>' +
+                '<div id="jita-side-group" class="jita-ta-manual">' +
+                '  <div id="jita-side-header" role="button" tabindex="0" aria-expanded="true">' +
+                '    <span class="jita-side-chevron" data-jita-chevron="1">' + JiTA.ui._chevronSvg + '</span>' +
+                '    <span class="jita-side-htitle">Triage Assistant</span>' +
                 '  </div>' +
-                '  <div class="ejf-side-body" data-ejf-body="1">' + EJF_SD.ui._sidebarBodyHtml() + '</div>' +
+                '  <div class="jita-side-body" data-jita-body="1">' + JiTA.ui._sidebarBodyHtml() + '</div>' +
                 '</div>'
             );
             group = $g[0];
-            headerClickTarget = group.querySelector('#ejf-side-header');
+            headerClickTarget = group.querySelector('#jita-side-header');
         }
 
         if (collapsed) { group.classList.add('collapsed'); }
-        EJF_SD.ui._setChevron(group, collapsed);   // point the chevron the right way for the initial state
+        JiTA.ui._setChevron(group, collapsed);   // point the chevron the right way for the initial state
 
         // Collapse toggle (shared by both paths): reflect on the root class + aria-expanded + chevron, persist.
         if (headerClickTarget) {
@@ -6515,9 +6515,9 @@ EJF_SD.ui = {
             headerClickTarget.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
             headerClickTarget.addEventListener('click', function () {
                 var isColl = group.classList.toggle('collapsed');
-                EJF_SD.ui._setChevron(group, isColl);
+                JiTA.ui._setChevron(group, isColl);
                 try { headerClickTarget.setAttribute('aria-expanded', isColl ? 'false' : 'true'); } catch (e) { /* ignore */ }
-                gmSet(EJF_SD.ui.SIDE_COLLAPSE_KEY, isColl);
+                gmSet(JiTA.ui.SIDE_COLLAPSE_KEY, isColl);
                 // Drop focus so the cloned button doesn't keep Jira's blue focus ring after the toggle click.
                 try { headerClickTarget.blur(); } catch (e3) { /* ignore */ }
             });
@@ -6537,20 +6537,20 @@ EJF_SD.ui = {
     // "Known defects in attached log" section so both behave identically.
     // ---- hide ("ignore") control: temporarily dismiss a defect ----
     // Eye-off icon (Material "visibility_off"); clicking opens a small duration popover. The chosen hide is
-    // persisted by EJF_SD.hidden (GM storage -> survives script updates) and the ranking layer skips hidden
+    // persisted by JiTA.hidden (GM storage -> survives script updates) and the ranking layer skips hidden
     // keys, so a hidden defect never takes a result slot. Shown next to each defect in the "Known defects in
     // attached log" list (renderLogLink) - hiding keys on the issue key, so it also drops out of the ranked
     // "Similar defects" suggestions.
     _eyeOffSvg: '<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><path d="M12 7c2.76 0 5 2.24 5 5 0 .65-.13 1.26-.36 1.83l2.92 2.92c1.51-1.26 2.7-2.89 3.43-4.75-1.73-4.39-6-7.5-11-7.5-1.4 0-2.74.25-3.98.7l2.16 2.16C10.74 7.13 11.35 7 12 7zM2 4.27l2.28 2.28.46.46C3.08 8.3 1.78 10.02 1 12c1.73 4.39 6 7.5 11 7.5 1.55 0 3.03-.3 4.38-.84l.42.42L19.73 22 21 20.73 3.27 3 2 4.27zM7.53 9.8l1.55 1.55c-.05.21-.08.43-.08.65 0 1.66 1.34 3 3 3 .22 0 .44-.03.65-.08l1.55 1.55c-.67.33-1.41.53-2.2.53-2.76 0-5-2.24-5-5 0-.79.2-1.53.53-2.2zm4.31-.78l3.15 3.15.02-.16c0-1.66-1.34-3-3-3l-.17.01z"></path></svg>',
 
     _hideButton: function (key) {
-        var $h = $('<span class="ejf-sd-hide"></span>')
+        var $h = $('<span class="jita-sd-hide"></span>')
             .attr('title', 'Hide ' + key + ' from suggestions for a while')
-            .html(EJF_SD.ui._eyeOffSvg);
+            .html(JiTA.ui._eyeOffSvg);
         $h.on('click', function (ev) {
             ev.preventDefault();
             ev.stopPropagation();
-            EJF_SD.ui._showHideMenu(key, this);
+            JiTA.ui._showHideMenu(key, this);
         });
         return $h;
     },
@@ -6558,26 +6558,26 @@ EJF_SD.ui = {
     // Small popover anchored to the eye-off icon: pick how long to hide (presets, max 90 days). On choice we
     // persist the hide and re-render the current view so the slot refills from the next-best non-hidden match.
     _showHideMenu: function (key, anchor) {
-        EJF_SD.ui._closeHideMenu();
-        EJF_SD.ui._hideTip();   // don't leave a hover card up behind the popover
+        JiTA.ui._closeHideMenu();
+        JiTA.ui._hideTip();   // don't leave a hover card up behind the popover
         var menu = document.createElement('div');
-        menu.id = 'ejf-sd-hidemenu';
+        menu.id = 'jita-sd-hidemenu';
         var label = document.createElement('div');
-        label.className = 'ejf-sd-hidemenu-label';
+        label.className = 'jita-sd-hidemenu-label';
         label.textContent = 'Hide ' + key + ' for…';
         menu.appendChild(label);
-        EJF_SD.hidden.PRESETS.forEach(function (p) {
+        JiTA.hidden.PRESETS.forEach(function (p) {
             var b = document.createElement('button');
             b.type = 'button';
-            b.className = 'ejf-sd-hidemenu-btn';
+            b.className = 'jita-sd-hidemenu-btn';
             b.textContent = p.label;
             b.addEventListener('click', function (ev) {
                 ev.stopPropagation();
-                EJF_SD.hidden.hide(key, p.days);
-                EJF_SD.ui._closeHideMenu();
-                EJF_SD.ui._hideTip();
-                EJF_SD.ui.toast('Hidden ' + key + ' for ' + p.label + '.');
-                EJF_SD.ui._rerenderCurrent();
+                JiTA.hidden.hide(key, p.days);
+                JiTA.ui._closeHideMenu();
+                JiTA.ui._hideTip();
+                JiTA.ui.toast('Hidden ' + key + ' for ' + p.label + '.');
+                JiTA.ui._rerenderCurrent();
             });
             menu.appendChild(b);
         });
@@ -6591,44 +6591,44 @@ EJF_SD.ui = {
         menu.style.left = Math.max(6, left) + 'px';
         menu.style.top = Math.max(6, top) + 'px';
         // Dismiss on outside click or Esc (capture phase, registered next tick so the opening click is ignored).
-        EJF_SD.ui._hideMenuDismiss = function (e) {
-            if (e.type === 'keydown') { if (e.key === 'Escape') { EJF_SD.ui._closeHideMenu(); } return; }
+        JiTA.ui._hideMenuDismiss = function (e) {
+            if (e.type === 'keydown') { if (e.key === 'Escape') { JiTA.ui._closeHideMenu(); } return; }
             if (menu.contains(e.target)) { return; }
-            EJF_SD.ui._closeHideMenu();
+            JiTA.ui._closeHideMenu();
         };
         setTimeout(function () {
-            document.addEventListener('mousedown', EJF_SD.ui._hideMenuDismiss, true);
-            document.addEventListener('keydown', EJF_SD.ui._hideMenuDismiss, true);
+            document.addEventListener('mousedown', JiTA.ui._hideMenuDismiss, true);
+            document.addEventListener('keydown', JiTA.ui._hideMenuDismiss, true);
         }, 0);
     },
 
     _closeHideMenu: function () {
-        var m = document.getElementById('ejf-sd-hidemenu');
+        var m = document.getElementById('jita-sd-hidemenu');
         if (m && m.parentNode) { m.parentNode.removeChild(m); }
-        if (EJF_SD.ui._hideMenuDismiss) {
-            document.removeEventListener('mousedown', EJF_SD.ui._hideMenuDismiss, true);
-            document.removeEventListener('keydown', EJF_SD.ui._hideMenuDismiss, true);
-            EJF_SD.ui._hideMenuDismiss = null;
+        if (JiTA.ui._hideMenuDismiss) {
+            document.removeEventListener('mousedown', JiTA.ui._hideMenuDismiss, true);
+            document.removeEventListener('keydown', JiTA.ui._hideMenuDismiss, true);
+            JiTA.ui._hideMenuDismiss = null;
         }
     },
 
     _markDupButton: function (defectKey) {
-        var $dup = $('<span class="ejf-sd-link"></span>')
+        var $dup = $('<span class="jita-sd-link"></span>')
             .text('Attach')
             .attr('title', 'Link this bug report as a duplicate of ' + defectKey);
         $dup.on('click', function (ev) {
             ev.preventDefault();
             ev.stopPropagation();
             var $btn = $(this);
-            if ($btn.hasClass('ejf-sd-linked') || $btn.hasClass('ejf-sd-linking')) { return; }
-            var ebr = EJF_SD.ui.currentKey;
+            if ($btn.hasClass('jita-sd-linked') || $btn.hasClass('jita-sd-linking')) { return; }
+            var ebr = JiTA.ui.currentKey;
             if (!ebr) { return; }
             if (!confirm('Link ' + ebr + ' as a duplicate of ' + defectKey + ' and set it to Attached?')) { return; }
-            $btn.addClass('ejf-sd-linking').text('…');
+            $btn.addClass('jita-sd-linking').text('…');
             // Single call: the Attached transition sets the status, resolution AND the duplicate link at once.
-            EJF_SD.link.attachDuplicate(ebr, defectKey, 'Attached', 'Duplicate').then(function (res) {
-                EJF_SD.ui._hideTip();
-                $btn.removeClass('ejf-sd-linking').addClass('ejf-sd-linked').text(res.attached ? '✓ attached' : '✓ linked');
+            JiTA.link.attachDuplicate(ebr, defectKey, 'Attached', 'Duplicate').then(function (res) {
+                JiTA.ui._hideTip();
+                $btn.removeClass('jita-sd-linking').addClass('jita-sd-linked').text(res.attached ? '✓ attached' : '✓ linked');
                 var msg = res.attached
                     ? ('Linked ' + ebr + ' as a duplicate of ' + defectKey + ' and set it to Attached.')
                     : ('Linked ' + ebr + ' as a duplicate of ' + defectKey + ' (could not set Attached).');
@@ -6636,19 +6636,19 @@ EJF_SD.ui = {
                 // Soft-patch the status lozenge in place - no full reload. The duplicate link is created
                 // server-side and shows in Jira's "Linked work items" section on the next natural refresh.
                 if (res.attached) {
-                    EJF_SD.ui.softRefreshStatus('Attached');
+                    JiTA.ui.softRefreshStatus('Attached');
                     // Drop the now-Attached report from the local open-report DB immediately so it no longer
                     // shows up as an open match on defects before the next EBR sync prunes it.
-                    EJF_SD.db.deleteDefects([ebr]).then(function () {
-                        EJF_SD.rank._dirtyEbr = true;
-                        EJF_SD.rank._dirtyEbrVec = true;
+                    JiTA.db.deleteDefects([ebr]).then(function () {
+                        JiTA.rank._dirtyEbr = true;
+                        JiTA.rank._dirtyEbrVec = true;
                     });
                 }
-                EJF_SD.ui.toast(msg);
+                JiTA.ui.toast(msg);
             }, function (e) {
-                console.log('[EJF-SD] mark-dup failed (attachDuplicate rejected):', e && e.message || e);
-                $btn.removeClass('ejf-sd-linking').text('Attach');
-                EJF_SD.ui.toast('Could not link: ' + (e && e.message || e));
+                console.log('[JiTA-SD] mark-dup failed (attachDuplicate rejected):', e && e.message || e);
+                $btn.removeClass('jita-sd-linking').text('Attach');
+                JiTA.ui.toast('Could not link: ' + (e && e.message || e));
             });
         });
         return $dup;
@@ -6659,15 +6659,15 @@ EJF_SD.ui = {
     // action when it couldn't verify who owns the report.
     _assigneeCache: {},
     _getAssignee: function (key) {
-        if (Object.prototype.hasOwnProperty.call(EJF_SD.ui._assigneeCache, key)) {
-            return Promise.resolve(EJF_SD.ui._assigneeCache[key]);
+        if (Object.prototype.hasOwnProperty.call(JiTA.ui._assigneeCache, key)) {
+            return Promise.resolve(JiTA.ui._assigneeCache[key]);
         }
         return new Promise(function (resolve, reject) {
-            $.ajax({ url: EJF_SD.HOST + '/rest/api/2/issue/' + key + '?fields=assignee', dataType: 'json' })
+            $.ajax({ url: JiTA.HOST + '/rest/api/2/issue/' + key + '?fields=assignee', dataType: 'json' })
                 .done(function (d) {
                     var a = d && d.fields && d.fields.assignee;
                     var v = a ? { accountId: a.accountId, name: a.displayName || a.name || '' } : null;
-                    EJF_SD.ui._assigneeCache[key] = v;
+                    JiTA.ui._assigneeCache[key] = v;
                     resolve(v);
                 })
                 .fail(function () { reject(new Error('assignee fetch failed')); });
@@ -6683,59 +6683,59 @@ EJF_SD.ui = {
     // non-clickable "assigned" hint. On attach it also sets the assignee to the current user (matches Jira's
     // native Attach dialog). The assignee can change server-side, so we gate on a LIVE fetch, not stored data.
     _attachReportButton: function (reportKey) {
-        var defectKey = EJF_SD.ui.currentKey;   // the defect this row was rendered for (captured now)
-        var $btn = $('<span class="ejf-sd-link ejf-sd-linking"></span>').text('…')
+        var defectKey = JiTA.ui.currentKey;   // the defect this row was rendered for (captured now)
+        var $btn = $('<span class="jita-sd-link jita-sd-linking"></span>').text('…')
             .attr('title', 'Checking assignee…');
 
         function wireAttach() {
-            $btn.removeClass('ejf-sd-linking ejf-sd-noattach').text('Attach')
+            $btn.removeClass('jita-sd-linking jita-sd-noattach').text('Attach')
                 .attr('title', 'Attach ' + reportKey + ' to ' + defectKey + ' as a duplicate (sets it to Attached)');
             $btn.on('click', function (ev) {
                 ev.preventDefault();
                 ev.stopPropagation();
                 var $b = $(this);
-                if ($b.hasClass('ejf-sd-linked') || $b.hasClass('ejf-sd-linking')) { return; }
+                if ($b.hasClass('jita-sd-linked') || $b.hasClass('jita-sd-linking')) { return; }
                 if (!confirm('Attach ' + reportKey + ' to ' + defectKey + ' as a duplicate and set it to Attached?')) { return; }
-                $b.addClass('ejf-sd-linking').text('…');
+                $b.addClass('jita-sd-linking').text('…');
                 // Pass the current user so the report is assigned to the triager on attach (the gate guarantees
                 // it was unassigned or already mine, so this never steals someone else's assignment).
-                EJF_SD.link.currentUser().then(function (me) {
-                    return EJF_SD.link.attachDuplicate(reportKey, defectKey, 'Attached', 'Duplicate', me).then(function (res) {
-                        EJF_SD.ui._hideTip();
-                        $b.removeClass('ejf-sd-linking').addClass('ejf-sd-linked').text(res.attached ? '✓ attached' : '✓ linked');
+                JiTA.link.currentUser().then(function (me) {
+                    return JiTA.link.attachDuplicate(reportKey, defectKey, 'Attached', 'Duplicate', me).then(function (res) {
+                        JiTA.ui._hideTip();
+                        $b.removeClass('jita-sd-linking').addClass('jita-sd-linked').text(res.attached ? '✓ attached' : '✓ linked');
                         var msg = res.attached
                             ? ('Attached ' + reportKey + ' to ' + defectKey + '.')
                             : ('Linked ' + reportKey + ' to ' + defectKey + ' (could not set Attached).');
                         if (!res.linked) { msg = 'Set ' + reportKey + ' to Attached, but the duplicate link failed.'; }
-                        EJF_SD.ui.toast(msg);
+                        JiTA.ui.toast(msg);
                         // Only remove it once the Attached transition actually succeeded (so it's genuinely
                         // resolved). Drop it from the local open-report DB, mark the EBR indexes dirty, then
                         // collapse/fade its row out (the rows below slide up) and re-render so a fresh
                         // suggestion loads into the freed slot. If only the link was created (status still
                         // open), leave the row in place - the report is still an open match.
                         if (res.attached) {
-                            return EJF_SD.db.deleteDefects([reportKey]).then(function () {
-                                EJF_SD.rank._dirtyEbr = true;
-                                EJF_SD.rank._dirtyEbrVec = true;
-                                EJF_SD.ui._fadeOutAndReplace($b.closest('li'), defectKey);
+                            return JiTA.db.deleteDefects([reportKey]).then(function () {
+                                JiTA.rank._dirtyEbr = true;
+                                JiTA.rank._dirtyEbrVec = true;
+                                JiTA.ui._fadeOutAndReplace($b.closest('li'), defectKey);
                             });
                         }
                     });
                 }).catch(function (e) {
-                    console.log('[EJF-SD] attach-report failed:', e && e.message || e);
-                    $b.removeClass('ejf-sd-linking').text('Attach');
-                    EJF_SD.ui.toast('Could not attach: ' + (e && e.message || e));
+                    console.log('[JiTA-SD] attach-report failed:', e && e.message || e);
+                    $b.removeClass('jita-sd-linking').text('Attach');
+                    JiTA.ui.toast('Could not attach: ' + (e && e.message || e));
                 });
             });
         }
 
         // Gate on the report's live assignee: only unassigned or assigned-to-me may be attached.
-        Promise.all([EJF_SD.link.currentUser(), EJF_SD.ui._getAssignee(reportKey)]).then(function (res) {
+        Promise.all([JiTA.link.currentUser(), JiTA.ui._getAssignee(reportKey)]).then(function (res) {
             var me = res[0], assignee = res[1];   // assignee: { accountId, name } or null (unassigned)
             if (!assignee || (me && assignee.accountId === me)) {
                 wireAttach();
             } else {
-                $btn.removeClass('ejf-sd-linking').addClass('ejf-sd-noattach').text('assigned')
+                $btn.removeClass('jita-sd-linking').addClass('jita-sd-noattach').text('assigned')
                     .attr('title', 'Assigned to ' + (assignee.name || 'someone else') +
                         ' - only unassigned reports or ones assigned to you can be attached');
             }
@@ -6757,12 +6757,12 @@ EJF_SD.ui = {
         // Snapshot the keys currently shown (minus the one being removed) so _appendNextReport can find the
         // first ranked result that isn't already on screen.
         var shown = {};
-        $('#ejf-sd-list').children('li').each(function () {
-            var k = this.getAttribute('data-ejf-key');
+        $('#jita-sd-list').children('li').each(function () {
+            var k = this.getAttribute('data-jita-key');
             if (k && this !== el) { shown[k] = true; }
         });
         function appendFresh() {
-            if (EJF_SD.ui.currentKey === defectKey) { EJF_SD.ui._appendNextReport(defectKey, shown); }
+            if (JiTA.ui.currentKey === defectKey) { JiTA.ui._appendNextReport(defectKey, shown); }
         }
         if (!el) { appendFresh(); return; }
         var h = el.offsetHeight;
@@ -6789,36 +6789,36 @@ EJF_SD.ui = {
     // status-line count + mode. No-op if nothing new ranks (e.g. fewer matches than slots) - the list just
     // ends up one row shorter. Used by _fadeOutAndReplace so we don't rebuild the whole list.
     _appendNextReport: function (defectKey, shown) {
-        var terms = EJF_SD.ui._filterTerms();   // honor the active filter when picking the replacement row
-        EJF_SD.ui.getIssueText(defectKey).then(function (text) {
-            if (EJF_SD.ui.currentKey !== defectKey || !text) { return; }
-            return EJF_SD.rank.suggestEbrBest(text, defectKey, EJF_SD.ui.modeOverride, terms).then(function (out) {
-                if (EJF_SD.ui.currentKey !== defectKey) { return; }
+        var terms = JiTA.ui._filterTerms();   // honor the active filter when picking the replacement row
+        JiTA.ui.getIssueText(defectKey).then(function (text) {
+            if (JiTA.ui.currentKey !== defectKey || !text) { return; }
+            return JiTA.rank.suggestEbrBest(text, defectKey, JiTA.ui.modeOverride, terms).then(function (out) {
+                if (JiTA.ui.currentKey !== defectKey) { return; }
                 var results = out.results || [];
-                $('#ejf-sd-mode').text(out.mode);
+                $('#jita-sd-mode').text(out.mode);
                 var pick = null;
                 for (var i = 0; i < results.length; i++) {
                     if (!shown[results[i].key]) { pick = results[i]; break; }   // first ranked result not already listed
                 }
                 function refreshCount() {
-                    EJF_SD.db.countEbr().then(function (n) {
-                        if (EJF_SD.ui.currentKey !== defectKey) { return; }
-                        var c = $('#ejf-sd-list').children('li').length;
-                        EJF_SD.ui.setStatus(c + ' matches · ' + out.mode + ' · ' + n + ' open reports');
+                    JiTA.db.countEbr().then(function (n) {
+                        if (JiTA.ui.currentKey !== defectKey) { return; }
+                        var c = $('#jita-sd-list').children('li').length;
+                        JiTA.ui.setStatus(c + ' matches · ' + out.mode + ' · ' + n + ' open reports');
                     });
                 }
                 if (!pick) { refreshCount(); return; }
                 // Enrich with the report's full description + created date (for the hover preview / date row),
                 // then build the row and slide it in at the bottom.
-                return EJF_SD.db.getDefect(pick.key).then(function (rec) {
+                return JiTA.db.getDefect(pick.key).then(function (rec) {
                     if (rec) { pick.description = rec.description; pick.created = rec.created; }
                 }, function () { /* ignore */ }).then(function () {
-                    if (EJF_SD.ui.currentKey !== defectKey) { return; }
-                    EJF_SD.ui._slideInRow(EJF_SD.ui._reportItem(pick), $('#ejf-sd-list'));
+                    if (JiTA.ui.currentKey !== defectKey) { return; }
+                    JiTA.ui._slideInRow(JiTA.ui._reportItem(pick), $('#jita-sd-list'));
                     refreshCount();
                 });
             });
-        }).catch(function (e) { console.log('[EJF-SD] append-next-report skipped:', e && e.message || e); });
+        }).catch(function (e) { console.log('[JiTA-SD] append-next-report skipped:', e && e.message || e); });
     },
 
     // Append a freshly-built row to the list and animate it sliding/expanding in from a collapsed state. We
@@ -6850,7 +6850,7 @@ EJF_SD.ui = {
             el.style.transition = ''; el.style.maxHeight = ''; el.style.overflow = '';
             el.style.opacity = ''; el.style.paddingTop = ''; el.style.paddingBottom = '';
             el.style.marginTop = ''; el.style.marginBottom = '';
-            EJF_SD.ui._fitVertical();
+            JiTA.ui._fitVertical();
         }, 340);
     },
 
@@ -6858,36 +6858,36 @@ EJF_SD.ui = {
     // EBR->defect list so you navigate in place; '_blank' for the defect->report list so the defect page stays
     // put). `action(key)` returns the trailing control ($ Mark-dup on the EBR view, Attach on the report view).
     // The staleNote / stale-class bits fire only for stale-demoted defect matches (undefined on reports), and
-    // data-ejf-key (read by the report view's incremental attach/slide-in) is harmless on the EBR view.
+    // data-jita-key (read by the report view's incremental attach/slide-in) is harmless on the EBR view.
     _row: function (r, target, action, opts) {
         var pct = (typeof r.pct === 'number') ? r.pct : 0;
         var meta = r.status || '';
         if (r.resolution) { meta += (meta ? ' · ' : '') + r.resolution; }
         if (r.staleNote) { meta += (meta ? ' · ' : '') + r.staleNote; }   // Feature A: explain the demotion
-        var $li = $('<li></li>').attr('data-ejf-key', r.key);
-        if (r.stale) { $li.addClass('ejf-sd-stale'); }                    // Feature A: grey out stale-closed matches
+        var $li = $('<li></li>').attr('data-jita-key', r.key);
+        if (r.stale) { $li.addClass('jita-sd-stale'); }                    // Feature A: grey out stale-closed matches
         // Feature C: hover preview - a styled card (built in _showTip) showing the summary, full description
         // (incl. reproduction steps) and status, so the triager can judge a match without navigating.
-        $li.on('mouseenter', function () { EJF_SD.ui._showTip(r, this, meta); });
-        $li.on('mouseleave', function () { EJF_SD.ui._hideTip(); });
+        $li.on('mouseenter', function () { JiTA.ui._showTip(r, this, meta); });
+        $li.on('mouseleave', function () { JiTA.ui._hideTip(); });
         $('<a></a>').attr('href', '/browse/' + r.key).attr('target', target).text(r.key).appendTo($li);
-        if (!(opts && opts.noScore)) { $('<span class="ejf-sd-score"></span>').text(pct + '%').appendTo($li); }   // reporter-list rows have no relevance score
+        if (!(opts && opts.noScore)) { $('<span class="jita-sd-score"></span>').text(pct + '%').appendTo($li); }   // reporter-list rows have no relevance score
         action(r.key).appendTo($li);
-        $('<div class="ejf-sd-sum"></div>').text(r.summary || '').appendTo($li);
-        if (meta) { $('<div class="ejf-sd-meta"></div>').text(meta).appendTo($li); }
-        var created = EJF_SD.util.fmtDate(r.created);
-        if (created) { $('<div class="ejf-sd-date"></div>').text('Created ' + created).appendTo($li); }
+        $('<div class="jita-sd-sum"></div>').text(r.summary || '').appendTo($li);
+        if (meta) { $('<div class="jita-sd-meta"></div>').text(meta).appendTo($li); }
+        var created = JiTA.util.fmtDate(r.created);
+        if (created) { $('<div class="jita-sd-date"></div>').text('Created ' + created).appendTo($li); }
         return $li;
     },
 
     // EBR view row: link navigates in place, trailing control marks the open EBR a duplicate of this defect.
     _item: function (r) {
-        return EJF_SD.ui._row(r, '_self', function (k) { return EJF_SD.ui._markDupButton(k); });
+        return JiTA.ui._row(r, '_self', function (k) { return JiTA.ui._markDupButton(k); });
     },
 
     // EDR/EO/PLAT "matching bug reports" row: link opens in a new tab, trailing control attaches the report.
     _reportItem: function (r) {
-        return EJF_SD.ui._row(r, '_blank', function (k) { return EJF_SD.ui._attachReportButton(k); });
+        return JiTA.ui._row(r, '_blank', function (k) { return JiTA.ui._attachReportButton(k); });
     },
 
     // Read the open issue's text from the DOM (reusing the Translate selectors); fall back to a REST GET.
@@ -6897,16 +6897,16 @@ EJF_SD.ui = {
         // cleaner sees everything, then strip boilerplate. Same normalization as the stored side.
         var descText = $("div[data-component-selector='jira-issue-view-rich-text-inline-edit-view-container']").text() || '';
         if (descText.replace(/\s+/g, '').length > 0) {
-            return Promise.resolve(EJF_SD.util.cleanForCompare(title, descText));
+            return Promise.resolve(JiTA.util.cleanForCompare(title, descText));
         }
         // DOM not ready / empty body - fall back to the REST API.
         return new Promise(function (resolve) {
-            $.ajax({ url: EJF_SD.HOST + '/rest/api/2/issue/' + key + '?fields=summary,description', dataType: 'json' })
+            $.ajax({ url: JiTA.HOST + '/rest/api/2/issue/' + key + '?fields=summary,description', dataType: 'json' })
                 .done(function (d) {
                     var f = d.fields || {};
-                    resolve(EJF_SD.util.cleanForCompare(f.summary || title, EJF_SD.util.toPlainText(f.description)));
+                    resolve(JiTA.util.cleanForCompare(f.summary || title, JiTA.util.toPlainText(f.description)));
                 })
-                .fail(function () { resolve(EJF_SD.util.cleanForCompare(title, descText)); });
+                .fail(function () { resolve(JiTA.util.cleanForCompare(title, descText)); });
         });
     },
 
@@ -6914,17 +6914,17 @@ EJF_SD.ui = {
     // compare against a candidate defect's fix date. Resolves to an ISO string, or null if unavailable.
     _createdCache: {},
     _getCreated: function (key) {
-        if (Object.prototype.hasOwnProperty.call(EJF_SD.ui._createdCache, key)) {
-            return Promise.resolve(EJF_SD.ui._createdCache[key]);
+        if (Object.prototype.hasOwnProperty.call(JiTA.ui._createdCache, key)) {
+            return Promise.resolve(JiTA.ui._createdCache[key]);
         }
         return new Promise(function (resolve) {
-            $.ajax({ url: EJF_SD.HOST + '/rest/api/2/issue/' + key + '?fields=created', dataType: 'json' })
+            $.ajax({ url: JiTA.HOST + '/rest/api/2/issue/' + key + '?fields=created', dataType: 'json' })
                 .done(function (d) {
                     var created = (d && d.fields && d.fields.created) || null;
-                    EJF_SD.ui._createdCache[key] = created;
+                    JiTA.ui._createdCache[key] = created;
                     resolve(created);
                 })
-                .fail(function () { EJF_SD.ui._createdCache[key] = null; resolve(null); });
+                .fail(function () { JiTA.ui._createdCache[key] = null; resolve(null); });
         });
     },
 
@@ -6959,11 +6959,11 @@ EJF_SD.ui = {
 
     _logScanCache: {},
     scanIssueLog: function (key) {
-        if (Object.prototype.hasOwnProperty.call(EJF_SD.ui._logScanCache, key)) {
-            return Promise.resolve(EJF_SD.ui._logScanCache[key]);
+        if (Object.prototype.hasOwnProperty.call(JiTA.ui._logScanCache, key)) {
+            return Promise.resolve(JiTA.ui._logScanCache[key]);
         }
         return new Promise(function (resolve) {
-            $.ajax({ url: EJF_SD.HOST + '/rest/api/3/issue/' + key + '?fields=attachment', dataType: 'json' })
+            $.ajax({ url: JiTA.HOST + '/rest/api/3/issue/' + key + '?fields=attachment', dataType: 'json' })
                 .done(function (d) {
                     var atts = (d && d.fields && d.fields.attachment) || [];
                     var logs = [];
@@ -6971,8 +6971,8 @@ EJF_SD.ui = {
                         var fn = atts[i].filename || '';
                         if (/\.txt$/i.test(fn) && /log/i.test(fn) && atts[i].content) { logs.push(atts[i]); }
                     }
-                    if (!logs.length) { EJF_SD.ui._logScanCache[key] = {}; resolve({}); return; }
-                    console.log('[EJF-SD] log scan ' + key + ': ' + logs.length + ' log attachment(s)');
+                    if (!logs.length) { JiTA.ui._logScanCache[key] = {}; resolve({}); return; }
+                    console.log('[JiTA-SD] log scan ' + key + ': ' + logs.length + ' log attachment(s)');
                     var merged = {}, pending = logs.length;
                     function mergeFound(found) {
                         Object.keys(found || {}).forEach(function (k) {
@@ -6982,52 +6982,52 @@ EJF_SD.ui = {
                             if (!merged[k].msg && found[k].msg) { merged[k].msg = found[k].msg; }
                         });
                         if (--pending === 0) {
-                            console.log('[EJF-SD] log scan ' + key + ': ' + Object.keys(merged).length + ' known defect(s) matched');
-                            EJF_SD.ui._logScanCache[key] = merged;
+                            console.log('[JiTA-SD] log scan ' + key + ': ' + Object.keys(merged).length + ' known defect(s) matched');
+                            JiTA.ui._logScanCache[key] = merged;
                             resolve(merged);
                         }
                     }
                     logs.forEach(function (att) {
-                        EJF_SD.ui._fetchText(att.content).then(function (txt) {
+                        JiTA.ui._fetchText(att.content).then(function (txt) {
                             if (!txt) { mergeFound({}); return; }
-                            EJF_SD.logsig.matchText(txt).then(mergeFound, function () { mergeFound({}); });
+                            JiTA.logsig.matchText(txt).then(mergeFound, function () { mergeFound({}); });
                         }, function () { mergeFound({}); });
                     });
                 })
-                .fail(function () { EJF_SD.ui._logScanCache[key] = {}; resolve({}); });
+                .fail(function () { JiTA.ui._logScanCache[key] = {}; resolve({}); });
         });
     },
 
     // Populate the "Known defects in attached log" section of the panel (hidden unless there are hits). Each
     // entry links to the defect and reuses the same hover-preview card as the suggestions.
     renderLogLink: function (key) {
-        var $box = $('#ejf-sd-loglink');
+        var $box = $('#jita-sd-loglink');
         if (!$box.length) { return; }
         $box.removeClass('has-hits').empty();
-        EJF_SD.db.countDefectsOnly().then(function (n) {
+        JiTA.db.countDefectsOnly().then(function (n) {
             if (!n) { return; }   // no defects to match the log against yet
-            EJF_SD.ui.scanIssueLog(key).then(function (found) {
-                if (EJF_SD.ui.currentKey !== key) { return; }   // navigated to another issue meanwhile
+            JiTA.ui.scanIssueLog(key).then(function (found) {
+                if (JiTA.ui.currentKey !== key) { return; }   // navigated to another issue meanwhile
                 var keys = Object.keys(found || {});
-                keys = keys.filter(function (k) { return !EJF_SD.hidden.isHidden(k); });   // drop user-hidden defects from the list
+                keys = keys.filter(function (k) { return !JiTA.hidden.isHidden(k); });   // drop user-hidden defects from the list
                 if (!keys.length) { return; }
                 keys.sort(function (a, b) { return found[b].count - found[a].count || (a < b ? -1 : 1); });
-                var $b = $('#ejf-sd-loglink');
+                var $b = $('#jita-sd-loglink');
                 $b.empty();
-                $('<div class="ejf-sd-loglink-head"></div>').text('⚠ Known defects in attached log (' + keys.length + ')').appendTo($b);
+                $('<div class="jita-sd-loglink-head"></div>').text('⚠ Known defects in attached log (' + keys.length + ')').appendTo($b);
                 var $ul = $('<ul></ul>').appendTo($b);
                 keys.forEach(function (k) {
                     var $li = $('<li></li>');
                     $('<a></a>').attr('href', '/browse/' + k).attr('target', '_blank').text(k).appendTo($li);
                     if (found[k].loose) {   // matched only by crash site (same bug, different path)
-                        $('<span class="ejf-sd-loose"></span>').text('~ similar')
+                        $('<span class="jita-sd-loose"></span>').text('~ similar')
                             .attr('title', 'Same crash site, reached via a different call path - possibly related').appendTo($li);
                     }
-                    EJF_SD.ui._markDupButton(k).appendTo($li);   // same one-click "Mark dup" as the suggestions
-                    EJF_SD.ui._hideButton(k).appendTo($li);      // temporarily ignore this defect (also hides it from Similar defects)
+                    JiTA.ui._markDupButton(k).appendTo($li);   // same one-click "Mark dup" as the suggestions
+                    JiTA.ui._hideButton(k).appendTo($li);      // temporarily ignore this defect (also hides it from Similar defects)
                     $('<span class="count"></span>').text(found[k].count + '×').appendTo($li);
-                    $li.on('mouseenter', function () { EJF_SD.logsig._showDefectTip(k, this); });
-                    $li.on('mouseleave', function () { EJF_SD.logsig._hoverKey = null; if (EJF_SD.ui._hideTip) { EJF_SD.ui._hideTip(); } });
+                    $li.on('mouseenter', function () { JiTA.logsig._showDefectTip(k, this); });
+                    $li.on('mouseleave', function () { JiTA.logsig._hoverKey = null; if (JiTA.ui._hideTip) { JiTA.ui._hideTip(); } });
                     $ul.append($li);
                 });
                 $b.addClass('has-hits');
@@ -7037,20 +7037,20 @@ EJF_SD.ui = {
 
     // Coalesce re-render requests. A single sync drives several "refresh the list" triggers in quick
     // succession - the sync's own completion, then embed.prepare()'s completion after the embed pass, and
-    // (for autoSync) both the defect and EBR legs - and each render() empties + refills #ejf-sd-list, so the
+    // (for autoSync) both the defect and EBR legs - and each render() empties + refills #jita-sd-list, so the
     // list visibly rebuilds several times. Route those background triggers through here so a burst collapses
     // into ONE render of whichever view is currently open. (User-initiated renders - navigation, panel-style
     // toggle - still call render()/renderReports() directly for instant feedback.)
     _renderTimer: null,
     scheduleRender: function () {
-        if (!EJF_SD.ui.currentKey) { return; }
-        if (EJF_SD.ui._renderTimer) { clearTimeout(EJF_SD.ui._renderTimer); }
-        EJF_SD.ui._renderTimer = setTimeout(function () {
-            EJF_SD.ui._renderTimer = null;
-            var k = EJF_SD.ui.currentKey;
+        if (!JiTA.ui.currentKey) { return; }
+        if (JiTA.ui._renderTimer) { clearTimeout(JiTA.ui._renderTimer); }
+        JiTA.ui._renderTimer = setTimeout(function () {
+            JiTA.ui._renderTimer = null;
+            var k = JiTA.ui.currentKey;
             if (!k) { return; }
-            if (/^EBR-/.test(k)) { EJF_SD.ui.render(k); }
-            else if (EJF_SD.ui._isReportsKey(k)) { EJF_SD.ui.renderReports(k); }
+            if (/^EBR-/.test(k)) { JiTA.ui.render(k); }
+            else if (JiTA.ui._isReportsKey(k)) { JiTA.ui.renderReports(k); }
         }, 600);
     },
 
@@ -7058,86 +7058,86 @@ EJF_SD.ui = {
         // View-mode switch: when the funnel's "this reporter's other reports" toggle is on, the EBR panel lists
         // the reporter's OTHER reports instead of similar defects. Every re-render path funnels through here, so
         // the branch lives here (one chokepoint) rather than at each caller.
-        if (EJF_SD.ui.reporterMode) { return EJF_SD.ui.renderReporterReports(key); }
-        EJF_SD.ui._ensurePanel();
-        EJF_SD.ui._syncFilterBtn();   // reflect any active session filters on the funnel
-        var terms = EJF_SD.ui._filterTerms();   // filter box: restrict the ranked corpus to these terms (whole DB)
-        $('#ejf-sd-title').text('Similar defects');   // reset title (the panel is shared with the EDR reports view)
-        $('#ejf-sd-exccluster').removeClass('has-hits').empty();   // defect-only section; clear it on the EBR view
-        EJF_SD.ui.renderLogLink(key);   // scan the attached log for known defects (no need to open it)
-        $('#ejf-sd-list').empty();
-        EJF_SD.ui.setStatus('Finding similar defects…');
-        EJF_SD.ui.getIssueText(key).then(function (text) {
-            return EJF_SD.db.countDefectsOnly().then(function (n) {
+        if (JiTA.ui.reporterMode) { return JiTA.ui.renderReporterReports(key); }
+        JiTA.ui._ensurePanel();
+        JiTA.ui._syncFilterBtn();   // reflect any active session filters on the funnel
+        var terms = JiTA.ui._filterTerms();   // filter box: restrict the ranked corpus to these terms (whole DB)
+        $('#jita-sd-title').text('Similar defects');   // reset title (the panel is shared with the EDR reports view)
+        $('#jita-sd-exccluster').removeClass('has-hits').empty();   // defect-only section; clear it on the EBR view
+        JiTA.ui.renderLogLink(key);   // scan the attached log for known defects (no need to open it)
+        $('#jita-sd-list').empty();
+        JiTA.ui.setStatus('Finding similar defects…');
+        JiTA.ui.getIssueText(key).then(function (text) {
+            return JiTA.db.countDefectsOnly().then(function (n) {
                 if (!n) {
-                    EJF_SD.ui.setStatus('No local data yet – open the Tampermonkey menu and click “Sync defects now”.');
+                    JiTA.ui.setStatus('No local data yet – open the Tampermonkey menu and click “Sync defects now”.');
                     return;
                 }
-                if (!text) { EJF_SD.ui.setStatus('Could not read this issue’s text.'); return; }
-                return EJF_SD.ui._getCreated(key).then(function (brCreated) {
-                return EJF_SD.rank.suggestBest(text, key, brCreated, EJF_SD.ui.modeOverride, terms).then(function (out) {
+                if (!text) { JiTA.ui.setStatus('Could not read this issue’s text.'); return; }
+                return JiTA.ui._getCreated(key).then(function (brCreated) {
+                return JiTA.rank.suggestBest(text, key, brCreated, JiTA.ui.modeOverride, terms).then(function (out) {
                     var results = out.results || [];
-                    $('#ejf-sd-mode').text(out.mode);   // 'Hybrid' or 'Keyword'
-                    if (!results.length) { EJF_SD.ui.setStatus('No similar defects found (' + n + ' indexed).'); return; }
-                    EJF_SD.ui.setStatus(results.length + ' suggestions · ' + out.mode + ' · ' + n + ' indexed');
+                    $('#jita-sd-mode').text(out.mode);   // 'Hybrid' or 'Keyword'
+                    if (!results.length) { JiTA.ui.setStatus('No similar defects found (' + n + ' indexed).'); return; }
+                    JiTA.ui.setStatus(results.length + ' suggestions · ' + out.mode + ' · ' + n + ' indexed');
                     // Feature C: enrich the displayed results with each defect's full description (which
                     // includes the reproduction steps) for the hover tooltip. Only a handful of indexed-DB
                     // reads (just the shown results), so it's cheap.
                     return Promise.all(results.map(function (r) {
-                        return EJF_SD.db.getDefect(r.key).then(function (rec) {
+                        return JiTA.db.getDefect(r.key).then(function (rec) {
                             if (rec) { r.description = rec.description; r.created = rec.created; }
                             return r;
                         }, function () { return r; });
                     })).then(function () {
-                        var $list = $('#ejf-sd-list');
+                        var $list = $('#jita-sd-list');
                         $list.empty();   // clear atomically right before filling: a concurrent re-render (e.g. after an auto-sync) also emptied at its top, but both appended later - emptying here keeps each render self-contained and avoids doubled rows
-                        for (var i = 0; i < results.length; i++) { $list.append(EJF_SD.ui._item(results[i])); }
-                        EJF_SD.ui._fitVertical();   // list height changed - re-check it still fits / drops up
+                        for (var i = 0; i < results.length; i++) { $list.append(JiTA.ui._item(results[i])); }
+                        JiTA.ui._fitVertical();   // list height changed - re-check it still fits / drops up
                     });
                 });
                 });
             });
-        }).catch(function (e) { EJF_SD.ui.setStatus('Error: ' + (e && e.message || e)); });
+        }).catch(function (e) { JiTA.ui.setStatus('Error: ' + (e && e.message || e)); });
     },
 
     // EDR (defect) view: rank the OPEN bug reports that best match this defect's description (keyword BM25),
     // and list them in the same panel. Mirrors render() but over the EBR index, with no log-scan / mark-dup.
     renderReports: function (key) {
-        EJF_SD.ui._ensurePanel();
-        EJF_SD.ui._syncFilterBtn();   // reflect any active session filters on the funnel
-        var terms = EJF_SD.ui._filterTerms();   // filter box: restrict the ranked corpus to these terms (whole DB)
-        $('#ejf-sd-title').text('Matching bug reports');
-        $('#ejf-sd-loglink').removeClass('has-hits').empty();   // EBR-only section; unused on a defect
-        $('#ejf-sd-list').empty();
-        EJF_SD.ui.renderExceptionCluster(key);   // list other defects that reported the same exception
-        EJF_SD.ui.setStatus('Finding matching bug reports…');
-        EJF_SD.ui.getIssueText(key).then(function (text) {
-            return EJF_SD.db.countEbr().then(function (n) {
+        JiTA.ui._ensurePanel();
+        JiTA.ui._syncFilterBtn();   // reflect any active session filters on the funnel
+        var terms = JiTA.ui._filterTerms();   // filter box: restrict the ranked corpus to these terms (whole DB)
+        $('#jita-sd-title').text('Matching bug reports');
+        $('#jita-sd-loglink').removeClass('has-hits').empty();   // EBR-only section; unused on a defect
+        $('#jita-sd-list').empty();
+        JiTA.ui.renderExceptionCluster(key);   // list other defects that reported the same exception
+        JiTA.ui.setStatus('Finding matching bug reports…');
+        JiTA.ui.getIssueText(key).then(function (text) {
+            return JiTA.db.countEbr().then(function (n) {
                 if (!n) {
-                    EJF_SD.ui.setStatus('No bug reports synced yet – open the Tampermonkey menu and click “Sync bug reports now”.');
+                    JiTA.ui.setStatus('No bug reports synced yet – open the Tampermonkey menu and click “Sync bug reports now”.');
                     return;
                 }
-                if (!text) { EJF_SD.ui.setStatus('Could not read this defect’s text.'); return; }
-                return EJF_SD.rank.suggestEbrBest(text, key, EJF_SD.ui.modeOverride, terms).then(function (out) {
+                if (!text) { JiTA.ui.setStatus('Could not read this defect’s text.'); return; }
+                return JiTA.rank.suggestEbrBest(text, key, JiTA.ui.modeOverride, terms).then(function (out) {
                     var results = out.results || [];
-                    $('#ejf-sd-mode').text(out.mode);   // 'Hybrid' or 'Keyword'
-                    if (!results.length) { EJF_SD.ui.setStatus('No matching bug reports found (' + n + ' open).'); return; }
-                    EJF_SD.ui.setStatus(results.length + ' matches · ' + out.mode + ' · ' + n + ' open reports');
+                    $('#jita-sd-mode').text(out.mode);   // 'Hybrid' or 'Keyword'
+                    if (!results.length) { JiTA.ui.setStatus('No matching bug reports found (' + n + ' open).'); return; }
+                    JiTA.ui.setStatus(results.length + ' matches · ' + out.mode + ' · ' + n + ' open reports');
                     // Enrich with each report's full description for the hover preview (a handful of reads).
                     return Promise.all(results.map(function (r) {
-                        return EJF_SD.db.getDefect(r.key).then(function (rec) {
+                        return JiTA.db.getDefect(r.key).then(function (rec) {
                             if (rec) { r.description = rec.description; r.created = rec.created; }
                             return r;
                         }, function () { return r; });
                     })).then(function () {
-                        var $list = $('#ejf-sd-list');
+                        var $list = $('#jita-sd-list');
                         $list.empty();   // clear atomically right before filling (see render() - avoids doubled rows from a concurrent re-render)
-                        for (var i = 0; i < results.length; i++) { $list.append(EJF_SD.ui._reportItem(results[i])); }
-                        EJF_SD.ui._fitVertical();   // list height changed - re-check it still fits / drops up
+                        for (var i = 0; i < results.length; i++) { $list.append(JiTA.ui._reportItem(results[i])); }
+                        JiTA.ui._fitVertical();   // list height changed - re-check it still fits / drops up
                     });
                 });
             });
-        }).catch(function (e) { EJF_SD.ui.setStatus('Error: ' + (e && e.message || e)); });
+        }).catch(function (e) { JiTA.ui.setStatus('Error: ' + (e && e.message || e)); });
     },
 
     // EBR view, "reporter's other reports" mode (funnel toggle): list EVERY other bug report from the same
@@ -7145,22 +7145,22 @@ EJF_SD.ui = {
     // we deliberately want ALL of the reporter's reports - open AND closed, GM-team included - and the cache
     // holds only open, non-GM reports. Closed reports are greyed so the open ones stand out.
     renderReporterReports: function (key) {
-        EJF_SD.ui._ensurePanel();
-        EJF_SD.ui._syncFilterBtn();
-        $('#ejf-sd-title').text('Reports by this reporter');
-        $('#ejf-sd-mode').text('');                                  // no ranking mode in this view
-        $('#ejf-sd-exccluster').removeClass('has-hits').empty();     // defect-only section
-        $('#ejf-sd-loglink').removeClass('has-hits').empty();        // similar-defects-only section
-        $('#ejf-sd-list').empty();
-        EJF_SD.ui.setStatus('Finding this reporter’s other reports…');
-        EJF_SD.ui._getReporterId(key).then(function (rid) {
-            if (EJF_SD.ui.currentKey !== key || !EJF_SD.ui.reporterMode) { return; }   // navigated / toggled off meanwhile
-            if (!rid) { EJF_SD.ui.setStatus('This report has no Original Reporter ID.'); return; }
-            var jql = 'project = EBR AND cf[11660] ~ ' + EJF_SD.ui._jqlQuote(rid) + ' ORDER BY created DESC';
-            return EJF_SD.sync._apiPost('/rest/api/3/search/jql', {
+        JiTA.ui._ensurePanel();
+        JiTA.ui._syncFilterBtn();
+        $('#jita-sd-title').text('Reports by this reporter');
+        $('#jita-sd-mode').text('');                                  // no ranking mode in this view
+        $('#jita-sd-exccluster').removeClass('has-hits').empty();     // defect-only section
+        $('#jita-sd-loglink').removeClass('has-hits').empty();        // similar-defects-only section
+        $('#jita-sd-list').empty();
+        JiTA.ui.setStatus('Finding this reporter’s other reports…');
+        JiTA.ui._getReporterId(key).then(function (rid) {
+            if (JiTA.ui.currentKey !== key || !JiTA.ui.reporterMode) { return; }   // navigated / toggled off meanwhile
+            if (!rid) { JiTA.ui.setStatus('This report has no Original Reporter ID.'); return; }
+            var jql = 'project = EBR AND cf[11660] ~ ' + JiTA.ui._jqlQuote(rid) + ' ORDER BY created DESC';
+            return JiTA.sync._apiPost('/rest/api/3/search/jql', {
                 jql: jql, fields: ['summary', 'status', 'resolution', 'created', 'description'], maxResults: 100
             }).then(function (r) {
-                if (EJF_SD.ui.currentKey !== key || !EJF_SD.ui.reporterMode) { return; }
+                if (JiTA.ui.currentKey !== key || !JiTA.ui.reporterMode) { return; }
                 var issues = (r.data && r.data.issues) || [];
                 var rows = [];
                 for (var i = 0; i < issues.length; i++) {
@@ -7173,18 +7173,18 @@ EJF_SD.ui = {
                         status: status,
                         resolution: (f.resolution && f.resolution.name) || null,
                         created: f.created || null,
-                        description: EJF_SD.util.toPlainText(f.description),
-                        stale: EJF_SD.util.isClosedStatus(status)   // grey out closed reports so the open ones stand out
+                        description: JiTA.util.toPlainText(f.description),
+                        stale: JiTA.util.isClosedStatus(status)   // grey out closed reports so the open ones stand out
                     });
                 }
-                if (!rows.length) { EJF_SD.ui.setStatus('No other reports from this reporter.'); return; }
-                EJF_SD.ui.setStatus(rows.length + ' other report' + (rows.length === 1 ? '' : 's') + ' from this reporter');
-                var $list = $('#ejf-sd-list');
+                if (!rows.length) { JiTA.ui.setStatus('No other reports from this reporter.'); return; }
+                JiTA.ui.setStatus(rows.length + ' other report' + (rows.length === 1 ? '' : 's') + ' from this reporter');
+                var $list = $('#jita-sd-list');
                 $list.empty();
-                for (var j = 0; j < rows.length; j++) { $list.append(EJF_SD.ui._reporterRow(rows[j])); }
-                EJF_SD.ui._fitVertical();
+                for (var j = 0; j < rows.length; j++) { $list.append(JiTA.ui._reporterRow(rows[j])); }
+                JiTA.ui._fitVertical();
             });
-        }).catch(function (e) { EJF_SD.ui.setStatus('Error: ' + (e && e.message || e)); });
+        }).catch(function (e) { JiTA.ui.setStatus('Error: ' + (e && e.message || e)); });
     },
 
     // Wrap a value as a JQL string literal (escape backslashes + double-quotes).
@@ -7193,7 +7193,7 @@ EJF_SD.ui = {
     // This report's Original Reporter ID, read live from Jira (one field). '' when the field is empty/absent.
     _getReporterId: function (key) {
         return new Promise(function (resolve) {
-            $.ajax({ url: EJF_SD.HOST + '/rest/api/2/issue/' + key + '?fields=customfield_11660', dataType: 'json' })
+            $.ajax({ url: JiTA.HOST + '/rest/api/2/issue/' + key + '?fields=customfield_11660', dataType: 'json' })
                 .done(function (d) { var v = d && d.fields && d.fields.customfield_11660; resolve(typeof v === 'string' ? v.trim() : ''); })
                 .fail(function () { resolve(''); });
         });
@@ -7201,50 +7201,50 @@ EJF_SD.ui = {
 
     // Reporter-list row: link navigates in place; no relevance score and no trailing control (not a ranked match).
     _reporterRow: function (r) {
-        return EJF_SD.ui._row(r, '_self', function () { return $(); }, { noScore: true });
+        return JiTA.ui._row(r, '_self', function () { return $(); }, { noScore: true });
     },
 
     // Populate the "Same exception" section: every OTHER defect that reported the same exception signature as
     // this one, each with its status (Open / Fixed). A sibling that is already FIXED while this defect is still
     // open is flagged "⚠ regression?". Hidden unless there are siblings. Reuses the shared cluster member rows.
     renderExceptionCluster: function (key) {
-        var $box = $('#ejf-sd-exccluster');
+        var $box = $('#jita-sd-exccluster');
         if (!$box.length) { return; }
         $box.removeClass('has-hits').empty();
         // Exact stack siblings ("Same exception") AND looser crash-site peers ("Possibly related").
-        Promise.all([EJF_SD.logsig.siblingsForKey(key), EJF_SD.logsig.relatedForKey(key)]).then(function (res) {
-            if (EJF_SD.ui.currentKey !== key) { return; }       // navigated to another issue meanwhile
+        Promise.all([JiTA.logsig.siblingsForKey(key), JiTA.logsig.relatedForKey(key)]).then(function (res) {
+            if (JiTA.ui.currentKey !== key) { return; }       // navigated to another issue meanwhile
             var siblings = res[0] || [], related = res[1] || [];
             if (!siblings.length && !related.length) { return; }
-            return EJF_SD.db.getDefect(key).then(function (rec) {
-                if (EJF_SD.ui.currentKey !== key) { return; }
+            return JiTA.db.getDefect(key).then(function (rec) {
+                if (JiTA.ui.currentKey !== key) { return; }
                 var currentResolved = !!(rec && (rec.resolution || rec.resolutiondate));
-                EJF_SD.logsig._injectClusterCss();
-                var $b = $('#ejf-sd-exccluster');
+                JiTA.logsig._injectClusterCss();
+                var $b = $('#jita-sd-exccluster');
                 $b.empty();
                 // ⚠ regression flag: a peer that's already FIXED while this defect is still open.
                 function regressionWarn(m) {
                     if (!((m.resolution || m.resolutiondate) && !currentResolved)) { return null; }
                     var warn = document.createElement('span');
-                    warn.className = 'ejf-exc-badge warn';
+                    warn.className = 'jita-exc-badge warn';
                     warn.textContent = '⚠ regression?';
                     warn.title = 'This exception was already resolved in ' + m.key + ', but the current issue is still open – possible regression.';
                     return warn;
                 }
                 function section(headText, headTitle, list, marginTop) {
-                    var $h = $('<div class="ejf-sd-exccluster-head"></div>').text(headText);
+                    var $h = $('<div class="jita-sd-exccluster-head"></div>').text(headText);
                     if (headTitle) { $h.attr('title', headTitle); }
                     if (marginTop) { $h.css('margin-top', '8px'); }
                     $h.appendTo($b);
                     var box = document.createElement('div');
-                    box.className = 'ejf-exc-members';
-                    list.forEach(function (m) { box.appendChild(EJF_SD.logsig._memberRowEl(m, regressionWarn(m))); });
+                    box.className = 'jita-exc-members';
+                    list.forEach(function (m) { box.appendChild(JiTA.logsig._memberRowEl(m, regressionWarn(m))); });
                     $b.append(box);
                 }
                 if (siblings.length) { section('Same exception (' + siblings.length + ')', '', siblings, false); }
                 if (related.length) { section('Possibly related (' + related.length + ')', 'Same crash site, reached via a different call path', related, siblings.length > 0); }
                 $b.addClass('has-hits');
-                EJF_SD.ui._fitVertical();
+                JiTA.ui._fitVertical();
             });
         }).catch(function () { /* swallow - the section just stays hidden */ });
     },
@@ -7255,20 +7255,20 @@ EJF_SD.ui = {
     // auto-initial build instead). The catch-up is incremental, so it cheaply fetches the new EDR.
     _autoSyncedKeys: {},
     _maybeSyncForDefect: function (key) {
-        if (EJF_SD.ui._autoSyncedKeys[key]) { return; }
-        if (EJF_SD.sync.running) { return; }
-        EJF_SD.db.countDefectsOnly().then(function (n) {
+        if (JiTA.ui._autoSyncedKeys[key]) { return; }
+        if (JiTA.sync.running) { return; }
+        JiTA.db.countDefectsOnly().then(function (n) {
             if (!n) { return; }   // empty defect DB - the scheduler's auto-initial build covers this
-            return EJF_SD.db.getDefect(key).then(function (rec) {
+            return JiTA.db.getDefect(key).then(function (rec) {
                 if (rec) { return; }   // already indexed - nothing to do
-                EJF_SD.ui._autoSyncedKeys[key] = true;   // don't retrigger for this key this session
-                console.log('[EJF-SD] ' + key + ' not in local DB - triggering catch-up sync');
-                EJF_SD.sync.autoSync();   // quiet incremental catch-up (fetches the new defect/EO issue; embeds + refreshes)
+                JiTA.ui._autoSyncedKeys[key] = true;   // don't retrigger for this key this session
+                console.log('[JiTA-SD] ' + key + ' not in local DB - triggering catch-up sync');
+                JiTA.sync.autoSync();   // quiet incremental catch-up (fetches the new defect/EO issue; embeds + refreshes)
             });
         });
     },
 
-    // Keys that are in the synced DEFECT scope (EJF_SD.SCOPE = "project in (EDR, EO, PLAT)"), so the local DB
+    // Keys that are in the synced DEFECT scope (JiTA.SCOPE = "project in (EDR, EO, PLAT)"), so the local DB
     // holds + embeds them and they surface as candidates in the EBR "similar defects" view. Gates the
     // defect-side catch-up sync (_maybeSyncForDefect), which only makes sense for issues we actually crawl.
     _isDefectKey: function (key) { return /^(EDR|EO|PLAT)-/.test(key || ''); },
@@ -7285,25 +7285,25 @@ EJF_SD.ui = {
         var $bc = $(issueItem);
         if (!$bc.length) { return; }
         var key = $.trim($bc.first().text());
-        var isEbr = /^EBR-/.test(key), isReports = EJF_SD.ui._isReportsKey(key);
+        var isEbr = /^EBR-/.test(key), isReports = JiTA.ui._isReportsKey(key);
         if (!isEbr && !isReports) {
             // neither a bug report nor a defect/EO/PLAT issue - remove any stale panel (either style)
-            if ($('#ejf-sd-panel').length) { $('#ejf-sd-panel').remove(); }
-            if ($('#ejf-side-group').length) { $('#ejf-side-group').remove(); }
-            EJF_SD.ui.currentKey = null;
+            if ($('#jita-sd-panel').length) { $('#jita-sd-panel').remove(); }
+            if ($('#jita-side-group').length) { $('#jita-side-group').remove(); }
+            JiTA.ui.currentKey = null;
             return;
         }
         // Skip only when the chrome is mounted AND it's the same issue. In sidebar mode a Jira re-render can
         // wipe our injected section; _chromePresent() then reports false and we re-mount + repopulate here.
-        if (EJF_SD.ui._chromePresent() && EJF_SD.ui.currentKey === key) { return; }
-        if (EJF_SD.ui.currentKey !== key) { EJF_SD.ui.reporterMode = false; }   // new issue -> leave the reporter-reports view (its reporter is per-issue)
-        EJF_SD.ui.currentKey = key;
+        if (JiTA.ui._chromePresent() && JiTA.ui.currentKey === key) { return; }
+        if (JiTA.ui.currentKey !== key) { JiTA.ui.reporterMode = false; }   // new issue -> leave the reporter-reports view (its reporter is per-issue)
+        JiTA.ui.currentKey = key;
         if (isEbr) {
-            EJF_SD.ui.render(key);              // bug report -> similar defects
+            JiTA.ui.render(key);              // bug report -> similar defects
         } else {
-            EJF_SD.ui.renderReports(key);       // defect / EO / PLAT issue -> matching open bug reports
+            JiTA.ui.renderReports(key);       // defect / EO / PLAT issue -> matching open bug reports
             // Only EDR/EO are in the crawled scope, so only they get the "index this issue if missing" catch-up.
-            if (EJF_SD.ui._isDefectKey(key)) { EJF_SD.ui._maybeSyncForDefect(key); }
+            if (JiTA.ui._isDefectKey(key)) { JiTA.ui._maybeSyncForDefect(key); }
         }
     }
 };
@@ -7315,87 +7315,87 @@ EJF_SD.ui = {
 // is enabled, its actions (sync defects / sync bug reports / rebuild) + the embedding-backend switch +
 // a live count of what's indexed. The existing toggle* functions still do the actual work; they call
 // refreshMenu() which re-renders this overlay so it reflects the new state without closing.
-EJF_SD.menu = {
+JiTA.menu = {
     _cssInjected: false,
     css: '\
-#ejf-menu-overlay { position: fixed; inset: 0; z-index: 10000; background: rgba(0,0,0,.5); display: flex;\
+#jita-menu-overlay { position: fixed; inset: 0; z-index: 10000; background: rgba(0,0,0,.5); display: flex;\
   align-items: center; justify-content: center; font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif; }\
-#ejf-menu { width: 360px; max-height: 82vh; overflow-y: auto; background: #1D2125; color: #e6e6e6;\
+#jita-menu { width: 360px; max-height: 82vh; overflow-y: auto; background: #1D2125; color: #e6e6e6;\
   border: 1px solid #3a434d; border-radius: 8px; box-shadow: 0 8px 30px rgba(0,0,0,.55); font-size: 13px; }\
-#ejf-menu .ejf-menu-head { display: flex; align-items: center; gap: 8px; padding: 12px 14px; background: #282d33; border-radius: 8px 8px 0 0; position: sticky; top: 0; }\
-#ejf-menu .ejf-menu-head h2 { margin: 0; font-size: 14px; font-weight: 700; flex: 1; }\
-#ejf-menu .ejf-menu-x { cursor: pointer; font-weight: 700; font-size: 18px; line-height: 1; padding: 0 4px; color: #9aa6b2; }\
-#ejf-menu .ejf-menu-x:hover { color: #fff; }\
-#ejf-menu .ejf-menu-sect { padding: 4px 14px 12px; }\
-#ejf-menu .ejf-menu-sect h3 { margin: 12px 0 4px; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: #7a8694; }\
-#ejf-menu .ejf-menu-row { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid #2c333a; }\
-#ejf-menu .ejf-menu-row:last-child { border-bottom: none; }\
-#ejf-menu .ejf-menu-row .lbl { flex: 1; }\
-#ejf-menu .ejf-menu-row .sub { display: block; color: #7a8694; font-size: 11px; margin-top: 2px; }\
-#ejf-menu .ejf-sw { width: 38px; height: 20px; border-radius: 12px; background: #3a434d; position: relative; cursor: pointer; flex: 0 0 auto; transition: background .15s; }\
-#ejf-menu .ejf-sw.on { background: #4caf7d; }\
-#ejf-menu .ejf-sw .knob { position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff; transition: left .15s; }\
-#ejf-menu .ejf-sw.on .knob { left: 20px; }\
-#ejf-menu .ejf-menu-actions { display: flex; flex-wrap: wrap; gap: 8px; padding: 6px 0 2px; }\
-#ejf-menu .ejf-btn { background: #2c333a; color: #e6e6e6; border: 1px solid #3a434d; border-radius: 5px; padding: 6px 10px; cursor: pointer; font-size: 12px; }\
-#ejf-menu .ejf-btn:hover { background: #343c44; border-color: #4c9aff; }\
-#ejf-menu .ejf-btn:disabled { opacity: .5; cursor: default; }\
-#ejf-menu .ejf-btn:disabled:hover { background: #2c333a; border-color: #3a434d; }\
-#ejf-menu .ejf-num { width: 56px; flex: 0 0 auto; background: #2c333a; color: #e6e6e6; border: 1px solid #3a434d; border-radius: 5px; padding: 5px 8px; font-size: 12px; text-align: center; }\
-#ejf-menu .ejf-num:focus { outline: none; border-color: #4c9aff; }\
-#ejf-menu .ejf-menu-status { color: #9aa6b2; font-size: 11px; padding: 8px 0 0; }\
-#ejf-menu .ejf-resp-list { display: flex; flex-direction: column; gap: 8px; padding: 6px 0; }\
-#ejf-menu .ejf-resp-item { display: flex; flex-direction: column; gap: 4px; border: 1px solid #2c333a; border-radius: 6px; padding: 8px; position: relative; }\
-#ejf-menu .ejf-resp-title { background: #14181b; color: #e6e6e6; border: 1px solid #3a434d; border-radius: 4px; padding: 5px 26px 5px 8px; font-size: 12px; font-weight: 600; }\
-#ejf-menu .ejf-resp-body { background: #14181b; color: #e6e6e6; border: 1px solid #3a434d; border-radius: 4px; padding: 5px 8px; font-size: 12px; resize: vertical; font-family: inherit; line-height: 1.4; }\
-#ejf-menu .ejf-resp-title:focus, #ejf-menu .ejf-resp-body:focus { outline: none; border-color: #4c9aff; }\
-#ejf-menu .ejf-resp-del { position: absolute; top: 6px; right: 6px; width: 20px; height: 20px; line-height: 1; background: transparent; color: #9aa6b2; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; }\
-#ejf-menu .ejf-resp-del:hover { background: #3a434d; color: #fff; }',
+#jita-menu .jita-menu-head { display: flex; align-items: center; gap: 8px; padding: 12px 14px; background: #282d33; border-radius: 8px 8px 0 0; position: sticky; top: 0; }\
+#jita-menu .jita-menu-head h2 { margin: 0; font-size: 14px; font-weight: 700; flex: 1; }\
+#jita-menu .jita-menu-x { cursor: pointer; font-weight: 700; font-size: 18px; line-height: 1; padding: 0 4px; color: #9aa6b2; }\
+#jita-menu .jita-menu-x:hover { color: #fff; }\
+#jita-menu .jita-menu-sect { padding: 4px 14px 12px; }\
+#jita-menu .jita-menu-sect h3 { margin: 12px 0 4px; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: #7a8694; }\
+#jita-menu .jita-menu-row { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid #2c333a; }\
+#jita-menu .jita-menu-row:last-child { border-bottom: none; }\
+#jita-menu .jita-menu-row .lbl { flex: 1; }\
+#jita-menu .jita-menu-row .sub { display: block; color: #7a8694; font-size: 11px; margin-top: 2px; }\
+#jita-menu .jita-sw { width: 38px; height: 20px; border-radius: 12px; background: #3a434d; position: relative; cursor: pointer; flex: 0 0 auto; transition: background .15s; }\
+#jita-menu .jita-sw.on { background: #4caf7d; }\
+#jita-menu .jita-sw .knob { position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff; transition: left .15s; }\
+#jita-menu .jita-sw.on .knob { left: 20px; }\
+#jita-menu .jita-menu-actions { display: flex; flex-wrap: wrap; gap: 8px; padding: 6px 0 2px; }\
+#jita-menu .jita-btn { background: #2c333a; color: #e6e6e6; border: 1px solid #3a434d; border-radius: 5px; padding: 6px 10px; cursor: pointer; font-size: 12px; }\
+#jita-menu .jita-btn:hover { background: #343c44; border-color: #4c9aff; }\
+#jita-menu .jita-btn:disabled { opacity: .5; cursor: default; }\
+#jita-menu .jita-btn:disabled:hover { background: #2c333a; border-color: #3a434d; }\
+#jita-menu .jita-num { width: 56px; flex: 0 0 auto; background: #2c333a; color: #e6e6e6; border: 1px solid #3a434d; border-radius: 5px; padding: 5px 8px; font-size: 12px; text-align: center; }\
+#jita-menu .jita-num:focus { outline: none; border-color: #4c9aff; }\
+#jita-menu .jita-menu-status { color: #9aa6b2; font-size: 11px; padding: 8px 0 0; }\
+#jita-menu .jita-resp-list { display: flex; flex-direction: column; gap: 8px; padding: 6px 0; }\
+#jita-menu .jita-resp-item { display: flex; flex-direction: column; gap: 4px; border: 1px solid #2c333a; border-radius: 6px; padding: 8px; position: relative; }\
+#jita-menu .jita-resp-title { background: #14181b; color: #e6e6e6; border: 1px solid #3a434d; border-radius: 4px; padding: 5px 26px 5px 8px; font-size: 12px; font-weight: 600; }\
+#jita-menu .jita-resp-body { background: #14181b; color: #e6e6e6; border: 1px solid #3a434d; border-radius: 4px; padding: 5px 8px; font-size: 12px; resize: vertical; font-family: inherit; line-height: 1.4; }\
+#jita-menu .jita-resp-title:focus, #jita-menu .jita-resp-body:focus { outline: none; border-color: #4c9aff; }\
+#jita-menu .jita-resp-del { position: absolute; top: 6px; right: 6px; width: 20px; height: 20px; line-height: 1; background: transparent; color: #9aa6b2; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; }\
+#jita-menu .jita-resp-del:hover { background: #3a434d; color: #fff; }',
 
     _injectCss: function () {
-        if (!EJF_SD.menu._cssInjected) { GM_addStyle(EJF_SD.menu.css); EJF_SD.menu._cssInjected = true; }
+        if (!JiTA.menu._cssInjected) { GM_addStyle(JiTA.menu.css); JiTA.menu._cssInjected = true; }
     },
 
-    isOpen: function () { return !!document.getElementById('ejf-menu-overlay'); },
+    isOpen: function () { return !!document.getElementById('jita-menu-overlay'); },
 
     close: function () {
-        var o = document.getElementById('ejf-menu-overlay');
+        var o = document.getElementById('jita-menu-overlay');
         if (o && o.parentNode) { o.parentNode.removeChild(o); }
-        if (EJF_SD.menu._esc) { document.removeEventListener('keydown', EJF_SD.menu._esc); EJF_SD.menu._esc = null; }
+        if (JiTA.menu._esc) { document.removeEventListener('keydown', JiTA.menu._esc); JiTA.menu._esc = null; }
     },
 
-    // Build the shared modal overlay chrome (#ejf-menu-overlay backdrop + #ejf-menu box) used by the settings
+    // Build the shared modal overlay chrome (#jita-menu-overlay backdrop + #jita-menu box) used by the settings
     // menu, the Exception-clusters view, and the responses editor. Closes any existing overlay first - tearing
     // down its Esc listener, which fixes a leak: the settings command's close() only removed _esc, so the
     // clusters/editor Esc handlers (their own closures) previously lingered until the next Escape. Injects the
     // menu CSS, wires backdrop + Esc to menu.close (the single close path, always tracked via _esc), and, when
-    // opts.title is given, builds .ejf-menu-head with an <h2> + × button. opts.wide adds .ejf-menu-wide (editor).
+    // opts.title is given, builds .jita-menu-head with an <h2> + × button. opts.wide adds .jita-menu-wide (editor).
     // Returns { $overlay, $menu, close }. The settings menu passes NO title - render() rebuilds its head on
     // every refresh (it $p.empty()s first).
     _openOverlay: function (opts) {
         opts = opts || {};
-        EJF_SD.menu.close();
-        EJF_SD.menu._injectCss();
-        var $overlay = $('<div id="ejf-menu-overlay"></div>');
-        $overlay.on('click', function (e) { if (e.target === this) { EJF_SD.menu.close(); } });   // backdrop click
-        var $menu = $('<div id="ejf-menu"' + (opts.wide ? ' class="ejf-menu-wide"' : '') + '></div>').appendTo($overlay);
+        JiTA.menu.close();
+        JiTA.menu._injectCss();
+        var $overlay = $('<div id="jita-menu-overlay"></div>');
+        $overlay.on('click', function (e) { if (e.target === this) { JiTA.menu.close(); } });   // backdrop click
+        var $menu = $('<div id="jita-menu"' + (opts.wide ? ' class="jita-menu-wide"' : '') + '></div>').appendTo($overlay);
         if (opts.title) {
-            var $head = $('<div class="ejf-menu-head"><h2></h2></div>');
+            var $head = $('<div class="jita-menu-head"><h2></h2></div>');
             $head.children('h2').text(opts.title);
-            $('<span class="ejf-menu-x" title="Close (Esc)">×</span>').on('click', EJF_SD.menu.close).appendTo($head);
+            $('<span class="jita-menu-x" title="Close (Esc)">×</span>').on('click', JiTA.menu.close).appendTo($head);
             $menu.append($head);
         }
         $overlay.appendTo(document.body);
-        EJF_SD.menu._esc = function (e) { if (e.key === 'Escape') { EJF_SD.menu.close(); } };
-        document.addEventListener('keydown', EJF_SD.menu._esc);
-        return { $overlay: $overlay, $menu: $menu, close: EJF_SD.menu.close };
+        JiTA.menu._esc = function (e) { if (e.key === 'Escape') { JiTA.menu.close(); } };
+        document.addEventListener('keydown', JiTA.menu._esc);
+        return { $overlay: $overlay, $menu: $menu, close: JiTA.menu.close };
     },
 
     // Open (toggle): a second click of the menu command closes it again.
     open: function () {
-        if (EJF_SD.menu.isOpen()) { EJF_SD.menu.close(); return; }
-        EJF_SD.menu._openOverlay({});   // no title - render() builds the head on every refresh
-        EJF_SD.menu.render();
+        if (JiTA.menu.isOpen()) { JiTA.menu.close(); return; }
+        JiTA.menu._openOverlay({});   // no title - render() builds the head on every refresh
+        JiTA.menu.render();
     },
 
     // A label + on/off switch row for the feature at savedVariables[index]. Clicking flips it via
@@ -7403,9 +7403,9 @@ EJF_SD.menu = {
     // optional onAfter runs afterwards for features that need extra work on change (e.g. the Triage Assistant
     // mounting / tearing down its panel).
     _toggleRow: function (label, index, onAfter) {
-        var $row = $('<div class="ejf-menu-row"></div>');
+        var $row = $('<div class="jita-menu-row"></div>');
         $('<span class="lbl"></span>').text(label).appendTo($row);
-        var $sw = $('<div class="ejf-sw"><span class="knob"></span></div>');
+        var $sw = $('<div class="jita-sw"><span class="knob"></span></div>');
         if (savedVariables[index][1]) { $sw.addClass('on'); }
         $sw.on('click', function () {
             toggleFeature(index);
@@ -7416,28 +7416,28 @@ EJF_SD.menu = {
     },
 
     render: function () {
-        var $p = $('#ejf-menu');
+        var $p = $('#jita-menu');
         if (!$p.length) { return; }
         $p.empty();
 
-        var $head = $('<div class="ejf-menu-head"><h2>Jira Triage Assistant</h2></div>');
-        $('<span class="ejf-menu-x" title="Close (Esc)">×</span>').on('click', EJF_SD.menu.close).appendTo($head);
+        var $head = $('<div class="jita-menu-head"><h2>Jira Triage Assistant</h2></div>');
+        $('<span class="jita-menu-x" title="Close (Esc)">×</span>').on('click', JiTA.menu.close).appendTo($head);
         $p.append($head);
 
         // ---- Features ----
-        var $feat = $('<div class="ejf-menu-sect"></div>');
+        var $feat = $('<div class="jita-menu-sect"></div>');
         $('<h3>Features</h3>').appendTo($feat);
-        $feat.append(EJF_SD.menu._toggleRow('Log Parser', 1));
-        $feat.append(EJF_SD.menu._toggleRow('Custom Scrollbar', 2));
-        $feat.append(EJF_SD.menu._toggleRow('Extra Buttons', 4));
+        $feat.append(JiTA.menu._toggleRow('Log Parser', 1));
+        $feat.append(JiTA.menu._toggleRow('Custom Scrollbar', 2));
+        $feat.append(JiTA.menu._toggleRow('Extra Buttons', 4));
         // Triage Assistant needs extra work on change: mount its panel when enabled, tear it down when disabled.
-        $feat.append(EJF_SD.menu._toggleRow('Triage Assistant', 5, function () {
+        $feat.append(JiTA.menu._toggleRow('Triage Assistant', 5, function () {
             if (!savedVariables[5][1]) {
-                $('#ejf-sd-panel').remove();
-                $('#ejf-side-group').remove();
-                if (typeof EJF_SD !== 'undefined') { EJF_SD.ui.currentKey = null; }
-            } else if (typeof EJF_SD !== 'undefined') {
-                EJF_SD.ui.ensure();
+                $('#jita-sd-panel').remove();
+                $('#jita-side-group').remove();
+                if (typeof JiTA !== 'undefined') { JiTA.ui.currentKey = null; }
+            } else if (typeof JiTA !== 'undefined') {
+                JiTA.ui.ensure();
             }
         }));
         $p.append($feat);
@@ -7445,62 +7445,62 @@ EJF_SD.menu = {
         // ---- Canned responses (Zendesk Support panel) ----
         // A repository of reusable replies, shown as a dropdown in the Zendesk Support activity panel (picking
         // one replaces the editor). The actual editing happens in a roomier standalone window
-        // (EJF_SD.responses.openEditor); here we just expose the entry point + a quick "Restore defaults".
+        // (JiTA.responses.openEditor); here we just expose the entry point + a quick "Restore defaults".
         // Edits persist in GM storage and reach the Forge-iframe dropdown live.
-        var $resp = $('<div class="ejf-menu-sect"></div>');
+        var $resp = $('<div class="jita-menu-sect"></div>');
         $('<h3>Canned responses</h3>').appendTo($resp);
-        $('<div class="ejf-menu-status">Shown as a dropdown in the Zendesk Support panel; picking one replaces the comment editor.</div>').appendTo($resp);
-        var $respActions = $('<div class="ejf-menu-actions"></div>').appendTo($resp);
-        $('<button class="ejf-btn">Customize responses</button>')
-            .on('click', function () { EJF_SD.responses.openEditor(); }).appendTo($respActions);
+        $('<div class="jita-menu-status">Shown as a dropdown in the Zendesk Support panel; picking one replaces the comment editor.</div>').appendTo($resp);
+        var $respActions = $('<div class="jita-menu-actions"></div>').appendTo($resp);
+        $('<button class="jita-btn">Customize responses</button>')
+            .on('click', function () { JiTA.responses.openEditor(); }).appendTo($respActions);
         $p.append($resp);
 
         // ---- Triage Assistant (only when enabled) ----
         if (savedVariables[5][1]) {
-            var $ta = $('<div class="ejf-menu-sect"></div>');
+            var $ta = $('<div class="jita-menu-sect"></div>');
             $('<h3>Triage Assistant</h3>').appendTo($ta);
 
-            var $actions = $('<div class="ejf-menu-actions"></div>');
-            $('<button class="ejf-btn">Sync now</button>')
-                .on('click', function () { EJF_SD.menu.close(); EJF_SD.sync.syncAllNow(); }).appendTo($actions);
-            $('<button class="ejf-btn">Rebuild defect DB</button>')
-                .on('click', function () { EJF_SD.menu.close(); EJF_SD.sync.rebuild(); }).appendTo($actions);
-            $('<button class="ejf-btn">Rebuild BR DB</button>')
-                .on('click', function () { EJF_SD.menu.close(); EJF_SD.sync.rebuildEbr(); }).appendTo($actions);
-            $('<button class="ejf-btn">Exception clusters</button>')
-                .on('click', function () { EJF_SD.logsig.openClustersView(); }).appendTo($actions);
+            var $actions = $('<div class="jita-menu-actions"></div>');
+            $('<button class="jita-btn">Sync now</button>')
+                .on('click', function () { JiTA.menu.close(); JiTA.sync.syncAllNow(); }).appendTo($actions);
+            $('<button class="jita-btn">Rebuild defect DB</button>')
+                .on('click', function () { JiTA.menu.close(); JiTA.sync.rebuild(); }).appendTo($actions);
+            $('<button class="jita-btn">Rebuild BR DB</button>')
+                .on('click', function () { JiTA.menu.close(); JiTA.sync.rebuildEbr(); }).appendTo($actions);
+            $('<button class="jita-btn">Exception clusters</button>')
+                .on('click', function () { JiTA.logsig.openClustersView(); }).appendTo($actions);
             $ta.append($actions);
 
-            // Panel style (integrated sidebar vs floating box). EJF_SD.ui.toggleStyle() re-mounts in place.
-            var sidebarOn = (typeof EJF_SD !== 'undefined' && EJF_SD.ui.mode() === 'sidebar');
-            var $styleRow = $('<div class="ejf-menu-row"></div>');
+            // Panel style (integrated sidebar vs floating box). JiTA.ui.toggleStyle() re-mounts in place.
+            var sidebarOn = (typeof JiTA !== 'undefined' && JiTA.ui.mode() === 'sidebar');
+            var $styleRow = $('<div class="jita-menu-row"></div>');
             $('<span class="lbl">Panel style</span>')
                 .append($('<span class="sub"></span>').text('Currently: ' + (sidebarOn ? 'Sidebar (integrated)' : 'Floating (draggable box)')))
                 .appendTo($styleRow);
-            $('<button class="ejf-btn"></button>').text(sidebarOn ? 'Switch to floating' : 'Switch to sidebar')
-                .on('click', function () { EJF_SD.menu.close(); EJF_SD.ui.toggleStyle(); }).appendTo($styleRow);
+            $('<button class="jita-btn"></button>').text(sidebarOn ? 'Switch to floating' : 'Switch to sidebar')
+                .on('click', function () { JiTA.menu.close(); JiTA.ui.toggleStyle(); }).appendTo($styleRow);
             $ta.append($styleRow);
 
-            // Results shown: how many related issues the panel lists (EJF_SD.TOP_N). Persisted in 'sdTopN';
-            // committing a new value updates EJF_SD.TOP_N live and re-renders the open view (no reload). The
+            // Results shown: how many related issues the panel lists (JiTA.TOP_N). Persisted in 'sdTopN';
+            // committing a new value updates JiTA.TOP_N live and re-renders the open view (no reload). The
             // ranking reads TOP_N at query time and CAND (50) bounds the candidate pool, so 1..30 is safe.
-            var $cntRow = $('<div class="ejf-menu-row"></div>');
+            var $cntRow = $('<div class="jita-menu-row"></div>');
             $('<span class="lbl">Results shown</span>')
                 .append($('<span class="sub"></span>').text('How many related issues to list (1–30)'))
                 .appendTo($cntRow);
-            var $cnt = $('<input type="number" min="1" max="30" class="ejf-num">').val(EJF_SD.TOP_N);
+            var $cnt = $('<input type="number" min="1" max="30" class="jita-num">').val(JiTA.TOP_N);
             function commitTopN() {
                 var v = parseInt($cnt.val(), 10);
-                if (isNaN(v)) { v = EJF_SD.TOP_N; }
+                if (isNaN(v)) { v = JiTA.TOP_N; }
                 v = Math.max(1, Math.min(30, v));
                 $cnt.val(v);
-                if (v === EJF_SD.TOP_N) { return; }
-                EJF_SD.TOP_N = v;
+                if (v === JiTA.TOP_N) { return; }
+                JiTA.TOP_N = v;
                 gmSet('sdTopN', v);
                 // Re-render whichever view is open so the new count takes effect immediately.
-                var k = EJF_SD.ui.currentKey;
-                if (k && /^EBR-/.test(k)) { EJF_SD.ui.render(k); }
-                else if (k && EJF_SD.ui._isReportsKey(k)) { EJF_SD.ui.renderReports(k); }
+                var k = JiTA.ui.currentKey;
+                if (k && /^EBR-/.test(k)) { JiTA.ui.render(k); }
+                else if (k && JiTA.ui._isReportsKey(k)) { JiTA.ui.renderReports(k); }
             }
             $cnt.on('change', commitTopN);
             $cnt.on('keydown', function (e) { if (e.key === 'Enter') { commitTopN(); } });
@@ -7509,27 +7509,27 @@ EJF_SD.menu = {
 
             // Embedding backend (GPU vs CPU). Same flags toggleEmbedBackend() reads/writes; it reloads.
             var gpuOn = gmGet('sdTryWebgpu', true) && !gmGet('sdForceCpu', false);
-            var $row = $('<div class="ejf-menu-row"></div>');
+            var $row = $('<div class="jita-menu-row"></div>');
             $('<span class="lbl">Embedding backend</span>')
                 .append($('<span class="sub"></span>').text('Currently: ' + (gpuOn ? 'GPU (faster, experimental)' : 'CPU (stable)')))
                 .appendTo($row);
-            $('<button class="ejf-btn"></button>').text(gpuOn ? 'Switch to CPU' : 'Switch to GPU')
+            $('<button class="jita-btn"></button>').text(gpuOn ? 'Switch to CPU' : 'Switch to GPU')
                 .on('click', function () { toggleEmbedBackend(); }).appendTo($row);
             $ta.append($row);
 
             // Hidden suggestions: user-dismissed issues (persisted in GM, survive script updates). Show the
             // active count and let the user clear them all at once - each also auto-expires after its window.
-            var hiddenN = EJF_SD.hidden.count();
-            var $hidRow = $('<div class="ejf-menu-row"></div>');
+            var hiddenN = JiTA.hidden.count();
+            var $hidRow = $('<div class="jita-menu-row"></div>');
             $('<span class="lbl">Hidden suggestions</span>')
                 .append($('<span class="sub"></span>').text(hiddenN ? (hiddenN + ' currently hidden (auto-expire)') : 'None hidden'))
                 .appendTo($hidRow);
-            var $clrHidden = $('<button class="ejf-btn"></button>').text('Unhide all')
+            var $clrHidden = $('<button class="jita-btn"></button>').text('Unhide all')
                 .on('click', function () {
-                    EJF_SD.hidden.clear();
-                    var k = EJF_SD.ui.currentKey;
-                    if (k && /^EBR-/.test(k)) { EJF_SD.ui.render(k); }
-                    else if (k && EJF_SD.ui._isReportsKey(k)) { EJF_SD.ui.renderReports(k); }
+                    JiTA.hidden.clear();
+                    var k = JiTA.ui.currentKey;
+                    if (k && /^EBR-/.test(k)) { JiTA.ui.render(k); }
+                    else if (k && JiTA.ui._isReportsKey(k)) { JiTA.ui.renderReports(k); }
                     refreshMenu();
                 });
             if (!hiddenN) { $clrHidden.prop('disabled', true); }
@@ -7538,16 +7538,16 @@ EJF_SD.menu = {
 
             // Live "what's indexed" status (defects + open reports) + when each local DB was last built,
             // filled in async.
-            var $status = $('<div class="ejf-menu-status">Loading database status…</div>').appendTo($ta);
-            EJF_SD.db.countDefectsOnly().then(function (d) {
-                return EJF_SD.db.countEbr().then(function (e) {
-                    return EJF_SD.db.getMeta('dbBuiltAtDefects').then(function (bd) {
-                        return EJF_SD.db.getMeta('dbBuiltAtEbr').then(function (be) {
-                            if (!document.getElementById('ejf-menu')) { return; }
+            var $status = $('<div class="jita-menu-status">Loading database status…</div>').appendTo($ta);
+            JiTA.db.countDefectsOnly().then(function (d) {
+                return JiTA.db.countEbr().then(function (e) {
+                    return JiTA.db.getMeta('dbBuiltAtDefects').then(function (bd) {
+                        return JiTA.db.getMeta('dbBuiltAtEbr').then(function (be) {
+                            if (!document.getElementById('jita-menu')) { return; }
                             var line = d + ' defects · ' + e + ' open bug reports indexed locally';
                             var built = [];
-                            if (bd) { built.push('defects ' + EJF_SD.util.fmtDate(bd)); }
-                            if (be) { built.push('reports ' + EJF_SD.util.fmtDate(be)); }
+                            if (bd) { built.push('defects ' + JiTA.util.fmtDate(bd)); }
+                            if (be) { built.push('reports ' + JiTA.util.fmtDate(be)); }
                             if (built.length) { line += ' · built ' + built.join(' / '); }
                             $status.text(line);
                         });
@@ -7580,36 +7580,36 @@ EJF_SD.menu = {
 // The stored records evolve over time. Most changes are picked up by the normal incremental catch-up, but a
 // few (a brand-new FIELD, like `created`) cannot be: incremental only re-fetches issues whose `updated` moved,
 // so every pre-existing row keeps the old shape forever. To handle that, each dataset is stamped with
-// EJF_SD.DATA_VERSION whenever it is built from scratch (fullSync / fullSyncEbr - which a manual rebuild also
+// JiTA.DATA_VERSION whenever it is built from scratch (fullSync / fullSyncEbr - which a manual rebuild also
 // routes through). On load, if a POPULATED dataset is stamped BELOW the current DATA_VERSION - or carries no
 // stamp at all, i.e. it was built before this mechanism shipped - we transparently re-fetch just that dataset
 // once (refetchDefects / refetchEbr), which backfills the new field without dropping embeddings. Brand-new /
 // empty DBs need nothing: their first full build stamps the current version.
-EJF_SD.migrate = {
+JiTA.migrate = {
     _done: false,
     run: function () {
-        if (EJF_SD.migrate._done) { return; }            // once per session
-        EJF_SD.migrate._done = true;
+        if (JiTA.migrate._done) { return; }            // once per session
+        JiTA.migrate._done = true;
         if (!savedVariables[5][1]) { return; }            // Triage Assistant off -> nothing to migrate
-        EJF_SD.db.countDefectsOnly().then(function (nDef) {
-            return EJF_SD.db.getMeta('dataVersionDefects').then(function (dv) {
-                var defStale = nDef > 0 && (Number(dv) || 0) < EJF_SD.DATA_VERSION;
-                return EJF_SD.db.countEbr().then(function (nEbr) {
-                    return EJF_SD.db.getMeta('dataVersionEbr').then(function (ev) {
-                        var ebrStale = nEbr > 0 && (Number(ev) || 0) < EJF_SD.DATA_VERSION;
+        JiTA.db.countDefectsOnly().then(function (nDef) {
+            return JiTA.db.getMeta('dataVersionDefects').then(function (dv) {
+                var defStale = nDef > 0 && (Number(dv) || 0) < JiTA.DATA_VERSION;
+                return JiTA.db.countEbr().then(function (nEbr) {
+                    return JiTA.db.getMeta('dataVersionEbr').then(function (ev) {
+                        var ebrStale = nEbr > 0 && (Number(ev) || 0) < JiTA.DATA_VERSION;
                         if (!defStale && !ebrStale) { return; }
-                        console.log('[EJF-SD] local DB schema out of date (defects v' + (Number(dv) || 0) +
-                            ', reports v' + (Number(ev) || 0) + ' < v' + EJF_SD.DATA_VERSION +
+                        console.log('[JiTA-SD] local DB schema out of date (defects v' + (Number(dv) || 0) +
+                            ', reports v' + (Number(ev) || 0) + ' < v' + JiTA.DATA_VERSION +
                             ') - auto re-fetching to backfill new fields');
                         // Sequential: each refetch is single-flight (the `running` guard), so chain them.
                         var chain = Promise.resolve();
-                        if (defStale) { chain = chain.then(function () { return EJF_SD.sync.refetchDefects(); }); }
-                        if (ebrStale) { chain = chain.then(function () { return EJF_SD.sync.refetchEbr(); }); }
+                        if (defStale) { chain = chain.then(function () { return JiTA.sync.refetchDefects(); }); }
+                        if (ebrStale) { chain = chain.then(function () { return JiTA.sync.refetchEbr(); }); }
                         return chain;
                     });
                 });
             });
-        }).catch(function (e) { console.log('[EJF-SD] migration check skipped:', e && e.message || e); });
+        }).catch(function (e) { console.log('[JiTA-SD] migration check skipped:', e && e.message || e); });
     }
 };
 
@@ -7621,7 +7621,7 @@ EJF_SD.migrate = {
 // overlap within a tab. We POLL on a short timer (POLL_MS) and let the persisted recentlySynced() gate
 // decide when INTERVAL_MS has actually elapsed - polling far more often than the gate avoids the phase
 // collision you'd get if the timer period equalled the gate window (which skipped every other run).
-EJF_SD.sched = {
+JiTA.sched = {
     INTERVAL_MS: 30 * 60 * 1000,   // minimum gap between catch-up syncs (the "freshness window")
     POLL_MS: 0.5 * 60 * 1000,      // how often we CHECK whether INTERVAL_MS has elapsed (≪ INTERVAL_MS)
     STARTUP_DELAY_MS: 20 * 1000,   // wait a bit after load so we don't compete with first paint / initial render
@@ -7635,26 +7635,26 @@ EJF_SD.sched = {
     // startup tick so a page RELOAD shortly after a recent sync does not re-fetch (and re-render the Similar
     // Defects list) all over again - the user only wants a catch-up roughly every 30 minutes.
     recentlySynced: function () {
-        var last = gmGet(EJF_SD.sched.LAST_SYNC_KEY, 0) || 0;
-        return !!last && (Date.now() - last) < EJF_SD.sched.INTERVAL_MS;
+        var last = gmGet(JiTA.sched.LAST_SYNC_KEY, 0) || 0;
+        return !!last && (Date.now() - last) < JiTA.sched.INTERVAL_MS;
     },
 
     // Stamp "a sync just completed" so recentlySynced() starts the 30-minute clock. Called from every sync
     // completion path (autoSync / syncNow / rebuild).
     markSynced: function () {
-        gmSet(EJF_SD.sched.LAST_SYNC_KEY, Date.now());
+        gmSet(JiTA.sched.LAST_SYNC_KEY, Date.now());
         // If a log is open, re-match it against the freshly-synced defect index so a newly-indexed defect
         // (e.g. one you just created) appears in the "Defects in log" panel without reopening the log.
-        try { if (EJF_SD.logsig) { EJF_SD.logsig.rematch(); } } catch (e2) { /* ignore */ }
+        try { if (JiTA.logsig) { JiTA.logsig.rematch(); } } catch (e2) { /* ignore */ }
     },
 
     // Best-effort single-syncer lease across tabs. Returns true if this tab may sync now. Not perfectly
     // race-free, but a rare double-run is harmless (bulkPut is idempotent and embeddings are preserved).
     _acquireLease: function () {
-        var l = gmGet(EJF_SD.sched.LEASE_KEY, null);
+        var l = gmGet(JiTA.sched.LEASE_KEY, null);
         var now = Date.now();
-        if (!l || !l.ts || (now - l.ts) > EJF_SD.sched.LEASE_TTL_MS || l.tabId === EJF_SD.sched.tabId) {
-            gmSet(EJF_SD.sched.LEASE_KEY, { tabId: EJF_SD.sched.tabId, ts: now });
+        if (!l || !l.ts || (now - l.ts) > JiTA.sched.LEASE_TTL_MS || l.tabId === JiTA.sched.tabId) {
+            gmSet(JiTA.sched.LEASE_KEY, { tabId: JiTA.sched.tabId, ts: now });
             return true;
         }
         return false;
@@ -7662,28 +7662,28 @@ EJF_SD.sched = {
 
     tick: function () {
         if (!savedVariables[5][1]) { return; }            // feature disabled
-        if (EJF_SD.sched.recentlySynced()) { return; }    // a sync ran < INTERVAL_MS ago (persisted) - don't re-fetch on reload
-        if (!EJF_SD.sched._acquireLease()) { return; }    // another tab is the syncer right now
-        EJF_SD.sync.autoSync();
+        if (JiTA.sched.recentlySynced()) { return; }    // a sync ran < INTERVAL_MS ago (persisted) - don't re-fetch on reload
+        if (!JiTA.sched._acquireLease()) { return; }    // another tab is the syncer right now
+        JiTA.sync.autoSync();
     },
 
     start: function () {
-        if (EJF_SD.sched._timer) { return; }
+        if (JiTA.sched._timer) { return; }
         setTimeout(function () {
-            try { EJF_SD.sched.tick(); } catch (e) { /* swallow */ }
+            try { JiTA.sched.tick(); } catch (e) { /* swallow */ }
             // Poll every POLL_MS (≪ INTERVAL_MS). tick() itself only acts once recentlySynced() reports that
             // INTERVAL_MS has elapsed, so this reliably fires ~every 30 min instead of skipping windows.
-            EJF_SD.sched._timer = setInterval(function () {
-                try { EJF_SD.sched.tick(); } catch (e) { /* swallow */ }
-            }, EJF_SD.sched.POLL_MS);
-        }, EJF_SD.sched.STARTUP_DELAY_MS);
+            JiTA.sched._timer = setInterval(function () {
+                try { JiTA.sched.tick(); } catch (e) { /* swallow */ }
+            }, JiTA.sched.POLL_MS);
+        }, JiTA.sched.STARTUP_DELAY_MS);
     }
 };
 
 
 /* ---- init: watch the DOM and (re)inject the panel across Atlassian's React re-renders / SPA nav ---- */
 (function () {
-    if (EJF_IS_FORGE_FRAME) { return; }  // inside the Zendesk Forge iframe we only run the responses dropdown
+    if (JITA_IS_FORGE_FRAME) { return; }  // inside the Zendesk Forge iframe we only run the responses dropdown
     if (!window.indexedDB) { return; }   // feature unavailable in this environment
     var scheduled = false;
     var observer = new MutationObserver(function () {
@@ -7691,29 +7691,29 @@ EJF_SD.sched = {
         scheduled = true;
         setTimeout(function () {
             scheduled = false;
-            try { EJF_SD.ui.ensure(); } catch (e) { /* swallow */ }
-            try { EJF_SD.ui.updateVisibility(); } catch (e2) { /* swallow */ }   // hide while an attachment viewer is open
-            try { EJF_SD.logsig.updateVisibility(); } catch (e3) { /* swallow */ }   // drop the "Defects in log" panel once the log viewer closes
+            try { JiTA.ui.ensure(); } catch (e) { /* swallow */ }
+            try { JiTA.ui.updateVisibility(); } catch (e2) { /* swallow */ }   // hide while an attachment viewer is open
+            try { JiTA.logsig.updateVisibility(); } catch (e3) { /* swallow */ }   // drop the "Defects in log" panel once the log viewer closes
         }, 300);
     });
     observer.observe(document.body, { childList: true, subtree: true });
     // also try once on load in case the breadcrumb is already present
-    setTimeout(function () { try { EJF_SD.ui.ensure(); } catch (e) { /* swallow */ } }, 1500);
+    setTimeout(function () { try { JiTA.ui.ensure(); } catch (e) { /* swallow */ } }, 1500);
     // one-time data-schema migration: re-fetch a local DB that predates a stored-field change. Runs before
     // the scheduler's startup tick (below) so its full re-fetch grabs the single-flight lock first.
-    setTimeout(function () { try { EJF_SD.migrate.run(); } catch (e) { /* swallow */ } }, 4000);
+    setTimeout(function () { try { JiTA.migrate.run(); } catch (e) { /* swallow */ } }, 4000);
     // Keep the hidden set in sync across tabs: another tab hiding/unhiding an issue invalidates our cached map
     // and re-renders the open view so a just-hidden suggestion drops out (and an unhidden one comes back).
     if (typeof GM_addValueChangeListener === 'function') {
         try {
             GM_addValueChangeListener('sdHidden', function (name, oldV, newV, remote) {
-                EJF_SD.hidden._map = null;   // force a reload from storage on the next read
-                if (remote) { try { EJF_SD.ui._rerenderCurrent(); } catch (e) { /* ignore */ } }
+                JiTA.hidden._map = null;   // force a reload from storage on the next read
+                if (remote) { try { JiTA.ui._rerenderCurrent(); } catch (e) { /* ignore */ } }
             });
         } catch (e) { /* ignore */ }
     }
     // start the periodic background catch-up sync
-    EJF_SD.sched.start();
+    JiTA.sched.start();
 })();
 
 
@@ -7724,7 +7724,7 @@ EJF_SD.sched = {
 // cheap: inject() early-exits unless #ticket-select is present, so it's a no-op in frames without the panel.
 (function () {
     var scheduled = false;
-    function tick() { try { EJF_SD.responses.inject(); } catch (e) { /* ignore */ } }
+    function tick() { try { JiTA.responses.inject(); } catch (e) { /* ignore */ } }
     // Re-inject across the panel's React re-renders / lazy tab load / ticket switches. The Zendesk tab isn't
     // selected by default, so the panel mounts only once the user navigates to it - the observer catches that.
     var obs = new MutationObserver(function () {
@@ -7737,8 +7737,8 @@ EJF_SD.sched = {
     if (typeof GM_addValueChangeListener === 'function') {
         try {
             GM_addValueChangeListener('ejfCannedResponses', function () {
-                var sel = document.getElementById('ejf-resp-select');
-                if (sel) { sel.removeAttribute('data-ejf-sig'); EJF_SD.responses._fill(sel); }
+                var sel = document.getElementById('jita-resp-select');
+                if (sel) { sel.removeAttribute('data-jita-sig'); JiTA.responses._fill(sel); }
             });
         } catch (e) { /* ignore */ }
     }
