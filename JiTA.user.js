@@ -197,6 +197,12 @@ if (!JITA_IS_FORGE_FRAME) {
     GM_registerMenuCommand("⚙ Jira Triage Assistant - Settings…", function () {
         if (typeof JiTA !== 'undefined' && JiTA.menu) { JiTA.menu.open(); }
     });
+    // Phase 1a (dev): compute the current month's ISD credit table in-browser and dump it to the console so
+    // the numbers can be verified against monthly_report.py. The always-on panel + background refresh + the
+    // leads leaderboard come in later phases.
+    GM_registerMenuCommand("📊 Compute my ISD credits (this month)", function () {
+        if (typeof JiTA !== 'undefined' && JiTA.credits) { JiTA.credits.runManual(); }
+    });
 }
 
 
@@ -7677,6 +7683,568 @@ JiTA.sched = {
                 try { JiTA.sched.tick(); } catch (e) { /* swallow */ }
             }, JiTA.sched.POLL_MS);
         }, JiTA.sched.STARTUP_DELAY_MS);
+    }
+};
+
+
+/* ---- ISD monthly credit tracker: live current-month credit calc (+ leaderboard, later phases) ----
+ * Ports scratchpad/monthly_report.py to run IN-BROWSER against the logged-in ISD's Jira SESSION (read-only,
+ * no API token). Same credit formula and attribution rules, so the live number matches the authoritative
+ * month-end Python run. The computed per-member table is cached in the meta store (key credits:<YYYY-MM>);
+ * past months are computed once (they don't change) and the current month is refreshed on demand / by a
+ * throttled background job (added in a later phase).
+ *
+ * PARITY: keep this in lockstep with monthly_report.py. Mirrored here: the credit formula, projects
+ * (EO/PLAT/EDR) + resolutions (Fixed/Done/Released), clone dedup via the "Cloners" link (union-find),
+ * reopen-aware Attached/Trashed attribution, automation-account re-credit (a BR converted to a defect sets
+ * -> Attached as the automation app account; credit the assignee who triggered it), Team -> GM reassignment
+ * changelog crawl (date-gated), old-account (<handle>@ccpgames.com) bridging, and the hardcoded leads bonus.
+ * Change one, change both.
+ */
+JiTA.credits = {
+    // ---- config (mirror monthly_report.py) ----
+    PROJECTS: 'EO, PLAT, EDR',
+    RESOLUTIONS: 'Fixed, Done, Released',
+    GROUP: 'Contractors ISD ECAID',
+    OLD_DOMAIN: 'ccpgames.com',
+    EBR: 'EBR',
+    ATTACHED_STATUS: 'Attached',
+    CLOSED_STATUS: 'Closed',
+    TEAM_JQL: 'Team[Team]',
+    TEAM_CF: 'customfield_10001',
+    GM_TEAM_ID: '38',                                              // short id (button / JQL)
+    GM_TEAM_FULL_ID: 'ef4edd53-c099-4431-82af-9b4bd717cb88-38',   // full id (changelog `to`)
+    GM_TEAM_NAME: 'EO - GameMasters',                             // changelog `toString`
+    AUTOMATION_ID: '557058:f58131cb-b67d-43c7-b30d-6b58d40bd077', // "Automation for Jira" app account
+    AUTOMATION_EMAIL: 'workato@ccpgames.com',
+    DEDUP_LINK_TYPES: { 'Cloners': true },
+    PROJECT_RANK: { EO: 0, PLAT: 1, EDR: 2 },
+    LEADS: { schogol: true, solnichka: true, lookuptable: true }, // handle token in display name -> lead bonus
+    LEAD_BONUS: 20,
+
+    PAGE_SIZE: 100,
+    CRAWL_DELAY_MS: 120,   // polite gap between per-issue changelog GETs (the crawl is the expensive part)
+
+    running: false,
+
+    // ---- progress (page-independent floating pill + console; shows with or without the Similar Defects panel) --
+    // A multi-minute crawl needs live feedback. _pill updates a fixed-position status pill (and the panel line
+    // when it exists); _log additionally breadcrumbs to the console. Use _pill for every-item ticks (smooth,
+    // no console spam) and _log for phase changes / interval milestones.
+    _pill: function (msg) {
+        try {
+            var el = document.getElementById('jita-credits-progress');
+            if (!el) {
+                el = document.createElement('div');
+                el.id = 'jita-credits-progress';
+                el.style.cssText = 'position:fixed;z-index:2147483647;right:16px;bottom:16px;max-width:360px;' +
+                    'background:#1a1c1f;color:#e8e8ea;border:1px solid #34373d;border-radius:8px;padding:9px 13px;' +
+                    'font:12px/1.45 "Segoe UI",Roboto,Arial,sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.45);' +
+                    'white-space:pre-line;pointer-events:none;';
+                (document.body || document.documentElement).appendChild(el);
+            }
+            el.textContent = '📊 ISD credits\n' + msg;
+        } catch (e) { /* ignore */ }
+        try { JiTA.ui.setStatus('Credits: ' + msg); } catch (e2) { /* ignore */ }   // also feed the panel line when present
+    },
+    _log: function (msg) { JiTA.credits._pill(msg); if (window.console) { console.log('[JiTA] credits: ' + msg); } },
+    _clearProgress: function () {
+        try { var el = document.getElementById('jita-credits-progress'); if (el && el.parentNode) { el.parentNode.removeChild(el); } } catch (e) { /* ignore */ }
+    },
+
+    // ---- REST (session-authenticated, read-only) --------------------------------------------------------
+    // GET with the session cookie; retries on 429 (honoring Retry-After) and transient 5xx.
+    _get: function (path) {
+        return new Promise(function (resolve, reject) {
+            (function attempt(retries) {
+                $.ajax({ url: JiTA.HOST + path, type: 'GET', dataType: 'json' })
+                    .done(function (data) { resolve(data); })
+                    .fail(function (xhr) {
+                        if ((xhr.status === 429 || xhr.status >= 500) && retries > 0) {
+                            var ra = parseInt(xhr.getResponseHeader('Retry-After'), 10);
+                            setTimeout(function () { attempt(retries - 1); }, (isNaN(ra) ? 3 : ra) * 1000);
+                        } else {
+                            reject(new Error('GET ' + path + ' -> HTTP ' + xhr.status));
+                        }
+                    });
+            })(JiTA.MAX_RETRIES);
+        });
+    },
+
+    // One page of /search/jql (reuses the sync engine's POST helper: session auth + 429 retry).
+    _searchPage: function (jql, fields, token) {
+        var body = { jql: jql, fields: fields, maxResults: JiTA.credits.PAGE_SIZE };
+        if (token) { body.nextPageToken = token; }
+        return JiTA.sync._apiPost('/rest/api/3/search/jql', body).then(function (r) { return r.data || {}; });
+    },
+
+    // All matching issues (full field objects), paginated.
+    _fetchIssues: function (jql, fields) {
+        var out = [];
+        function page(token) {
+            return JiTA.credits._searchPage(jql, fields, token).then(function (d) {
+                out = out.concat(d.issues || []);
+                var next = d.nextPageToken || null;
+                if (!next || d.isLast) { return out; }
+                return JiTA.util.delay(JiTA.PAGE_DELAY_MS).then(function () { return page(next); });
+            });
+        }
+        return page(null);
+    },
+
+    // Just the keys matching jql, as a { key: true } set.
+    _allKeys: function (jql) {
+        return JiTA.credits._fetchIssues(jql, ['key']).then(function (issues) {
+            var keys = {};
+            for (var i = 0; i < issues.length; i++) { keys[issues[i].key] = true; }
+            return keys;
+        });
+    },
+
+    // Full changelog for an issue (dedicated paginated endpoint, so no 100-entry truncation), oldest-first.
+    _allHistories: function (key) {
+        var out = [];
+        function page(start) {
+            return JiTA.credits._get('/rest/api/3/issue/' + key + '/changelog?startAt=' + start + '&maxResults=100').then(function (res) {
+                var vals = res.values || [];
+                out = out.concat(vals);
+                if (start + vals.length >= (res.total || 0) || !vals.length) {
+                    out.sort(function (a, b) { return (a.created || '') < (b.created || '') ? -1 : 1; });
+                    return out;
+                }
+                return page(start + vals.length);
+            });
+        }
+        return page(0);
+    },
+
+    // Run fn(item, i) over items ONE AT A TIME (polite to rate limits), resolving to the array of results.
+    _serial: function (items, fn) {
+        var out = [];
+        return items.reduce(function (p, item, i) {
+            return p.then(function () { return fn(item, i); }).then(function (r) { out.push(r); });
+        }, Promise.resolve()).then(function () { return out; });
+    },
+
+    _accList: function (accounts) {
+        return accounts.map(function (a) { return '"' + a + '"'; }).join(', ');
+    },
+
+    // ---- member resolution (group members + pre-migration <handle>@ccpgames.com accounts) ----------------
+    _groupMembers: function (group) {
+        group = group || JiTA.credits.GROUP;
+        var out = [];
+        function page(param, start) {
+            return JiTA.credits._get('/rest/api/3/group/member?' + param +
+                '&includeInactiveUsers=true&startAt=' + start + '&maxResults=50').then(function (res) {
+                var vals = res.values || [];
+                out = out.concat(vals);
+                if (res.isLast || !vals.length) { return out; }
+                return page(param, start + vals.length);
+            });
+        }
+        // Prefer groupname; fall back to groupId (some instances reject groupname on /group/member).
+        return page('groupname=' + encodeURIComponent(group), 0).catch(function () {
+            return JiTA.credits._get('/rest/api/3/groups/picker?query=' + encodeURIComponent(group)).then(function (res) {
+                var gid = null, gs = (res && res.groups) || [];
+                for (var i = 0; i < gs.length; i++) { if ((gs[i].name || '').toLowerCase() === group.toLowerCase()) { gid = gs[i].groupId; } }
+                if (!gid) { throw new Error('group not found: ' + group); }
+                out = [];
+                return page('groupId=' + encodeURIComponent(gid), 0);
+            });
+        });
+    },
+
+    // Candidate login handles for a member, most reliable first (email local-part, then display name variants).
+    _handles: function (member) {
+        var out = [], seen = {};
+        var email = member.emailAddress || '';
+        if (email.indexOf('@') > 0) { out.push(email.split('@')[0]); }
+        var dn = (member.displayName || '').replace(/^\s+|\s+$/g, '');
+        var norm = /^isd /i.test(dn) ? dn.slice(4) : dn;
+        out.push(norm.replace(/ /g, '').toLowerCase());
+        out.push(norm.split(' ')[0].toLowerCase());
+        var uniq = [];
+        for (var i = 0; i < out.length; i++) { var h = out[i]; if (h && !seen[h]) { seen[h] = true; uniq.push(h); } }
+        return uniq;
+    },
+
+    // accountId that `value` resolves to (read off one of its issues); '' if it resolves but has no issues,
+    // null if it doesn't resolve to a user at all.
+    _reporterAccount: function (value) {
+        return JiTA.credits._searchPage('reporter = "' + value + '"', ['reporter'], null).then(function (d) {
+            var issues = d.issues || [];
+            if (!issues.length) { return ''; }
+            return ((issues[0].fields || {}).reporter || {}).accountId || '';
+        }, function () { return null; });
+    },
+
+    // For each member, find & verify their <handle>@OLD_DOMAIN account. Returns { oldIds: {id:true},
+    // oldNames: {oldAccountId: currentMemberName} }.
+    _resolveOldReporters: function (members) {
+        var claimed = {}, oldIds = {}, oldNames = {};
+        return JiTA.credits._serial(members, function (m, i) {
+            JiTA.credits._pill('resolving members: ' + (i + 1) + '/' + members.length);
+            var dn = m.displayName || m.accountId;
+            var cands = JiTA.credits._handles(m).map(function (h) { return h + '@' + JiTA.credits.OLD_DOMAIN; });
+            return JiTA.credits._serial(cands, function (cand) {
+                if (claimed[cand]) { return null; }
+                return JiTA.credits._reporterAccount(cand).then(function (aid) {
+                    return aid === null ? null : { cand: cand, aid: aid };
+                });
+            }).then(function (results) {
+                for (var i = 0; i < results.length; i++) {
+                    var hit = results[i];
+                    if (hit) {
+                        claimed[hit.cand] = true;
+                        if (hit.aid) { oldIds[hit.aid] = true; oldNames[hit.aid] = dn; }
+                        break;   // first resolving handle wins for this member
+                    }
+                }
+            });
+        }).then(function () { return { oldIds: oldIds, oldNames: oldNames }; });
+    },
+
+    // ---- month + formula --------------------------------------------------------------------------------
+    _monthBounds: function (y, m) {
+        var ny = m === 12 ? y + 1 : y, nm = m === 12 ? 1 : m + 1;
+        var p2 = function (n) { return (n < 10 ? '0' : '') + n; };
+        return { start: y + '-' + p2(m) + '-01', end: ny + '-' + p2(nm) + '-01' };
+    },
+
+    _creditFormula: function (r, extra) {
+        var filtered = r.attached + r.trashed;
+        var c = 0.3 * Math.min(100, filtered) + 0.1 * Math.max(0, filtered - 100);
+        c += 0.1 * r.reassigned + r.created + r.resolved + (extra || 0);
+        return Math.round(c * 10) / 10;
+    },
+
+    // ---- defects (created + resolved, clone-deduped) ----------------------------------------------------
+    _defectsCreated: function (accounts, b, acctToName, rows) {
+        var jql = 'project in (' + JiTA.credits.PROJECTS + ') AND issuetype = Defect ' +
+            'AND reporter in (' + JiTA.credits._accList(accounts) + ') ' +
+            'AND created >= "' + b.start + '" AND created < "' + b.end + '" ' +
+            'AND (resolution is EMPTY OR resolution != Duplicate)';
+        return JiTA.credits._fetchIssues(jql, ['reporter', 'project']).then(function (issues) {
+            for (var i = 0; i < issues.length; i++) {
+                var name = acctToName[((issues[i].fields || {}).reporter || {}).accountId];
+                if (name) { rows[name].created++; }
+            }
+        });
+    },
+
+    _defectsResolved: function (accounts, b, acctToName, rows) {
+        var jql = 'project in (' + JiTA.credits.PROJECTS + ') AND issuetype = Defect ' +
+            'AND reporter in (' + JiTA.credits._accList(accounts) + ') ' +
+            'AND resolution in (' + JiTA.credits.RESOLUTIONS + ') ' +
+            'AND resolved >= "' + b.start + '" AND resolved < "' + b.end + '"';
+        return JiTA.credits._fetchIssues(jql, ['reporter', 'project', 'issuelinks']).then(function (issues) {
+            var present = {}, meta = {};
+            for (var i = 0; i < issues.length; i++) { present[issues[i].key] = true; meta[issues[i].key] = issues[i]; }
+            // union-find over Cloners links so a cloned pair counts as ONE real defect (chains too).
+            var parent = {};
+            function find(x) { if (parent[x] === undefined) { parent[x] = x; } while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; }
+            function union(a, c) { var ra = find(a), rb = find(c); if (ra !== rb) { parent[ra] = rb; } }
+            for (var k in present) { if (present.hasOwnProperty(k)) { find(k); } }
+            for (var j = 0; j < issues.length; j++) {
+                var links = (issues[j].fields || {}).issuelinks || [];
+                for (var l = 0; l < links.length; l++) {
+                    if (!JiTA.credits.DEDUP_LINK_TYPES[(links[l].type || {}).name]) { continue; }
+                    var other = links[l].inwardIssue || links[l].outwardIssue;
+                    if (other && present[other.key]) { union(issues[j].key, other.key); }
+                }
+            }
+            function rank(key) {
+                var pk = (meta[key].fields.project || {}).key;
+                var pr = JiTA.credits.PROJECT_RANK[pk]; return (pr === undefined ? 99 : pr);
+            }
+            var comps = {};
+            for (var kk in present) { if (present.hasOwnProperty(kk)) { var root = find(kk); (comps[root] = comps[root] || []).push(kk); } }
+            for (var root2 in comps) {
+                if (!comps.hasOwnProperty(root2)) { continue; }
+                var keep = comps[root2][0];
+                for (var q = 1; q < comps[root2].length; q++) {
+                    var cand = comps[root2][q];
+                    if (rank(cand) < rank(keep) || (rank(cand) === rank(keep) && cand < keep)) { keep = cand; }
+                }
+                var name = acctToName[((meta[keep].fields || {}).reporter || {}).accountId];
+                if (name) { rows[name].resolved++; }
+            }
+        });
+    },
+
+    // ---- reports Attached / Trashed (reopen-aware, automation re-credited) ------------------------------
+    _isAutomation: function (author) {
+        if (!author) { return false; }
+        if (JiTA.credits.AUTOMATION_ID && author.accountId === JiTA.credits.AUTOMATION_ID) { return true; }
+        if ((author.emailAddress || '').toLowerCase() === JiTA.credits.AUTOMATION_EMAIL.toLowerCase()) { return true; }
+        return (author.displayName || '').toLowerCase().indexOf('automation for jira') !== -1;
+    },
+
+    _assigneeAt: function (histories, ts) {
+        var who = null;
+        for (var i = 0; i < histories.length; i++) {           // oldest-first
+            if ((histories[i].created || '') > ts) { break; }
+            var items = histories[i].items || [];
+            for (var j = 0; j < items.length; j++) { if (items[j].field === 'assignee') { who = items[j].to; } }
+        }
+        return who;
+    },
+
+    // accountId to credit for a report currently in target_status: author of the last (still-in-effect)
+    // transition into it, if in-month; automation transitions are re-credited to the assignee at that moment.
+    _effectiveActioner: function (histories, targetStatus, b) {
+        var last = null;
+        for (var i = 0; i < histories.length; i++) {
+            var items = histories[i].items || [];
+            for (var j = 0; j < items.length; j++) {
+                if (items[j].field !== 'status') { continue; }
+                last = items[j].toString === targetStatus ? histories[i] : null;   // else = undone by a later change
+            }
+        }
+        if (!last) { return null; }
+        var created = last.created || '';
+        if (!(b.start <= created.slice(0, 10) && created.slice(0, 10) < b.end)) { return null; }
+        var author = last.author || {};
+        return JiTA.credits._isAutomation(author) ? JiTA.credits._assigneeAt(histories, created) : author.accountId;
+    },
+
+    _reportsActioned: function (memberAccounts, b, rows, acctToName) {
+        var C = JiTA.credits, names = Object.keys(memberAccounts).sort();
+        var win = 'DURING ("' + b.start + '", "' + b.end + '")';
+        var movedOut = {};
+        // Reports that left Attached/Closed this month need their effective actioner resolved from the
+        // changelog (a close-then-reopen must not credit the reopener); the rest are direct BY-author counts.
+        return C._allKeys('project = ' + C.EBR + ' AND status CHANGED FROM "' + C.ATTACHED_STATUS + '" ' + win).then(function (a) {
+            return C._allKeys('project = ' + C.EBR + ' AND status CHANGED FROM "' + C.CLOSED_STATUS + '" ' + win).then(function (c) {
+                var k; for (k in a) { if (a.hasOwnProperty(k)) { movedOut[k] = true; } }
+                for (k in c) { if (c.hasOwnProperty(k)) { movedOut[k] = true; } }
+            });
+        }).then(function () {
+            return C._serial(names, function (name, i) {
+                C._pill('reports: member ' + (i + 1) + '/' + names.length + '  (' + name + ')');
+                if (i % 20 === 0 && window.console) { console.log('[JiTA] credits: reports ' + (i + 1) + '/' + names.length); }
+                var accs = memberAccounts[name];
+                var att = {}, clo = {};
+                var queries = [];
+                for (var i = 0; i < accs.length; i++) {
+                    queries.push({ tgt: att, jql: 'project = ' + C.EBR + ' AND status CHANGED TO "' + C.ATTACHED_STATUS + '" BY "' + accs[i] + '" ' + win });
+                    queries.push({ tgt: clo, jql: 'project = ' + C.EBR + ' AND status CHANGED TO "' + C.CLOSED_STATUS + '" BY "' + accs[i] + '" ' + win });
+                }
+                if (C.AUTOMATION_ID) {   // automation did the transition, but this member (assignee) triggered it
+                    var who = 'assignee in (' + C._accList(accs) + ')';
+                    queries.push({ tgt: att, jql: 'project = ' + C.EBR + ' AND status CHANGED TO "' + C.ATTACHED_STATUS + '" BY "' + C.AUTOMATION_ID + '" ' + win + ' AND ' + who });
+                    queries.push({ tgt: clo, jql: 'project = ' + C.EBR + ' AND status CHANGED TO "' + C.CLOSED_STATUS + '" BY "' + C.AUTOMATION_ID + '" ' + win + ' AND ' + who });
+                }
+                return C._serial(queries, function (q) {
+                    return C._allKeys(q.jql).then(function (keys) { for (var kk in keys) { if (keys.hasOwnProperty(kk)) { q.tgt[kk] = true; } } });
+                }).then(function () {
+                    var a = 0, cc = 0;
+                    for (var kA in att) { if (att.hasOwnProperty(kA) && !movedOut[kA]) { a++; } }
+                    for (var kC in clo) { if (clo.hasOwnProperty(kC) && !movedOut[kC]) { cc++; } }
+                    rows[name].attached += a;
+                    rows[name].trashed += cc;
+                });
+            });
+        }).then(function () {
+            // Ambiguous (moved-out) reports: credit whoever's Attached/Closed transition is now in effect.
+            var movedKeys = Object.keys(movedOut);
+            if (movedKeys.length) { C._log('resolving ' + movedKeys.length + ' moved-out report(s) via changelog…'); }
+            return C._serial(movedKeys, function (k, i) {
+                C._pill('moved-out reports: ' + (i + 1) + '/' + movedKeys.length);
+                if (i % 50 === 0 && window.console) { console.log('[JiTA] credits: moved-out ' + (i + 1) + '/' + movedKeys.length); }
+                return JiTA.util.delay(C.CRAWL_DELAY_MS).then(function () { return C._allHistories(k); }).then(function (hist) {
+                    var an = acctToName[C._effectiveActioner(hist, C.ATTACHED_STATUS, b)];
+                    var cn = acctToName[C._effectiveActioner(hist, C.CLOSED_STATUS, b)];
+                    if (an) { rows[an].attached += 1; }
+                    if (cn) { rows[cn].trashed += 1; }
+                });
+            });
+        });
+    },
+
+    // ---- reports Reassigned to GM (Team -> GM changelog crawl, date-gated) -------------------------------
+    _autoReassigned: function (b, acctToName, rows) {
+        var C = JiTA.credits;
+        var jql = 'project = ' + C.EBR + ' AND ' + C.TEAM_JQL + ' = ' + C.GM_TEAM_ID + ' AND updated >= "' + b.start + '"';
+        return C._allKeys(jql).then(function (keySet) {
+            var keys = Object.keys(keySet);
+            C._log('reassign: crawling ' + keys.length + ' candidate report(s)…');
+            return C._serial(keys, function (k, i) {
+                C._pill('reassign: ' + (i + 1) + '/' + keys.length);
+                if (i % 50 === 0 && window.console) { console.log('[JiTA] credits: reassign ' + (i + 1) + '/' + keys.length); }
+                return JiTA.util.delay(C.CRAWL_DELAY_MS).then(function () {
+                    return C._get('/rest/api/3/issue/' + k + '?expand=changelog&fields=summary');
+                }).then(function (issue) {
+                    var credited = {};
+                    var hist = ((issue.changelog || {}).histories) || [];
+                    for (var i = 0; i < hist.length; i++) {
+                        var created = (hist[i].created || '').slice(0, 10);
+                        if (!(b.start <= created && created < b.end)) { continue; }   // in-month change only
+                        var items = hist[i].items || [];
+                        for (var j = 0; j < items.length; j++) {
+                            var it = items[j];
+                            var isTeam = it.fieldId === C.TEAM_CF || it.field === 'Team';
+                            var isGm = it.to === C.GM_TEAM_ID || it.to === C.GM_TEAM_FULL_ID || it.toString === C.GM_TEAM_NAME;
+                            if (isTeam && isGm) {
+                                var author = (hist[i].author || {}).accountId;
+                                if (author && !credited[author]) {
+                                    credited[author] = true;
+                                    var name = acctToName[author];
+                                    if (name) { rows[name].reassigned += 1; }
+                                }
+                            }
+                        }
+                    }
+                });
+            });
+        }).catch(function (e) {
+            // Team-field JQL can fail (permissions / field ref); leave Reassigned at 0 rather than aborting.
+            if (window.console) { console.log('[JiTA] reassigned crawl skipped:', e && e.message || e); }
+        });
+    },
+
+    // ---- extra credits (lead bonus + optional mentor overrides) -----------------------------------------
+    _computeExtra: function (names, mentor) {
+        var out = {};
+        for (var i = 0; i < names.length; i++) {
+            var n = names[i];
+            var toks = {}; n.toLowerCase().replace(/-/g, ' ').split(/\s+/).forEach(function (t) { if (t) { toks[t] = true; } });
+            var e = 0;
+            for (var lead in JiTA.credits.LEADS) { if (JiTA.credits.LEADS.hasOwnProperty(lead) && toks[lead]) { e += JiTA.credits.LEAD_BONUS; } }
+            if (mentor) { for (var h in mentor) { if (mentor.hasOwnProperty(h) && toks[h]) { e += mentor[h]; } } }
+            if (e) { out[n] = e; }
+        }
+        return out;
+    },
+
+    // ---- orchestration ----------------------------------------------------------------------------------
+    // Compute the full per-member credit table for month (y, m). Resolves { ym, computedAt, header, table,
+    // rows, nameToAcc }. `table` rows are arrays aligned to `header` (last row is the Total).
+    computeMonth: function (y, m, mentor) {
+        var C = JiTA.credits, b = C._monthBounds(y, m);
+        var ym = b.start.slice(0, 7);
+        C._log(ym + ': resolving group members…');
+        return C._groupMembers().then(function (members) {
+            var active = members.filter(function (x) { return x.active !== false; });
+            return C._resolveOldReporters(active).then(function (old) {
+                var acctToName = {}, memberAccounts = {}, nameToAcc = {};
+                active.forEach(function (x) {
+                    acctToName[x.accountId] = x.displayName;
+                    (memberAccounts[x.displayName] = memberAccounts[x.displayName] || []).push(x.accountId);
+                    if (!nameToAcc[x.displayName]) { nameToAcc[x.displayName] = x.accountId; }
+                });
+                for (var oid in old.oldNames) {
+                    if (!old.oldNames.hasOwnProperty(oid)) { continue; }
+                    var nm = old.oldNames[oid];
+                    acctToName[oid] = nm;
+                    (memberAccounts[nm] = memberAccounts[nm] || []).push(oid);
+                }
+                var names = Object.keys(memberAccounts).sort();
+                var rows = {};
+                names.forEach(function (n) { rows[n] = { created: 0, resolved: 0, attached: 0, trashed: 0, reassigned: 0 }; });
+                var allAccounts = Object.keys(acctToName);
+
+                C._log(ym + ': ' + names.length + ' members - fetching defects…');
+                return C._defectsCreated(allAccounts, b, acctToName, rows)
+                    .then(function () { return C._defectsResolved(allAccounts, b, acctToName, rows); })
+                    .then(function () { C._log(ym + ': reports (attached / trashed)…'); return C._reportsActioned(memberAccounts, b, rows, acctToName); })
+                    .then(function () { C._log(ym + ': reassignments to GM…'); return C._autoReassigned(b, acctToName, rows); })
+                    .then(function () {
+                        var extras = C._computeExtra(names, mentor);
+                        var header = ['Name', 'Defects Created', 'Defects Resolved', 'Reports Attached',
+                            'Reports Trashed', 'Reports Reassigned', 'Total Actioned', 'Extra Credits', 'Credits Earned'];
+                        var table = [];
+                        var tot = { created: 0, resolved: 0, attached: 0, trashed: 0, reassigned: 0, actioned: 0, extra: 0, credits: 0 };
+                        names.forEach(function (n) {
+                            var r = rows[n], extra = extras[n] || 0;
+                            var actioned = r.attached + r.trashed + r.reassigned + r.created;
+                            var earned = C._creditFormula(r, extra);
+                            table.push([n, r.created, r.resolved, r.attached, r.trashed, r.reassigned, actioned, extra, earned]);
+                            tot.created += r.created; tot.resolved += r.resolved; tot.attached += r.attached;
+                            tot.trashed += r.trashed; tot.reassigned += r.reassigned; tot.actioned += actioned;
+                            tot.extra += extra; tot.credits += earned;
+                        });
+                        table.push(['Total', tot.created, tot.resolved, tot.attached, tot.trashed, tot.reassigned,
+                            tot.actioned, Math.round(tot.extra * 10) / 10, Math.round(tot.credits * 10) / 10]);
+                        return { ym: ym, computedAt: new Date().toISOString(), header: header, table: table, rows: rows, nameToAcc: nameToAcc };
+                    });
+            });
+        });
+    },
+
+    // ---- cache (meta store: credits:<YYYY-MM>) ----------------------------------------------------------
+    _cacheKey: function (ym) { return 'credits:' + ym; },
+    getCached: function (ym) { return JiTA.db.getMeta(JiTA.credits._cacheKey(ym)); },
+    putCached: function (result) { return JiTA.db.setMeta(JiTA.credits._cacheKey(result.ym), result); },
+
+    _ymNow: function () {
+        var d = new Date(), p2 = function (n) { return (n < 10 ? '0' : '') + n; };
+        return { y: d.getFullYear(), m: d.getMonth() + 1, ym: d.getFullYear() + '-' + p2(d.getMonth() + 1) };
+    },
+
+    // Compute a month + cache it. Guarded so two calls don't overlap. Resolves the result object.
+    refresh: function (y, m, mentor) {
+        if (JiTA.credits.running) { JiTA.ui.toast('A credit computation is already running…'); return Promise.resolve(null); }
+        JiTA.credits.running = true;
+        var t0 = Date.now();
+        return JiTA.credits.computeMonth(y, m, mentor).then(function (res) {
+            return JiTA.credits.putCached(res).then(function () {
+                JiTA.credits.running = false;
+                JiTA.credits._clearProgress();
+                JiTA.ui.setStatus('Credits ' + res.ym + ' ready (' + Math.round((Date.now() - t0) / 1000) + 's)');
+                return res;
+            });
+        }).catch(function (e) {
+            JiTA.credits.running = false;
+            JiTA.credits._clearProgress();
+            JiTA.ui.setStatus('Credits error: ' + (e && e.message || e));
+            throw e;
+        });
+    },
+
+    // ---- Phase 1a: manual trigger + console dump (verify against monthly_report.py) ---------------------
+    // Pretty-print the table to the console and return the current user's row + rank.
+    _report: function (res) {
+        var header = res.header, table = res.table;
+        // fixed-width console dump
+        var widths = header.map(function (h, i) {
+            return Math.max.apply(null, [String(h).length].concat(table.map(function (r) { return String(r[i]).length; })));
+        });
+        function line(row) {
+            return row.map(function (c, i) { var s = String(c); return i === 0 ? s + Array(widths[i] - s.length + 1).join(' ') : Array(widths[i] - s.length + 1).join(' ') + s; }).join('  ');
+        }
+        if (window.console) {
+            console.log('[JiTA] ISD credits ' + res.ym + ' (computed ' + res.computedAt + ')');
+            console.log(line(header));
+            table.forEach(function (r) { console.log(line(r)); });
+        }
+        return JiTA.link.currentUser().then(function (me) {
+            var myName = null;
+            for (var name in res.nameToAcc) { if (res.nameToAcc.hasOwnProperty(name) && res.nameToAcc[name] === me) { myName = name; } }
+            // rank among real members (exclude the Total row) by Credits Earned desc
+            var real = table.slice(0, -1).slice().sort(function (a, b) { return b[8] - a[8]; });
+            var myRow = null, myRank = null;
+            for (var i = 0; i < real.length; i++) { if (real[i][0] === myName) { myRow = real[i]; myRank = i + 1; } }
+            return { myName: myName, myRow: myRow, myRank: myRank, total: real.length };
+        });
+    },
+
+    runManual: function () {
+        var now = JiTA.credits._ymNow();
+        JiTA.ui.toast('Computing ISD credits for ' + now.ym + '… (see console; this can take a while)');
+        JiTA.credits.refresh(now.y, now.m).then(function (res) {
+            if (!res) { return; }
+            return JiTA.credits._report(res).then(function (mine) {
+                if (mine.myRow) {
+                    JiTA.ui.toast('Your credits ' + now.ym + ': ' + mine.myRow[8] + ' (rank ' + mine.myRank + '/' + mine.total + '). Full table in console.');
+                } else {
+                    JiTA.ui.toast('Credits ' + now.ym + ' computed (' + mine.total + ' members). Full table in console. (Your account was not matched to a member.)');
+                }
+            });
+        }).catch(function (e) {
+            alert('Credit computation failed: ' + (e && e.message || e) + '\nReport issues to Schogol :).');
+        });
     }
 };
 
