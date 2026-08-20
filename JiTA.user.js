@@ -8471,15 +8471,13 @@ JiTA.credits = {
             var $tbl = $('<table style="border-collapse:collapse;font-size:12px;width:100%;"></table>');
             var $thead = $('<thead></thead>');
             // grouping row: the underline spans the FULL group (Created+Resolved / Attached+Trashed+Reassigned),
-            // inset a little so the two groups' underlines don't merge into one line. The caption sits over the
-            // group's FIRST column (Created / Attached), right-aligned to line up with that column's header below.
+            // inset on the left so the two groups' underlines don't merge. The caption sits over the group's LAST
+            // column (Resolved / Reassigned), right-aligned (padding-right 8px) to line up with that column's header.
             function grpCell(cols, label) {
                 var $th = $('<th colspan="' + cols + '" style="padding:0;"></th>');
-                var $u = $('<div style="margin:0 12px;padding-bottom:4px;border-bottom:1px solid #4a5560;"></div>');
-                $('<div></div>').attr('style', 'width:' + (100 / cols) + '%;box-sizing:border-box;text-align:right;padding-right:8px;' +
+                $('<div></div>').attr('style', 'margin-left:24px;padding:0 8px 4px 0;border-bottom:1px solid #4a5560;text-align:right;' +
                     'color:#8a94a0;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;white-space:nowrap;')
-                    .text(label).appendTo($u);
-                $u.appendTo($th);
+                    .text(label).appendTo($th);
                 return $th;
             }
             var $g = $('<tr></tr>');
