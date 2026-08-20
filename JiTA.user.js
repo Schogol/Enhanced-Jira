@@ -8470,21 +8470,23 @@ JiTA.credits = {
             var $wrap = $('<div style="overflow-x:auto;"></div>');
             var $tbl = $('<table style="border-collapse:collapse;font-size:12px;width:100%;"></table>');
             var $thead = $('<thead></thead>');
-            // grouping row: DEFECTS sits over its FIRST column (Created), BUG REPORTS over its first (Attached),
-            // each RIGHT-aligned so the caption + its own-width underline line up with the right-bound column header
-            // below it. One cell per column keeps each caption anchored to a specific column, so the two underlines
-            // stay separate instead of merging into one line.
-            var groupLabels = ['', '', 'Defects', '', 'Bug reports', '', '', '', ''];   // #, Name, Created, Resolved, Attached, Trashed, Reassigned, Actioned, Credits
+            // grouping row: the underline spans the FULL group (Created+Resolved / Attached+Trashed+Reassigned),
+            // inset a little so the two groups' underlines don't merge into one line. The caption sits over the
+            // group's FIRST column (Created / Attached), right-aligned to line up with that column's header below.
+            function grpCell(cols, label) {
+                var $th = $('<th colspan="' + cols + '" style="padding:0;"></th>');
+                var $u = $('<div style="margin:0 12px;padding-bottom:4px;border-bottom:1px solid #4a5560;"></div>');
+                $('<div></div>').attr('style', 'width:' + (100 / cols) + '%;box-sizing:border-box;text-align:right;padding-right:8px;' +
+                    'color:#8a94a0;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;white-space:nowrap;')
+                    .text(label).appendTo($u);
+                $u.appendTo($th);
+                return $th;
+            }
             var $g = $('<tr></tr>');
-            groupLabels.forEach(function (label) {
-                var $th = $('<th style="padding:2px 8px 0;text-align:right;"></th>');
-                if (label) {
-                    $('<span></span>').attr('style', 'display:inline-block;padding-bottom:4px;border-bottom:1px solid #4a5560;' +
-                        'color:#8a94a0;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;white-space:nowrap;')
-                        .text(label).appendTo($th);
-                }
-                $th.appendTo($g);
-            });
+            $('<th colspan="2"></th>').appendTo($g);   // # + Name
+            grpCell(2, 'Defects').appendTo($g);        // Created + Resolved
+            grpCell(3, 'Bug reports').appendTo($g);    // Attached + Trashed + Reassigned
+            $('<th colspan="2"></th>').appendTo($g);   // Actioned + Credits
             $thead.append($g);
             // label row
             var $hr = $('<tr></tr>');
