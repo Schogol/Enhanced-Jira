@@ -8470,31 +8470,29 @@ JiTA.credits = {
             var $wrap = $('<div style="overflow-x:auto;"></div>');
             var $tbl = $('<table style="border-collapse:collapse;font-size:12px;width:100%;"></table>');
             var $thead = $('<thead></thead>');
-            // grouping row: DEFECTS (Created/Resolved) vs BUG REPORTS (Attached/Trashed/Reassigned). The caption +
-            // its underline live in an INSET div, so each group's underline is separated by a gap (adjacent <th>
-            // bottom-borders would otherwise merge into one long line) and the label is centred over its columns.
+            // grouping row: DEFECTS sits over its FIRST column (Created), BUG REPORTS over its first (Attached),
+            // each RIGHT-aligned so the caption + its own-width underline line up with the right-bound column header
+            // below it. One cell per column keeps each caption anchored to a specific column, so the two underlines
+            // stay separate instead of merging into one line.
+            var groupLabels = ['', '', 'Defects', '', 'Bug reports', '', '', '', ''];   // #, Name, Created, Resolved, Attached, Trashed, Reassigned, Actioned, Credits
             var $g = $('<tr></tr>');
-            function grpCell(colspan, label) {
-                var $th = $('<th colspan="' + colspan + '"></th>');
+            groupLabels.forEach(function (label) {
+                var $th = $('<th style="padding:2px 8px 0;text-align:right;"></th>');
                 if (label) {
-                    $('<div></div>').attr('style', 'margin:0 16px;padding-bottom:4px;border-bottom:1px solid #4a5560;' +
-                        'text-align:center;color:#8a94a0;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;')
+                    $('<span></span>').attr('style', 'display:inline-block;padding-bottom:4px;border-bottom:1px solid #4a5560;' +
+                        'color:#8a94a0;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;white-space:nowrap;')
                         .text(label).appendTo($th);
                 }
-                return $th;
-            }
-            $g.append(grpCell(2, ''));             // # + Name
-            $g.append(grpCell(2, 'Defects'));      // Created + Resolved
-            $g.append(grpCell(3, 'Bug reports'));  // Attached + Trashed + Reassigned
-            $g.append(grpCell(2, ''));             // Actioned + Credits
+                $th.appendTo($g);
+            });
             $thead.append($g);
             // label row
             var $hr = $('<tr></tr>');
             $('<th style="text-align:left;padding:5px 8px;border-bottom:1px solid #3a434d;color:#9aa6b2;">#</th>').appendTo($hr);
             short.forEach(function (c, i) {
                 if (i === 7) { return; }   // Extra Credits column removed (the bonus is still baked into Credits)
-                // numeric columns centred (so they line up under the centred group captions); Name stays left
-                $('<th></th>').attr('style', 'padding:5px 8px;border-bottom:1px solid #3a434d;color:#9aa6b2;white-space:nowrap;text-align:' + (i === 0 ? 'left' : 'center') + ';').text(c).appendTo($hr);
+                // numeric columns right-aligned; Name stays left
+                $('<th></th>').attr('style', 'padding:5px 8px;border-bottom:1px solid #3a434d;color:#9aa6b2;white-space:nowrap;text-align:' + (i === 0 ? 'left' : 'right') + ';').text(c).appendTo($hr);
             });
             $tbl.append($thead.append($hr));
             var $tb = $('<tbody></tbody>');
@@ -8509,8 +8507,8 @@ JiTA.credits = {
                 $nt.appendTo($r);
                 for (var i = 1; i < row.length; i++) {
                     if (i === 7) { continue; }   // Extra Credits column removed (still counted in Credits)
-                    var st = 'padding:4px 8px;text-align:center;white-space:nowrap;color:#d7dce2;';
-                    if (i === 8) { st = 'padding:4px 8px;text-align:center;color:#fff;font-weight:800;'; }               // Credits
+                    var st = 'padding:4px 8px;text-align:right;white-space:nowrap;color:#d7dce2;';
+                    if (i === 8) { st = 'padding:4px 8px;text-align:right;color:#fff;font-weight:800;'; }               // Credits
                     $('<td></td>').attr('style', st).text(row[i]).appendTo($r);
                 }
                 $tb.append($r);
