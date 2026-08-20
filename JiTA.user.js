@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Jira Triage Assistant
-// @version     3.0.0
+// @version     3.1.0
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Jira-Triage-Assistant/raw/main/JiTA.user.js
@@ -466,11 +466,19 @@ function jitaAjaxError(msg) {
     };
 }
 
-// Convert-to-Defect (EBR -> EDR) automation rule id (invoked via jitaInvokeAutomationRule).
-var JITA_CONVERT_DEFECT_RULE = '767335';
+// ---- "Assign to GM" -> Convert-to-Support-Ticket flow ----
+// New workflow (replaces the old "set Team = EO-GameMasters + unassign"): a modal where the Bug Hunter picks a
+// support category and optionally leaves an internal note for the GMs. On confirm we (optionally) post the note to
+// the linked Zendesk ticket, THEN invoke CCP's manual automation rule - which converts the ZD ticket into a GM
+// support ticket in the chosen queue AND auto-closes this bug report. Same invocation pattern as the
+// Convert-to-Defect button: cloud id from the page meta -> issue numeric id -> POST the rule ARI.
+var JITA_GM_RULE = '019ff09b-0456-71ed-8e5b-8b246bbfe066';                         // GM convert-to-support-ticket automation rule
+var JITA_CONVERT_DEFECT_RULE = '767335';                                          // Convert-to-Defect (EBR -> EDR) automation rule
+var JITA_GM_CATEGORIES = ['Gameplay', 'Billing & Account', 'Technical', 'Other']; // dropdown `value`s - only "Other" is CONFIRMED from the captured payload; verify the other three
 
 // POST a manual automation-rule invocation for the issue with the given NUMERIC id (ari .../issue/<id>). Optional
-// `userInputs` carries a form selection (Convert-to-Defect passes none). Returns the $.ajax promise.
+// `userInputs` carries a form selection (the GM convert passes a category dropdown; Convert-to-Defect passes none).
+// Returns the $.ajax promise; the caller inspects the response / handles errors.
 function jitaInvokeAutomationRule(numericId, ruleId, userInputs) {
     var cloudId = $('meta[name="ajs-cloud-id"]').attr('content');
     var body = { objects: ['ari:cloud:jira:' + cloudId + ':issue/' + numericId] };
@@ -479,6 +487,98 @@ function jitaInvokeAutomationRule(numericId, ruleId, userInputs) {
         url: 'https://fenriscreations.atlassian.net/gateway/api/automation/internal-api/jira/' + cloudId + '/pro/rest/v1/rules/manual/invocation/' + ruleId,
         type: 'POST', contentType: 'application/json', charset: 'utf-8',
         data: JSON.stringify(body)
+    });
+}
+
+// Invoke the GM conversion automation for `key` with the chosen category. Resolves on SUCCESS, rejects otherwise.
+function jitaInvokeGmAutomation(key, category) {
+    return new Promise(function (resolve, reject) {
+        // The automation addresses the issue by its NUMERIC id, not the EBR-xxxx key, so fetch it first.
+        $.ajax({ url: 'https://fenriscreations.atlassian.net/rest/api/2/issue/' + key + '?fields=id', dataType: 'json' })
+            .done(function (d) {
+                if (!d || !d.id) { reject(new Error('Could not read the issue id.')); return; }
+                jitaInvokeAutomationRule(d.id, JITA_GM_RULE, { formSelected: { inputType: 'DROPDOWN', value: category } })
+                    .done(function (resp) {
+                        var inv = resp && resp.invocations && resp.invocations[0];
+                        if (inv && inv.status === 'SUCCESS') { resolve(resp); }
+                        else { reject(new Error('Automation did not report success.')); }
+                    })
+                    .fail(function (xhr) { reject(new Error('Automation invocation failed (HTTP ' + xhr.status + ').')); });
+            })
+            .fail(function (xhr) { reject(new Error('Could not read the issue id (HTTP ' + xhr.status + ').')); });
+    });
+}
+
+// Find + click the "Zendesk Support" tab / menu item if present and not already active. Returns true if found.
+function jitaClickZendeskTab() {
+    var nodes = document.querySelectorAll('[role="tab"], [role="menuitem"], [role="menuitemradio"], button, [role="button"], a');
+    for (var i = 0; i < nodes.length; i++) {
+        var el = nodes[i];
+        if ((el.textContent || '').trim().toLowerCase() === 'zendesk support') {
+            if (el.getAttribute('aria-selected') !== 'true' && el.getAttribute('aria-pressed') !== 'true') {
+                try { el.click(); } catch (e) { /* ignore */ }
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+// Make "Zendesk Support" the active Activity tab so its composer (in the Forge iframe) exists - the panel is lazy:
+// its iframe mounts only when its tab is selected. On a NARROW window the tab is collapsed into a "More" overflow
+// dropdown whose items only render once it's opened, so if the tab isn't directly present we open "More", wait for
+// it to populate, then click. Resolves true if found/clicked. (Heuristic by label; capture the DOM if it ever
+// stops matching.)
+function jitaEnsureZendeskTab() {
+    return new Promise(function (resolve) {
+        if (jitaClickZendeskTab()) { resolve(true); return; }
+        var more = document.querySelector('button[data-testid="issue-activity-feed.ui.buttons-with-dropdown.dropdown-menu-stateless--trigger"]');
+        if (!more) { resolve(false); return; }
+        if (more.getAttribute('aria-expanded') !== 'true') { try { more.click(); } catch (e) { /* ignore */ } }
+        var t = 0;
+        (function step() {
+            if (jitaClickZendeskTab()) { resolve(true); return; }   // clicking the item also closes the dropdown
+            if (t >= 4000) { resolve(false); return; }
+            t += 150; setTimeout(step, 150);
+        })();
+    });
+}
+
+// The ZD Support panel renders NATIVELY in the MAIN document (UI Kit 2). Determine whether this bug report has a
+// LINKED TICKET: ensure the tab is active, then wait for the panel to resolve - the composer (add-comment-button)
+// renders ONLY when a ticket is linked, and a "No linked tickets" message shows when there's none (no composer
+// loads at all). Resolves 'ticket' | 'noticket' | 'unavailable'.
+function jitaZdTicketState() {
+    return jitaEnsureZendeskTab().then(function () {
+        return new Promise(function (resolve) {
+            var t = 0;
+            (function waitState() {
+                if (document.querySelector('button[data-testid="add-comment-button"]')) { resolve('ticket'); return; }
+                if (jitaHasNoLinkedTicketsMsg()) { resolve('noticket'); return; }
+                if (t >= 25000) { resolve('unavailable'); return; }
+                t += 250; setTimeout(waitState, 250);
+            })();
+        });
+    });
+}
+
+// The ZD panel shows a "No linked tickets" message when the Jira issue has no linked Zendesk ticket.
+function jitaHasNoLinkedTicketsMsg() {
+    return !!(document.body && (document.body.textContent || '').indexOf('No linked tickets') !== -1);
+}
+
+// Close the current bug report directly as "Won't Do" via the REST transitions API (no resolution dialog). The
+// transition + resolution ids come from a real close (legacy CommentAssignIssue POST: action=71 sets
+// resolution=10001 = "Won't Do" on the EBR workflow). Same-origin, session-cookie auth. Returns the $.ajax promise.
+var JITA_CLOSE_TRANSITION = '71';        // EBR workflow transition that closes the report
+var JITA_WONTDO_RESOLUTION = '10001';    // "Won't Do" resolution id
+function jitaCloseAsWontDo(key) {
+    key = key || jitaCurrentKey();
+    return $.ajax({
+        url: 'https://fenriscreations.atlassian.net/rest/api/2/issue/' + key + '/transitions',
+        type: 'POST', contentType: 'application/json', charset: 'utf-8',
+        headers: { 'X-Atlassian-Token': 'no-check' },
+        data: JSON.stringify({ transition: { id: JITA_CLOSE_TRANSITION }, fields: { resolution: { id: JITA_WONTDO_RESOLUTION } } })
     });
 }
 
@@ -514,6 +614,86 @@ function jitaGoToNewDefect(ebrKey, beforeKeys) {
             });
     })();
 }
+
+// The category + optional-note modal opened by the "Assign to GM" button.
+function jitaOpenGmModal(key) {
+    var ov = JiTA.menu._openOverlay({ title: 'Convert to Support Ticket' });
+    var $body = $('<div class="jita-menu-sect"></div>').appendTo(ov.$menu);
+    $('<div class="jita-menu-status" style="padding-top:2px;">Pick the support category. The linked Zendesk ticket is converted into a GM support ticket and this bug report closes automatically.</div>').appendTo($body);
+
+    var selected = null;
+    var $cats = $('<div style="display:flex; flex-wrap:wrap; gap:8px; margin-top:10px;"></div>').appendTo($body);
+    JITA_GM_CATEGORIES.forEach(function (c) {
+        var $b = $('<button type="button" class="jita-btn"></button>').text(c).appendTo($cats);
+        $b.on('click', function () {
+            selected = c;
+            $cats.children('button').css({ background: '', color: '', fontWeight: '', borderColor: '' });
+            $b.css({ background: '#4c9aff', color: '#fff', fontWeight: '700', borderColor: '#4c9aff' });
+        });
+    });
+
+    $('<div class="jita-menu-status" style="margin-top:14px;">Internal note for the GMs (optional) - posted to the Zendesk ticket before conversion.</div>').appendTo($body);
+    var $note = $('<textarea rows="3" placeholder="Optional note for the GM team…" style="width:100%; margin-top:6px; box-sizing:border-box; background:#0f1316; color:#e6e6e6; border:1px solid #3a434d; border-radius:5px; padding:6px 8px; font-size:12px; font-family:inherit; resize:vertical;"></textarea>').appendTo($body);
+
+    var $status = $('<div class="jita-menu-status" style="min-height:15px; margin-top:8px;"></div>').appendTo($body);
+    var $actions = $('<div class="jita-menu-actions"></div>').appendTo($body);
+    $('<button class="jita-btn">Cancel</button>').on('click', ov.close).appendTo($actions);
+    var $go = $('<button class="jita-btn" style="background:#4c9aff; color:#fff; font-weight:700; border-color:#4c9aff;">Convert</button>').appendTo($actions);
+
+    $go.on('click', function () {
+        if (!selected) { $status.css('color', '#ff8f8f').text('Please pick a category first.'); return; }
+        var note = ($note.val() || '').trim();
+        $go.prop('disabled', true).css('opacity', '.6').text('Checking…');
+        $status.css('color', '#9aa6b2').text('Checking for a linked Zendesk ticket…');
+        jitaZdTicketState().then(function (state) {
+            if (state === 'noticket') { showNoTicketOption(); return; }
+            if (state === 'unavailable') { throw new Error('Could not load the Zendesk Support panel to check for a ticket. Open the Zendesk Support tab and retry.'); }
+            // Ticket present -> post the note (if any), then run the conversion automation.
+            $go.text('Converting…');
+            $status.text(note ? 'Posting note to Zendesk…' : 'Running automation…');
+            var pre = note ? JiTA.responses.postInternalNote(note).then(function (res) {
+                if (!res || !res.ok) { throw new Error((res && res.error) || 'Could not post the note.'); }
+            }) : Promise.resolve();
+            return pre.then(function () {
+                $status.text('Running automation…');
+                return jitaInvokeGmAutomation(key, selected);
+            }).then(function () {
+                $status.css('color', '#7fdca4').text('Automation started - this report will close in a few seconds…');
+                var waited = 0;
+                var t = setInterval(function () {
+                    waited += 500;
+                    if ($('strong:contains(Issue Updated)')[0]) { clearInterval(t); window.location.reload(false); }
+                    else if (waited >= 20000) { clearInterval(t); ov.close(); }
+                }, 500);
+            });
+        }).catch(function (e) {
+            $go.prop('disabled', false).css('opacity', '').text('Convert');
+            $status.css('color', '#ff8f8f').text('Failed: ' + (e && e.message || e));
+        });
+    });
+
+    // No linked ZD ticket -> nothing to convert. Swap the modal to offer closing the bug report instead.
+    function showNoTicketOption() {
+        $body.empty();
+        $('<div class="jita-menu-status" style="padding-top:2px; color:#ffd479;">This report has no linked Zendesk ticket (the reporter likely had no email), so there is no support ticket to convert. You can close the bug report instead.</div>').appendTo($body);
+        var $s2 = $('<div class="jita-menu-status" style="min-height:15px; margin-top:8px;"></div>').appendTo($body);
+        var $a2 = $('<div class="jita-menu-actions"></div>').appendTo($body);
+        $('<button class="jita-btn">Cancel</button>').on('click', ov.close).appendTo($a2);
+        var $close = $('<button class="jita-btn" style="background:#ff8f8f; color:#1d2125; font-weight:700; border-color:#ff8f8f;">Close bug report</button>').appendTo($a2);
+        $close.on('click', function () {
+            $close.prop('disabled', true).css('opacity', '.6').text('Closing…');
+            $s2.css('color', '#9aa6b2').text('Closing the bug report as Won\'t Do…');
+            jitaCloseAsWontDo(key).done(function () {
+                $s2.css('color', '#7fdca4').text('Closed as Won\'t Do.');
+                setTimeout(function () { ov.close(); window.location.reload(false); }, 1000);
+            }).fail(function (xhr) {
+                $close.prop('disabled', false).css('opacity', '').text('Close bug report');
+                $s2.css('color', '#ff8f8f').text('Failed to close: HTTP ' + (xhr && xhr.status));
+            });
+        });
+    }
+}
+
 
 // Adds the different buttons to the "command-bar" and defines what they do
 function addButtons() {
@@ -603,41 +783,13 @@ function addButtons() {
     // Create GM Button
     addActionButton('GMButton', 'Assign to GM');
 
-    // When the Assign to GM button is clicked we change the Team to "EO - Game Masters" and also visually change the field so the user sees that it worked.
-    // .off('click.jita').on(...) so re-running addButtons (React re-renders / SPA nav) never STACKS a second handler on the same button.
+    // The "Assign to GM" button now opens the Convert-to-Support-Ticket modal (category + optional GM note ->
+    // run CCP's conversion automation). Replaces the old "set Team = EO-GameMasters + unassign" flow: the
+    // automation itself moves the linked Zendesk ticket to the GM queue and auto-closes this bug report.
     $("#GMButton").off('click.jita').on('click.jita', function () {
         var key = jitaCurrentKey();
-        $.ajax({
-            url: 'https://fenriscreations.atlassian.net/rest/api/2/issue/' + key,
-            type: 'PUT',
-            contentType: 'application/json',
-            charset: 'utf-8',
-            data: '{"fields":{"customfield_10001":"38"}}',
-
-            // When the change of the team via API is successful we change the Team visually for the user to also see that as the Issue doesnt update automatically
-            success: function (data) {
-                $('div[data-testid="issue-field-heading-styled-field-heading.field"]:contains(Team)').parent().children('div').eq(1).text('EO - GameMasters');
-                // After changing the Team field to "EO - Game Masters" we change the Assignee field to "Unassigned" because GMs wont be able to see the BRs in their filters if they are assigned to someone.
-                $.ajax({
-                    url: 'https://fenriscreations.atlassian.net/rest/api/3/issue/' + key + '/assignee',
-                    type: 'PUT',
-                    contentType: 'application/json',
-                    charset: 'utf-8',
-                    data: '{"accountId":null}',
-
-                    success: function (data) {
-                        $('div[data-testid="issue-field-heading-styled-field-heading.assignee"]:contains(Assignee)').parent().children('div').eq(1).text('Unassigned');
-                    },
-
-                    // If we get an Error we annoy the user by telling them that it failed and to check their Dev Console for errors
-                    error: jitaAjaxError("Wasn't able to change Assignee field to 'Unassigned'.")
-                });
-
-            },
-
-            // If we get an Error then we annoy the user by telling them that it failed and to check their Dev Console for errors
-            error: jitaAjaxError()
-        });
+        if (!key) { alert('Could not read the issue key. Report issues to Schogol :).'); return; }
+        jitaOpenGmModal(key);
     });
 
 
@@ -4120,6 +4272,86 @@ JiTA.responses = {
             }
         }
         return false;
+    },
+
+    // True when the Zendesk panel has a LINKED TICKET selected. react-select points the ticket combobox's
+    // aria-describedby at a "…-single-value" node when a ticket is chosen, vs "…-placeholder" when empty (e.g. the
+    // reporter had no email, so no ZD ticket was ever created - there's then nothing to comment on).
+    _hasTicket: function () {
+        var inp = document.querySelector('input[id$="ticket-select"]');
+        if (!inp) { return false; }
+        return /-single-value$/.test(inp.getAttribute('aria-describedby') || '');
+    },
+
+    // Select the "Add internal note" composer tab (mirrors _selectPublicReply). Internal is the default tab, but
+    // we select it explicitly in case the composer was last left on "Add public reply".
+    _selectInternalNote: function () {
+        var tabs = document.querySelectorAll('[role="tab"]');
+        for (var i = 0; i < tabs.length; i++) {
+            if ((tabs[i].textContent || '').trim().toLowerCase() === 'add internal note') {
+                if (tabs[i].getAttribute('aria-selected') !== 'true') { tabs[i].click(); }
+                return true;
+            }
+        }
+        return false;
+    },
+
+    // Post `note` as an INTERNAL comment by driving the Zendesk composer: select the internal-note tab, fill the
+    // editor (reusing apply), click the Add button (data-testid="add-comment-button"), then confirm the composer
+    // cleared - its success signal. Resolves { ok, error }. Runs in whichever frame holds the composer (the Forge
+    // iframe normally). Errs toward FAILURE (so the caller aborts the conversion) rather than risk a lost note.
+    postInternalNote: function (note) {
+        var ADD = 'button[data-testid="add-comment-button"]';
+        // Small poller: call onOk once test() is truthy, or onTimeout after `ms`.
+        function poll(test, ms, onOk, onTimeout) {
+            var t = 0;
+            (function step() {
+                if (test()) { onOk(); return; }
+                if (t >= ms) { onTimeout(); return; }
+                t += 200; setTimeout(step, 200);
+            })();
+        }
+        return new Promise(function (resolve) {
+            // 1. Composer should already be present (the caller confirms a linked ticket via jitaZdTicketState first), but re-check
+            //    briefly as a safety net.
+            poll(function () { return !!document.querySelector(ADD); }, 5000, afterComposer, function () {
+                resolve({ ok: false, error: 'The Zendesk composer did not appear (is the Support tab available?).' });
+            });
+            function afterComposer() {
+                // 2. Wait for a LINKED TICKET to resolve (it loads a moment after the panel). If it never resolves,
+                //    the report has no ZD ticket (reporter had no email) - nothing to comment on.
+                poll(JiTA.responses._hasTicket, 9000, afterTicket, function () {
+                    resolve({ ok: false, error: 'No Zendesk ticket is linked to this report (the reporter likely had no email), so there is no ticket to add an internal note to.' });
+                });
+            }
+            function afterTicket() {
+                var switched = JiTA.responses._selectInternalNote();
+                setTimeout(function () {
+                    if (!JiTA.responses.apply(note)) { resolve({ ok: false, error: 'Could not find the comment editor.' }); return; }
+                    // 3. Wait for the Add button to enable (our fill has to register), then click.
+                    poll(function () { var b = document.querySelector(ADD); return b && !b.disabled; }, 6000, doClick, function () {
+                        resolve({ ok: false, error: 'The Add button did not enable (empty note?).' });
+                    });
+                }, switched ? 150 : 30);
+            }
+            function doClick() {
+                var b = document.querySelector(ADD);
+                if (!b) { resolve({ ok: false, error: 'The Add button vanished.' }); return; }
+                b.click();
+                // 4. Success signal: after a posted comment the composer RESETS - the SCOPED editor (the one we
+                //    filled) empties AND/OR the Add button disables again, whichever comes first.
+                var waited = 0;
+                var iv = setInterval(function () {
+                    waited += 200;
+                    var ed = JiTA.responses._composerEditor();
+                    var addBtn = document.querySelector(ADD);
+                    var cleared = ed && (ed.textContent || '').trim() === '';
+                    var disabled = !!(addBtn && addBtn.disabled);
+                    if (cleared || disabled) { clearInterval(iv); resolve({ ok: true }); }
+                    else if (waited >= 8000) { clearInterval(iv); resolve({ ok: false, error: 'Could not confirm the note posted (composer did not reset).' }); }
+                }, 200);
+            }
+        });
     },
 
     // Shared change handler for the overlay/fallback <select>: switch the composer to the public-reply tab,
