@@ -7752,13 +7752,15 @@ JiTA.credits = {
     running: false,
     _quiet: false,        // background (scheduled) runs set this true so the floating pill stays hidden (the badge is the visible artifact)
     _cssInjected: false,
+    _flashTimer: null,
 
-    // ---- progress (page-independent floating pill + console; shows with or without the Similar Defects panel) --
-    // A multi-minute crawl needs live feedback. _pill updates a fixed-position status pill (and the panel line
-    // when it exists); _log additionally breadcrumbs to the console. Use _pill for every-item ticks (smooth,
-    // no console spam) and _log for phase changes / interval milestones.
+    // ---- progress (bottom-right pill + console ONLY; never the Triage Assistant panel line) ----------------
+    // A multi-minute crawl needs live feedback, shown solely in the fixed bottom-right pill. _pill updates the
+    // pill; _log also breadcrumbs to the console; _flash shows a brief pill message even during a quiet
+    // background run. Use _pill for every-item ticks (smooth), _log for phase milestones.
     _pill: function (msg) {
         if (JiTA.credits._quiet) { return; }   // scheduled background runs stay silent
+        if (JiTA.credits._flashTimer) { clearTimeout(JiTA.credits._flashTimer); JiTA.credits._flashTimer = null; }   // cancel a pending flash auto-clear
         try {
             var el = document.getElementById('jita-credits-progress');
             if (!el) {
@@ -7772,11 +7774,19 @@ JiTA.credits = {
             }
             el.textContent = '📊 ISD credits\n' + msg;
         } catch (e) { /* ignore */ }
-        try { JiTA.ui.setStatus('Credits: ' + msg); } catch (e2) { /* ignore */ }   // also feed the panel line when present
     },
     _log: function (msg) { JiTA.credits._pill(msg); if (window.console) { console.log('[JiTA] credits: ' + msg); } },
     _clearProgress: function () {
         try { var el = document.getElementById('jita-credits-progress'); if (el && el.parentNode) { el.parentNode.removeChild(el); } } catch (e) { /* ignore */ }
+    },
+    // Briefly show the bottom-right pill (even during a quiet background run), then auto-clear. Keeps run
+    // completion / error status in the pill and off the Triage Assistant panel line.
+    _flash: function (msg, ms) {
+        var wasQuiet = JiTA.credits._quiet;
+        JiTA.credits._quiet = false;
+        JiTA.credits._pill(msg);
+        JiTA.credits._quiet = wasQuiet;
+        JiTA.credits._flashTimer = setTimeout(function () { JiTA.credits._clearProgress(); }, ms || 4000);
     },
 
     // ---- REST (session-authenticated, read-only) --------------------------------------------------------
@@ -8220,14 +8230,12 @@ JiTA.credits = {
         return JiTA.credits.computeMonth(y, m, mentor).then(function (res) {
             return JiTA.credits.putCached(res).then(function () {
                 JiTA.credits.running = false;
-                JiTA.credits._clearProgress();
-                JiTA.ui.setStatus('Credits ' + res.ym + ' ready (' + Math.round((Date.now() - t0) / 1000) + 's)');
+                JiTA.credits._flash('Credits ' + res.ym + ' ready (' + Math.round((Date.now() - t0) / 1000) + 's)');
                 return res;
             });
         }).catch(function (e) {
             JiTA.credits.running = false;
-            JiTA.credits._clearProgress();
-            JiTA.ui.setStatus('Credits error: ' + (e && e.message || e));
+            JiTA.credits._flash('Credits error: ' + (e && e.message || e), 8000);
             throw e;
         });
     },
