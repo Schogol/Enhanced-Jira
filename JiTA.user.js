@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Jira Triage Assistant
-// @version     2.39.0
+// @version     3.0.0
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Jira-Triage-Assistant/raw/main/JiTA.user.js
@@ -2761,6 +2761,10 @@ JiTA.logsig = {
     // Every OTHER defect that shares a signature with `key` (deduped across all of the key's signatures),
     // each with its status/resolution. Drives the inline "Same exception" section on a defect. [] when none.
     siblingsForKey: function (key) {
+        if (JiTA.worker && JiTA.worker._started) { return JiTA.worker.call('logsig', { op: 'siblings', key: key }).catch(function () { return JiTA.logsig._siblingsLocal(key); }); }
+        return JiTA.logsig._siblingsLocal(key);
+    },
+    _siblingsLocal: function (key) {
         return JiTA.logsig.ensure().then(function (idx) {
             var out = [], seen = {};
             seen[key] = true;
@@ -2783,6 +2787,10 @@ JiTA.logsig = {
     // sibling - i.e. the SAME bug reached via a DIFFERENT call path. Looser than siblingsForKey; drives the
     // "Possibly related" hint. [] when none.
     relatedForKey: function (key) {
+        if (JiTA.worker && JiTA.worker._started) { return JiTA.worker.call('logsig', { op: 'related', key: key }).catch(function () { return JiTA.logsig._relatedLocal(key); }); }
+        return JiTA.logsig._relatedLocal(key);
+    },
+    _relatedLocal: function (key) {
         return JiTA.logsig.ensure().then(function (idx) {
             if (!idx) { return []; }
             var exclude = {};
@@ -2812,6 +2820,10 @@ JiTA.logsig = {
     // first (the freshly-recurring exceptions a triager most wants to see), with cluster size as the
     // tiebreaker. Drives the "Exception clusters" overview.
     clusters: function () {
+        if (JiTA.worker && JiTA.worker._started) { return JiTA.worker.call('logsig', { op: 'clusters' }).catch(function () { return JiTA.logsig._clustersLocal(); }); }
+        return JiTA.logsig._clustersLocal();
+    },
+    _clustersLocal: function () {
         function newest(members) {
             var n = '';
             for (var i = 0; i < members.length; i++) {
@@ -3025,6 +3037,10 @@ JiTA.logsig = {
     // swallow the whole rest of the log (hundreds of unrelated `file.py(NN) func` lines) and the stack
     // signature would never match the clean one in the index. Resolves to { defect -> { defect, count, msg } }.
     matchText: function (text) {
+        if (JiTA.worker && JiTA.worker._started) { return JiTA.worker.call('logsig', { op: 'match', text: text }).catch(function () { return JiTA.logsig._matchTextLocal(text); }); }
+        return JiTA.logsig._matchTextLocal(text);
+    },
+    _matchTextLocal: function (text) {
         return JiTA.logsig.ensure().then(function (idx) {
             var found = {};
             if (!idx || !text) { return found; }
@@ -4546,7 +4562,7 @@ JiTA.sync = {
         });
     },
 
-    // Wipe the local DB and rebuild from scratch (also used after a model-version change in Phase 2).
+    // Wipe the local DB and rebuild from scratch (also used after an embedding model-version change).
     rebuild: function () {
         if (JiTA.sync.running) { JiTA.ui.toast('A sync is already running…'); return Promise.resolve(); }
         if (!confirm('Rebuild the local defect database from scratch? This re-fetches every EDR/EO/PLAT issue.')) { return Promise.resolve(); }
@@ -4809,8 +4825,24 @@ JiTA.rank = {
         });
     },
 
-    // Rank stored defects against the query text. Returns up to `limit` (default TOP_N) scored results.
+    // Keyword (BM25) defect candidates. Routes to the shared worker's index (so tabs don't build one), gating
+    // tab-side; on worker failure, falls back to a locally-built BM25 index (the ONLY time _index is built here).
     suggest: function (text, excludeKey, limit, filterTerms) {
+        if (JiTA.worker && JiTA.worker._started) {
+            return JiTA.rank._workerKeyword(text, 'defects', excludeKey, filterTerms, limit)
+                .then(function (cands) { return JiTA.rank._gateScored(cands, 'defects').slice(0, limit || JiTA.TOP_N); })
+                .catch(function () { return JiTA.rank._suggestLocal(text, excludeKey, limit, filterTerms); });
+        }
+        return JiTA.rank._suggestLocal(text, excludeKey, limit, filterTerms);
+    },
+    _workerKeyword: function (text, scope, excludeKey, filterTerms, limit) {
+        return JiTA.worker.call('rankKeyword', {
+            text: text, scope: scope, excludeKey: excludeKey,
+            filterTerms: (filterTerms && filterTerms.length ? filterTerms : null),
+            topN: Math.max((limit || JiTA.TOP_N) * 4, 100)
+        }).then(function (r) { return (r && r.results) || []; });
+    },
+    _suggestLocal: function (text, excludeKey, limit, filterTerms) {
         return JiTA.rank._ensureIndex().then(function (idx) {
             return JiTA.rank._bm25Score(idx, text, excludeKey, limit, filterTerms);
         });
@@ -4825,9 +4857,22 @@ JiTA.rank = {
         });
     },
 
-    // Rank OPEN bug reports against the query text (a defect's text). Returns up to `limit` scored results,
-    // each with a display `pct` relative to the top score. Mirrors `suggest` but over the EBR index.
+    // Rank OPEN bug reports against the query text (a defect's text), each with a display `pct` relative to the
+    // top score. Worker-backed (with local fallback), mirroring suggest.
     suggestEbr: function (text, excludeKey, limit, filterTerms) {
+        function withPct(scored) {
+            var top = (scored[0] && scored[0].score) || 0;
+            for (var p = 0; p < scored.length; p++) { scored[p].pct = top > 0 ? Math.round(scored[p].score / top * 100) : 0; }
+            return scored;
+        }
+        if (JiTA.worker && JiTA.worker._started) {
+            return JiTA.rank._workerKeyword(text, 'ebr', excludeKey, filterTerms, limit)
+                .then(function (cands) { return withPct(JiTA.rank._gateScored(cands, 'ebr').slice(0, limit || JiTA.TOP_N)); })
+                .catch(function () { return JiTA.rank._suggestEbrLocal(text, excludeKey, limit, filterTerms); });
+        }
+        return JiTA.rank._suggestEbrLocal(text, excludeKey, limit, filterTerms);
+    },
+    _suggestEbrLocal: function (text, excludeKey, limit, filterTerms) {
         return JiTA.rank._ensureEbrIndex().then(function (idx) {
             var scored = JiTA.rank._bm25Score(idx, text, excludeKey, limit, filterTerms);
             var top = (scored[0] && scored[0].score) || 0;
@@ -4897,8 +4942,10 @@ JiTA.rank._bm25Score = function (idx, text, excludeKey, limit, filterTerms) {
 };
 
 
-/* ---- embedding engine: local transformers.js (Phase 2) ----
- * Lazily loads a small sentence-embedding model in the browser (no server, no API key) and embeds
+/* ---- embedding engine: local transformers.js (main-thread fallback) ----
+ * The shared worker hosts the primary embedding engine now (one model for all tabs). This local copy is
+ * the fallback path for when the worker never comes up (no Web Locks / BroadcastChannel / module workers):
+ * it lazily loads the same small sentence-embedding model in THIS tab (no server, no API key) and embeds
  * defect text into 384-dim normalized vectors. CSP on this instance is permissive (only frame-ancestors,
  * WASM OK), so we load the library with a plain dynamic import() of a pinned CDN ESM build and let it
  * fetch model weights directly. Any failure flips `unavailable` and the ranking layer falls back to BM25.
@@ -5121,6 +5168,20 @@ JiTA.embed = {
     // Background entry point: load the model and embed anything outstanding, then refresh the panel.
     // Idempotent per session unless `force` is passed (used right after a sync brings in new/changed text).
     prepare: function (force) {
+        // With the shared worker, embedding runs THERE (one model for all tabs) - no main-thread model load.
+        // Any tab can trigger it; the request routes to the single leader worker, which is single-flight.
+        if (JiTA.worker && JiTA.worker._started) {
+            if (JiTA.embed._preparing) { return JiTA.embed._preparing; }
+            JiTA.embed._preparing = JiTA.worker.call('embedPass').then(function (r) {
+                JiTA.embed._preparing = null;
+                if (r && r.embedded > 0) { try { JiTA.ui.scheduleRender(); } catch (e) { /* ignore */ } }   // new vectors -> re-rank the open view
+            }, function (e) {
+                JiTA.embed._preparing = null;
+                console.log('[JiTA] worker embed pass skipped:', (e && e.message) || e);
+            });
+            return JiTA.embed._preparing;
+        }
+        // Fallback (no worker at all): the original main-thread embed pass.
         if (JiTA.embed.unavailable) { return Promise.resolve(); }
         if (JiTA.embed._preparing) { return JiTA.embed._preparing; }
         if (JiTA.embed._prepared && !force) { return Promise.resolve(); }
@@ -5130,8 +5191,6 @@ JiTA.embed = {
                 JiTA.embed._prepared = true;
                 JiTA.rank._dirtyVec = true;
                 JiTA.rank._dirtyEbrVec = true;
-                // Refresh whichever view is open (coalesced, so a sync + this embed-pass completion collapse
-                // into a single list rebuild instead of thrashing): EBR -> similar defects, EDR -> reports.
                 JiTA.ui.scheduleRender();
             });
         }).then(function () {
@@ -5145,40 +5204,7 @@ JiTA.embed = {
 };
 
 
-/* ---- semantic ranking (Phase 2): cosine over stored embeddings, with BM25 fallback ---- */
-JiTA.rank._vecIndex = null;     // cached array of { key, project, summary, status, resolution, vec }
-JiTA.rank._dirtyVec = true;     // rebuild the in-memory vector cache on next semantic query
-JiTA.rank._buildingVec = null;
-
-// Shared body of the two vector indexes (_ensureVecIndex / _ensureEbrVecIndex): the current-model embedded
-// docs, filtered by `keep` (defects = non-EBR; open reports = EBR & not closed). resolutiondate is carried
-// uniformly (unused on the EBR side, harmless).
-JiTA.rank._buildVecIndex = function (records, keep) {
-    var docs = [];
-    for (var i = 0; i < records.length; i++) {
-        var r = records[i];
-        if (!keep(r)) { continue; }
-        if (r.embedding && r.embeddingModelVersion === JiTA.MODEL_VERSION) {
-            docs.push({ key: r.key, project: r.project, summary: r.summary, status: r.status, resolution: r.resolution, resolutiondate: r.resolutiondate, created: r.created, vec: r.embedding, hay: ((r.key || '') + ' ' + (r.summary || '') + ' ' + (r.description || '')).toLowerCase() });
-        }
-    }
-    return docs;
-};
-
-// Build (and cache) the in-memory list of DEFECT vectors for the current model version.
-JiTA.rank._ensureVecIndex = function () {
-    return JiTA.rank._ensureCached('_vecIndex', '_dirtyVec', '_buildingVec', function (recs) {
-        return JiTA.rank._buildVecIndex(recs, function (r) { return r.project !== 'EBR'; });
-    });
-};
-
-// Cosine similarity of two normalized vectors == dot product.
-JiTA.rank._dot = function (a, b) {
-    var s = 0, n = Math.min(a.length, b.length);
-    for (var i = 0; i < n; i++) { s += a[i] * b[i]; }
-    return s;
-};
-
+/* ---- ranking fusion: semantic + BM25 candidates come from the shared worker; RRF-fused here ---- */
 JiTA.rank.CAND = 50;     // candidates pulled from each retriever before fusion
 JiTA.rank.RRF_K = 60;    // Reciprocal-Rank-Fusion constant (standard default)
 
@@ -5210,79 +5236,44 @@ JiTA.rank._fuse = function (sem, bm, demote) {
     return topN;
 };
 
-// Embed the query text, caching the most recent (text -> vector) so filter-box keystrokes (which re-rank the
-// SAME issue text against a changing filter) don't re-run the transformer every time - only the filter +
-// scoring re-run, not the expensive inference.
-JiTA.rank._qvText = null;
-JiTA.rank._qvVec = null;
-JiTA.rank._embedQuery = function (text) {
-    if (JiTA.rank._qvText === text && JiTA.rank._qvVec) { return Promise.resolve(JiTA.rank._qvVec); }
-    return JiTA.embed.embedOne(text).then(function (qv) {
-        JiTA.rank._qvText = text; JiTA.rank._qvVec = qv; return qv;
-    });
+// Semantic candidates from the SHARED worker (embed + cosine live in the worker's one model+index, not per tab).
+// Returns the worker's top-K score-sorted candidate list, or rejects if the worker is unavailable (caller then
+// keyword-falls-back). filterTerms is applied in the worker; the remaining session/UI gates run tab-side below.
+JiTA.rank._workerSemantic = function (text, scope, excludeKey, filterTerms) {
+    if (!JiTA.worker || !JiTA.worker._started) { return Promise.reject(new Error('worker off')); }
+    return JiTA.worker.call('rankSemantic', {
+        text: text, scope: scope, excludeKey: excludeKey,
+        filterTerms: (filterTerms && filterTerms.length ? filterTerms : null),
+        topN: JiTA.rank.CAND * 4
+    }).then(function (r) { return (r && r.results) || []; });
 };
 
-// Cosine-score every doc from `indexGetter()` (a Promise of a vec index) against the query vector, applying
-// the exclude / hidden / filter-box / session-filter gates, sorted best-first. [] if none embedded. Shared by
-// the defect and open-EBR semantic scorers (identical loop; resolutiondate is carried uniformly - unused on
-// the EBR side, harmless). `filterTerms` restricts to docs whose key+title+description contains them all.
-JiTA.rank._cosineScored = function (indexGetter, qv, excludeKey, filterTerms) {
-    return indexGetter().then(function (docs) {
-        var scored = [];
-        for (var d = 0; d < docs.length; d++) {
-            if (excludeKey && docs[d].key === excludeKey) { continue; }
-            if (JiTA.hidden.isHidden(docs[d].key)) { continue; }   // user-hidden suggestion (temporary, persisted across updates)
-            if (filterTerms && filterTerms.length && !JiTA.rank._matchTerms(docs[d].hay, filterTerms)) { continue; }
-            if (!JiTA.ui.passesFilter(docs[d])) { continue; }   // session filters (status / recency)
-            var sc = JiTA.rank._dot(qv, docs[d].vec);
-            if (!isFinite(sc)) { continue; }   // defensively drop any corrupt (NaN/Inf) vector
-            scored.push({ key: docs[d].key, project: docs[d].project, summary: docs[d].summary, status: docs[d].status, resolution: docs[d].resolution, resolutiondate: docs[d].resolutiondate, score: sc });
-        }
-        scored.sort(function (a, c) { return c.score - a.score; });
-        return scored;
-    });
+// Apply the tab-side gates the worker doesn't know about to the worker's pre-scored candidates: user-hidden
+// suggestions, the structural open+non-GM filter for matching-reports (ebr scope), and the session status/recency
+// filter. Candidates arrive score-sorted, so order is preserved. Returns the semantic list for fusion.
+JiTA.rank._gateScored = function (cands, scope) {
+    var out = [];
+    for (var i = 0; i < cands.length; i++) {
+        var d = cands[i];
+        if (JiTA.hidden.isHidden(d.key)) { continue; }
+        if (scope === 'ebr' && (JiTA.util.isClosedStatus(d.status) || JiTA.util.isGmTeam(d.team))) { continue; }
+        if (!JiTA.ui.passesFilter(d)) { continue; }
+        out.push({ key: d.key, project: d.project, summary: d.summary, status: d.status, resolution: d.resolution, resolutiondate: d.resolutiondate, score: d.score });
+    }
+    return out;
 };
 
-// Cosine-score the DEFECT vectors against the query. [] if none embedded.
-JiTA.rank._semanticScored = function (qv, excludeKey, filterTerms) {
-    return JiTA.rank._cosineScored(JiTA.rank._ensureVecIndex, qv, excludeKey, filterTerms);
-};
-
-/* ---- EBR semantic ranking (stage 2): cosine over OPEN bug-report embeddings ---- */
-JiTA.rank._ebrVecIndex = null;
-JiTA.rank._dirtyEbrVec = true;
-JiTA.rank._buildingEbrVec = null;
-
-// In-memory vector list over OPEN bug reports (project EBR) with a current-version embedding. Mirrors
-// _ensureVecIndex but keeps only open EBRs (closed ones aren't ranked and lose their slot).
-JiTA.rank._ensureEbrVecIndex = function () {
-    return JiTA.rank._ensureCached('_ebrVecIndex', '_dirtyEbrVec', '_buildingEbrVec', function (recs) {
-        return JiTA.rank._buildVecIndex(recs, function (r) { return r.project === 'EBR' && !JiTA.util.isClosedStatus(r.status) && !JiTA.util.isGmTeam(r.team); });
-    });
-};
-
-// Cosine-score the OPEN-EBR vectors against the query. [] if none embedded.
-JiTA.rank._semanticScoredEbr = function (qv, excludeKey, filterTerms) {
-    return JiTA.rank._cosineScored(JiTA.rank._ensureEbrVecIndex, qv, excludeKey, filterTerms);
-};
-
-// Shared HYBRID body for suggestBest / suggestEbrBest: embed the query, cosine-score via semFn, fall back to
-// keyword when nothing is embedded (or the filter excluded all), else pull the BM25 candidates via bmFn and
-// RRF-fuse (with optional `demote`, defect side only). A query-time embed failure (e.g. a WebGPU device loss)
-// drops the possibly-dead pipeline - we do NOT auto-switch backend, that's the user's menu choice - and shows
-// keyword results for now.
-JiTA.rank._hybridResults = function (text, key, filterTerms, semFn, bmFn, keywordOnly, demote) {
-    return JiTA.rank._embedQuery(text).then(function (qv) {
-        return semFn(qv, key, filterTerms).then(function (sem) {
-            if (!sem.length) { return keywordOnly(); }
-            return bmFn(text, key, JiTA.rank.CAND, filterTerms).then(function (bm) {
-                return { mode: 'Hybrid', results: JiTA.rank._fuse(sem, bm, demote) };
-            });
+// Shared HYBRID body for suggestBest / suggestEbrBest: pull semantic candidates from the shared worker, gate them
+// tab-side, then RRF-fuse with the local BM25 candidates (with optional `demote`, defect side only). If the worker
+// is unavailable / errors / yields nothing usable, fall back to keyword-only.
+JiTA.rank._hybridResults = function (text, key, filterTerms, scope, bmFn, keywordOnly, demote) {
+    return JiTA.rank._workerSemantic(text, scope, key, filterTerms).then(function (cands) {
+        var sem = JiTA.rank._gateScored(cands, scope);
+        if (!sem.length) { return keywordOnly(); }
+        return bmFn(text, key, JiTA.rank.CAND, filterTerms).then(function (bm) {
+            return { mode: 'Hybrid', results: JiTA.rank._fuse(sem, bm, demote) };
         });
-    }).catch(function () {
-        JiTA.embed._resetPipe();
-        return keywordOnly();
-    });
+    }).catch(function () { return keywordOnly(); });
 };
 
 // Shared mode-selection tail: honor a forced Keyword override, go straight to hybrid() when the model is ready,
@@ -5291,20 +5282,18 @@ JiTA.rank._hybridResults = function (text, key, filterTerms, semFn, bmFn, keywor
 // keyword() now (prepare()'s later re-render upgrades it once the model is ready).
 JiTA.rank._pickMode = function (forceMode, keywordOnly, hybrid) {
     if (forceMode === 'Keyword') { return keywordOnly(); }
-    if (JiTA.embed.ready) { return hybrid(); }
-    if (JiTA.embed.unavailable) { return keywordOnly(); }
-    JiTA.embed.prepare();
+    if (!JiTA.worker || !JiTA.worker._started) { return keywordOnly(); }   // no shared worker -> keyword only
+    // Keyword-first: race the worker-backed hybrid against a short window. If the worker answers in time we show
+    // Hybrid straight away; otherwise show Keyword now and, once the (cold-starting) worker finally responds,
+    // re-render to upgrade to Hybrid. hybrid() itself keyword-falls-back if the worker errors.
     return new Promise(function (resolve) {
         var settled = false;
         var timer = setTimeout(function () { if (settled) { return; } settled = true; resolve(keywordOnly()); }, JiTA.embed.WARM_WAIT_MS);
-        JiTA.embed.load().then(function () {
-            if (settled) { return; }
-            settled = true; clearTimeout(timer);
-            resolve(hybrid());
+        hybrid().then(function (res) {
+            if (settled) { try { JiTA.ui.scheduleRender(); } catch (e) { /* ignore */ } return; }   // late: upgrade via a re-render
+            settled = true; clearTimeout(timer); resolve(res);
         }, function () {
-            if (settled) { return; }
-            settled = true; clearTimeout(timer);
-            resolve(keywordOnly());
+            if (settled) { return; } settled = true; clearTimeout(timer); resolve(keywordOnly());
         });
     });
 };
@@ -5343,7 +5332,7 @@ JiTA.rank.suggestBest = function (text, key, brCreated, forceMode, filterTerms) 
     }
     // HYBRID (semantic + keyword, RRF-fused) over the DEFECT indexes, with stale-match demotion.
     function hybrid() {
-        return JiTA.rank._hybridResults(text, key, filterTerms, JiTA.rank._semanticScored, JiTA.rank.suggest, keywordOnly, demote);
+        return JiTA.rank._hybridResults(text, key, filterTerms, 'defects', JiTA.rank.suggest, keywordOnly, demote);
     }
     return JiTA.rank._pickMode(forceMode, keywordOnly, hybrid);
 };
@@ -5360,7 +5349,7 @@ JiTA.rank.suggestEbrBest = function (text, key, forceMode, filterTerms) {
     }
     // HYBRID over the OPEN-EBR indexes; no stale-demotion (open reports have no fix date).
     function hybrid() {
-        return JiTA.rank._hybridResults(text, key, filterTerms, JiTA.rank._semanticScoredEbr, JiTA.rank.suggestEbr, keywordOnly);
+        return JiTA.rank._hybridResults(text, key, filterTerms, 'ebr', JiTA.rank.suggestEbr, keywordOnly);
     }
     return JiTA.rank._pickMode(forceMode, keywordOnly, hybrid);
 };
@@ -7753,6 +7742,9 @@ JiTA.credits = {
     _quiet: false,        // background (scheduled) runs set this true so the floating pill stays hidden (the badge is the visible artifact)
     _cssInjected: false,
     _flashTimer: null,
+    _tagSeq: 0,           // per-tab counter -> unique progress tag for a worker crawl (scopes the pill to THIS tab)
+    _workerTag: null,     // tag of the in-flight worker crawl THIS tab initiated (null when idle); gates progress events
+    WORKER_TIMEOUT_MS: 15 * 60 * 1000,   // a full month crawl runs minutes; give the worker RPC ample headroom vs the 30s default
 
     // ---- progress (bottom-right pill + console ONLY; never the Triage Assistant panel line) ----------------
     // A multi-minute crawl needs live feedback, shown solely in the fixed bottom-right pill. _pill updates the
@@ -8160,7 +8152,26 @@ JiTA.credits = {
     // ---- orchestration ----------------------------------------------------------------------------------
     // Compute the full per-member credit table for month (y, m). Resolves { ym, computedAt, header, table,
     // rows, nameToAcc }. `table` rows are arrays aligned to `header` (last row is the Total).
+    // The crawl is fetch + politeness-sleep heavy, so it runs in the shared worker where a hidden/unfocused
+    // tab's background timer throttling can't stall it. Falls back to the in-tab crawl (_computeMonthLocal)
+    // when the worker is unavailable; progress streams back as throttled 'creditsProgress' events -> the pill.
     computeMonth: function (y, m, mentor) {
+        var C = JiTA.credits;
+        if (JiTA.worker && JiTA.worker._started) {
+            var tag = (JiTA.sched.tabId) + ':' + (++C._tagSeq);
+            C._workerTag = tag;
+            return JiTA.worker.call('creditsMonth', { y: y, m: m, mentor: mentor || null, tag: tag }, { timeoutMs: C.WORKER_TIMEOUT_MS })
+                .then(function (res) { C._workerTag = null; return res; }, function (err) {
+                    C._workerTag = null;
+                    if (window.console) { console.log('[JiTA] credits: worker crawl failed, running in-tab:', (err && err.message) || err); }
+                    return C._computeMonthLocal(y, m, mentor);
+                });
+        }
+        return C._computeMonthLocal(y, m, mentor);
+    },
+
+    // In-tab crawl: the fallback path, and the reference implementation the worker copy (crComputeMonth) mirrors.
+    _computeMonthLocal: function (y, m, mentor) {
         var C = JiTA.credits, b = C._monthBounds(y, m);
         var ym = b.start.slice(0, 7);
         C._log(ym + ': resolving group members…');
@@ -8359,23 +8370,16 @@ JiTA.credits = {
         });
     },
 
-    // ---- shared: per-viewer derivation (your row / rank / lead-ness) ------------------------------------
-    // True if a member's display name carries a lead handle token (e.g. "ISD BH Solnichka" -> "solnichka").
-    _leadFromName: function (name) {
-        var toks = {};
-        (name || '').toLowerCase().replace(/-/g, ' ').split(/\s+/).forEach(function (t) { if (t) { toks[t] = true; } });
-        for (var l in JiTA.credits.LEADS) { if (JiTA.credits.LEADS.hasOwnProperty(l) && toks[l]) { return true; } }
-        return false;
-    },
+    // ---- shared: per-viewer derivation (your row / rank) -----------------------------------------------
     // From a computed/cached result + the viewer's accountId: the members sorted by credits desc, plus which
-    // row is the viewer's, their rank, and whether they're a lead (gates the full leaderboard).
+    // row is the viewer's and their rank.
     _derive: function (res, me) {
         var real = res.table.slice(0, res.table.length - 1).slice().sort(function (a, b) { return b[8] - a[8]; });
         var myName = null;
         for (var name in res.nameToAcc) { if (res.nameToAcc.hasOwnProperty(name) && res.nameToAcc[name] === me) { myName = name; } }
         var myRow = null, myRank = null;
         for (var i = 0; i < real.length; i++) { if (real[i][0] === myName) { myRow = real[i]; myRank = i + 1; } }
-        return { real: real, myName: myName, myRow: myRow, myRank: myRank, total: real.length, isLead: JiTA.credits._leadFromName(myName) };
+        return { real: real, myName: myName, myRow: myRow, myRank: myRank, total: real.length };
     },
 
     // ---- overlay CSS (the wide, scrollable overlay chrome; base menu CSS comes from JiTA.menu._injectCss) --
@@ -8434,26 +8438,31 @@ JiTA.credits = {
         });
 
         // The viewer's line, preferring the fresher self cache (current month) over the full-leaderboard row.
+        // `computed` distinguishes "this month was computed but you're not an ECAID member" from "not computed yet".
         function cardInfo(fullRes, selfRes, me) {
+            var computed = !!(fullRes || selfRes);
             if (selfRes && selfRes.me === me && selfRes.credits != null) {
-                return { myName: selfRes.myName, created: selfRes.created, resolved: selfRes.resolved, attached: selfRes.attached,
+                return { computed: computed, myName: selfRes.myName, created: selfRes.created, resolved: selfRes.resolved, attached: selfRes.attached,
                     trashed: selfRes.trashed, reassigned: selfRes.reassigned, actioned: selfRes.actioned, extra: selfRes.extra,
                     credits: selfRes.credits, rank: selfRes.rank, total: selfRes.total };
             }
             if (fullRes) {
                 var d = C._derive(fullRes, me);
                 if (d.myRow) {
-                    return { myName: d.myName, created: d.myRow[1], resolved: d.myRow[2], attached: d.myRow[3], trashed: d.myRow[4],
+                    return { computed: computed, myName: d.myName, created: d.myRow[1], resolved: d.myRow[2], attached: d.myRow[3], trashed: d.myRow[4],
                         reassigned: d.myRow[5], actioned: d.myRow[6], extra: d.myRow[7], credits: d.myRow[8], rank: d.myRank, total: d.total };
                 }
             }
-            return { myName: null };
+            return { computed: computed, myName: null };
         }
 
         function card(info) {
             var $c = $('<div style="background:#22272b;border:1px solid #2c333a;border-radius:8px;padding:12px 14px;"></div>');
-            $('<div style="font-weight:700;font-size:13px;margin-bottom:8px;"></div>')
-                .text(info.myName ? ('You - ' + info.myName) : 'Your account was not matched to an ECAID member').appendTo($c);
+            // Not computed -> a neutral title (the status line below explains + offers Refresh); computed but no
+            // match -> the account genuinely isn't an ECAID member.
+            var title = info.myName ? ('You - ' + info.myName)
+                : (info.computed ? 'Your account was not matched to an ECAID member' : 'Your credits for ' + sel);
+            $('<div style="font-weight:700;font-size:13px;margin-bottom:8px;"></div>').text(title).appendTo($c);
             if (info.myName && info.credits != null) {
                 // Two labelled groups so it's clear Created/Resolved are DEFECTS and Attached/Trashed/Reassigned are BUG REPORTS.
                 function group(label, parts) {
@@ -8505,6 +8514,7 @@ JiTA.credits = {
             $tbl.append($thead.append($hr));
             var $tb = $('<tbody></tbody>');
             d.real.forEach(function (row, idx) {
+                if (!row[8]) { return; }   // hide members who earned 0 credits this month (they sort last, so ranks stay intact)
                 var mine = row[0] === d.myName;
                 var $r = $('<tr></tr>').attr('style', mine ? 'background:#20303f;' : '');
                 $('<td style="padding:4px 8px;color:#7a8694;"></td>').text(idx + 1).appendTo($r);
@@ -8541,20 +8551,23 @@ JiTA.credits = {
                 var fullRes = arr[0], selfRes = arr[1], me = arr[2];
                 $scroll.empty();
                 $scroll.append($('<div id="jita-cred-card-slot"></div>').append(card(cardInfo(fullRes, selfRes, me))));
+                // Only the current month auto-refreshes (the scheduler computes _ymNow()); past months are on-demand.
+                var isCurrentMonth = (sel === C._ymNow().ym);
+                if (!isCurrentMonth) {
+                    // Warn that older months are slower: the GM-reassignment step (crAutoReassigned) crawls every bug
+                    // report touched since the month began (updated >= start, no upper bound), so further back = slower.
+                    $scroll.append($('<div class="jita-menu-status" style="margin-top:8px;color:#e0b050;"></div>')
+                        .text('Heads up: older months compute slower - the GM-reassignment step crawls every bug report touched since ' + sel + ' began, so the further back you go, the longer it takes.'));
+                }
                 if (!fullRes) {
                     $scroll.append($('<div class="jita-menu-status" style="margin-top:12px;"></div>')
-                        .text('Leaderboard not computed yet for ' + sel + '. It refreshes automatically, or click Refresh.'));
+                        .text('Leaderboard not computed yet for ' + sel + '.' + (isCurrentMonth ? ' It refreshes automatically, or click Refresh.' : ' Click Refresh to compute it.')));
                     return;
                 }
                 var d = C._derive(fullRes, me);
-                if (d.isLead) {
-                    $scroll.append($('<div class="jita-cred-sub">Leaderboard</div>'));
-                    $scroll.append(table(fullRes, d));
-                } else {
-                    var info = cardInfo(fullRes, selfRes, me);
-                    $scroll.append($('<div class="jita-menu-status" style="margin-top:12px;"></div>')
-                        .text('The full leaderboard is visible to leads only.' + (info.rank != null ? (' You are ranked #' + info.rank + ' of ' + info.total + '.') : '')));
-                }
+                // Full leaderboard is visible to everyone now (no lead gate).
+                $scroll.append($('<div class="jita-cred-sub">Leaderboard</div>'));
+                $scroll.append(table(fullRes, d));
                 $scroll.append($('<div class="jita-menu-status" style="margin-top:12px;color:#7a8694;"></div>')
                     .text('Leaderboard computed ' + String(fullRes.computedAt || '').replace('T', ' ').slice(0, 16) + ' - ' + d.total + ' members. Your own total updates every ~2 min.'));
             });
@@ -8593,7 +8606,7 @@ JiTA.credits = {
             var ym = JiTA.credits._ymNow().ym;
             JiTA.credits.getSelf(ym).then(function (self) {
                 if (self && self.credits != null) {
-                    el.textContent = '📊 ' + self.credits + ' cr' + (self.rank != null ? (' · #' + self.rank + '/' + self.total) : '');
+                    el.textContent = '📊 ' + self.credits + ' Credits' + (self.rank != null ? (' · #' + self.rank + '/' + self.total) : '');
                     return;
                 }
                 // fallback: derive from the full-leaderboard cache until the first self compute lands
@@ -8601,7 +8614,7 @@ JiTA.credits = {
                     if (!res) { el.textContent = '📊 credits: —'; return; }
                     JiTA.link.currentUser().then(function (me) {
                         var d = JiTA.credits._derive(res, me);
-                        el.textContent = d.myRow ? ('📊 ' + d.myRow[8] + ' cr · #' + d.myRank + '/' + d.total) : '📊 credits: n/a';
+                        el.textContent = d.myRow ? ('📊 ' + d.myRow[8] + ' Credits · #' + d.myRank + '/' + d.total) : '📊 credits: n/a';
                     });
                 }).catch(function () { /* ignore */ });
             }).catch(function () { /* ignore */ });
@@ -8683,6 +8696,900 @@ JiTA.credits = {
 };
 
 
+// The dedicated ranking worker's BODY, written as a real function so node --check validates it and it stays
+// readable as it grows. It is serialized via toString() and blobbed into the worker, so it must be fully
+// self-contained (NO closures over page scope) - all config arrives through `cfg`. Uses dynamic import() so it
+// runs as-is in the worker. Never called in the page (references self/indexedDB/import only when run as a worker).
+function jitaWorkerBody(cfg) {
+    var pipe = null, backend = 'none', db = null, vecCache = null, kwCache = null, logsigCache = null, BATCH = 8, embedding = false;
+    var LG_MIN = 2, LG_CRASH = 2;   // logsig: min stack frames to trust a signature; innermost frames for the crash-site sig
+    var K1 = 1.5, B = 0.75, STOP = {};
+    ('the a an and or of to in for on with is are was were be been it this that these those as at by from we you they i he she his her its their our your not no but if then than so such can will would should could may might do does did has have had into over under out up down off about your yours').split(' ').forEach(function (w) { STOP[w] = true; });
+    function tokenize(text) {
+        var raw = (text || '').toLowerCase().replace(/[^a-z0-9\s]+/g, ' ').split(/\s+/), out = [];
+        for (var i = 0; i < raw.length; i++) { var t = raw[i]; if (t.length >= 2 && !STOP[t]) { out.push(t); } }
+        return out;
+    }
+    // BM25 over a { N, avgdl, df, docs } index. Applies only the excludeKey + filter-box gates (hidden / session
+    // filters stay in the tab); a filter-box match with no query-term overlap is kept as a score-0 candidate.
+    function bm25Score(idx, text, excludeKey, limit, filterTerms) {
+        if (!idx || !idx.N) { return []; }
+        var q = tokenize(text), qSet = {}, i;
+        for (i = 0; i < q.length; i++) { qSet[q[i]] = true; }
+        var terms = Object.keys(qSet);
+        if (!terms.length) { return []; }
+        var avgdl = idx.avgdl || 1, idf = {}, hasTerms = filterTerms && filterTerms.length;
+        for (i = 0; i < terms.length; i++) { var n = idx.df[terms[i]] || 0; idf[terms[i]] = Math.log(1 + (idx.N - n + 0.5) / (n + 0.5)); }
+        var scored = [];
+        for (var d = 0; d < idx.docs.length; d++) {
+            var doc = idx.docs[d];
+            if (excludeKey && doc.key === excludeKey) { continue; }
+            if (hasTerms && !matchTerms(doc.hay, filterTerms)) { continue; }
+            var score = 0;
+            for (var t = 0; t < terms.length; t++) { var tf = doc.tf[terms[t]]; if (!tf) { continue; } var denom = tf + K1 * (1 - B + B * (doc.len / avgdl)); score += idf[terms[t]] * (tf * (K1 + 1)) / denom; }
+            if (score > 0 || hasTerms) { scored.push({ key: doc.key, project: doc.project, summary: doc.summary, status: doc.status, resolution: doc.resolution, resolutiondate: doc.resolutiondate, created: doc.created, team: doc.team, score: score }); }
+        }
+        scored.sort(function (a, b) { return b.score - a.score; });
+        return scored.slice(0, limit || 50);
+    }
+
+    // ---- logsig: exception-signature mining + queries (ported from JiTA.logsig so tabs hold no logsig index) --
+    function lgSplit(text) {
+        var blocks = [], re = /EXCEPTION #[\s\S]*?(?=EXCEPTION #|$)/gi, m;
+        while ((m = re.exec(text))) { blocks.push(m[0]); if (re.lastIndex === m.index) { re.lastIndex++; } }
+        return blocks.length ? blocks : [text || ''];
+    }
+    function lgFp(text) {
+        text = (text || '').replace(/^[ \t]*\d{1,2}:\d{2}:\d{2}\t[^\t\n]*\t[^\t\n]*\t/gm, '');
+        var msg = '', mm = /Formatted exception info\s*:?\s*([\s\S]*?)(?:\bCommon path prefix\b|\bCaught at\b|\bThrown at\b|\bReported from\b|\bThread Locals\b|\bStackhash\b|\bEXCEPTION END\b|$)/i.exec(text);
+        if (mm) { msg = (mm[1] || '').replace(/\s+/g, ' ').trim(); }
+        var frames = [], fre = /([A-Za-z0-9_.\/\\-]+\.py)\((\d+)\)\s+([A-Za-z0-9_<>]+)/g, fm;
+        while ((fm = fre.exec(text))) { frames.push(fm[1].replace(/^.*[\/\\]/, '') + ':' + fm[3]); }
+        var nmsg = msg.replace(/0x[0-9a-fA-F]+/g, '0x#').replace(/\b\d+L\b/g, '#').replace(/([(\[{,]\s*)\d+/g, '$1#').replace(/\d+(\s*[)\]},])/g, '#$1').replace(/\b\d{4,}\b/g, '#');
+        var sig = frames.length >= LG_MIN ? (nmsg + '|' + frames.join('>')).toLowerCase() : null;
+        var crashSig = frames.length >= LG_MIN ? (nmsg + '|' + frames.slice(-LG_CRASH).join('>')).toLowerCase() : null;
+        return { sig: sig, crashSig: crashSig, msg: msg };
+    }
+    function lgSiblings(key) {
+        var idx = logsigCache; if (!idx) { return []; }
+        var out = [], seen = {}; seen[key] = true;
+        var sigs = idx.keyToSigs[key] || [];
+        for (var s = 0; s < sigs.length; s++) { var c = idx.sigMap[sigs[s]]; if (!c) { continue; } for (var m = 0; m < c.members.length; m++) { var mem = c.members[m]; if (seen[mem.key]) { continue; } seen[mem.key] = true; out.push(mem); } }
+        return out;
+    }
+    function lgRelated(key) {
+        var idx = logsigCache; if (!idx) { return []; }
+        var exclude = {}; exclude[key] = true;
+        var sigs = idx.keyToSigs[key] || [];
+        for (var s = 0; s < sigs.length; s++) { var sc = idx.sigMap[sigs[s]]; if (sc) { for (var e = 0; e < sc.members.length; e++) { exclude[sc.members[e].key] = true; } } }
+        var out = [], seen = {}, csigs = idx.keyToCrash[key] || [];
+        for (var c = 0; c < csigs.length; c++) { var cc = idx.crashMap[csigs[c]]; if (!cc) { continue; } for (var m = 0; m < cc.members.length; m++) { var mem = cc.members[m]; if (exclude[mem.key] || seen[mem.key]) { continue; } seen[mem.key] = true; out.push(mem); } }
+        return out;
+    }
+    function lgClusters() {
+        var idx = logsigCache; if (!idx) { return []; }
+        function newest(members) { var n = ''; for (var i = 0; i < members.length; i++) { if (members[i].created && members[i].created > n) { n = members[i].created; } } return n; }
+        var out = [];
+        Object.keys(idx.sigMap).forEach(function (sig) { var c = idx.sigMap[sig]; if (c.members.length >= 2) { out.push({ sig: sig, label: c.label, members: c.members, newest: newest(c.members) }); } });
+        out.sort(function (a, b) { if (a.newest !== b.newest) { return a.newest < b.newest ? 1 : -1; } return b.members.length - a.members.length || (a.label < b.label ? -1 : 1); });
+        return out;
+    }
+    function lgMatch(text) {
+        var idx = logsigCache, found = {}; if (!idx || !text) { return found; }
+        var lines = text.replace(/\r/g, '').split('\n'), messages = [];
+        for (var li = 0; li < lines.length; li++) { var parts = lines[li].split('\t'); messages.push(parts.length >= 4 ? parts.slice(3).join('\t') : lines[li]); }
+        function tally(blockText) {
+            var fp = lgFp(blockText);
+            var defect = (fp.sig && idx.sigMap[fp.sig]) ? idx.sigMap[fp.sig].members[0].key : null, loose = false;
+            if (!defect && fp.crashSig && idx.crashMap[fp.crashSig]) { defect = idx.crashMap[fp.crashSig].members[0].key; loose = true; }
+            if (!defect) { return; }
+            if (!found[defect]) { found[defect] = { defect: defect, count: 0, msg: fp.msg || '', loose: loose }; }
+            found[defect].count++; if (!loose) { found[defect].loose = false; } if (!found[defect].msg && fp.msg) { found[defect].msg = fp.msg; }
+        }
+        var i = 0;
+        while (i < messages.length) {
+            if (messages[i].indexOf('EXCEPTION #') === -1) { i++; continue; }
+            var blockText = messages[i], j = i + 1;
+            for (; j < messages.length; j++) { if (messages[j].indexOf('EXCEPTION #') !== -1) { break; } blockText += '\n' + messages[j]; if (messages[j].indexOf('EXCEPTION END') !== -1) { j++; break; } }
+            tally(blockText); i = j;
+        }
+        return found;
+    }
+
+    async function loadModel() {
+        if (pipe) { return pipe; }
+        var mod = await import(cfg.LIB);
+        mod.env.allowLocalModels = false;
+        mod.env.useBrowserCache = true;                                   // cache weights in CacheStorage after first download
+        try { mod.env.backends.onnx.wasm.proxy = true; } catch (e) { /* older builds */ }
+        var attempts = cfg.tryGpu ? [{ device: 'webgpu', dtype: 'fp32' }, { device: 'wasm', dtype: 'q8' }] : [{ device: 'wasm', dtype: 'q8' }];
+        var lastErr;
+        for (var i = 0; i < attempts.length; i++) {
+            try {
+                pipe = await mod.pipeline('feature-extraction', cfg.MODEL, attempts[i]);
+                backend = attempts[i].device + '/' + attempts[i].dtype;
+                BATCH = attempts[i].device === 'webgpu' ? 8 : 1;          // fp32 GPU batches; WASM one-at-a-time (batched hangs)
+                return pipe;
+            } catch (e) { lastErr = e; }
+        }
+        throw lastErr || new Error('no backend loaded');
+    }
+    async function embed(text) {
+        var p = await loadModel();
+        var out = await p(text || '', { pooling: 'mean', normalize: true });
+        return out.data;   // normalized Float32Array(384)
+    }
+    var qText = null, qVec = null;
+    async function qEmbed(text) {   // cache the last query vector so filter-box re-queries don't re-embed the same text
+        if (qText === text && qVec) { return qVec; }
+        qVec = await embed(text); qText = text; return qVec;
+    }
+    function matchTerms(hay, terms) { for (var i = 0; i < terms.length; i++) { if (hay.indexOf(terms[i]) === -1) { return false; } } return true; }
+
+    // ---- embed pass (runs HERE now, so no tab ever loads a model) --------------------------------------
+    async function embedBatch(texts) {
+        var p = await loadModel();
+        var inputs = texts.map(function (t) { return (t || ' ').slice(0, cfg.MAX_CHARS) || ' '; });
+        if (inputs.length === 1) { var o1 = await p(inputs[0], { pooling: 'mean', normalize: true }); return [new Float32Array(o1.data)]; }
+        var out = await p(inputs, { pooling: 'mean', normalize: true });
+        var dim = out.dims[out.dims.length - 1], vecs = [];
+        for (var i = 0; i < inputs.length; i++) { vecs.push(new Float32Array(out.data.subarray(i * dim, (i + 1) * dim))); }
+        return vecs;
+    }
+    // Ported verbatim from JiTA.util so the worker prepares the same embedding text the tab used to.
+    function cleanForCompare(summary, description) {
+        var s = (summary || '').replace(/\s+/g, ' ').trim();
+        var d = ' ' + (description || '') + ' ';
+        d = d.replace(/<url=[^>]*>/gi, ' ').replace(/<\/url>/gi, ' ');
+        d = d.replace(/Session Info\s*:[\s\S]*?(?=Reproduction Steps|Computer Info|$)/i, ' ');
+        d = d.replace(/Computer Info[\s\S]*$/i, ' ');
+        d = d.replace(/\b(Reproduction Steps|Description)\b\s*:?/ig, ' ');
+        d = d.replace(/\bNone\b/g, ' ');
+        d = d.replace(/\s+/g, ' ').trim();
+        return (s ? (s + '. ' + s + '. ') : '') + d;
+    }
+    function isClosedStatus(status) { return /closed|done|resolved|rejected|cancel|attached/i.test(status || ''); }
+    function teamId(v) { if (v == null) { return ''; } if (typeof v === 'string' || typeof v === 'number') { return String(v); } if (typeof v === 'object') { return String(v.id || v.value || v.teamId || v.name || ''); } return ''; }
+    function isGmTeam(v) { var id = teamId(v); if (!id) { return false; } var short = String(cfg.GM_TEAM_ID).split('-').pop(); return id === cfg.GM_TEAM_ID || id === short || id.split('-').pop() === short; }
+    function bulkPut(records) {
+        return openDb().then(function (d) {
+            return new Promise(function (resolve, reject) {
+                var tx = d.transaction('defects', 'readwrite'), store = tx.objectStore('defects');
+                for (var i = 0; i < records.length; i++) { store.put(records[i]); }
+                tx.oncomplete = function () { resolve(records.length); };
+                tx.onerror = function () { reject(tx.error); };
+            });
+        });
+    }
+    // Embed every stored record lacking a current-version embedding (defects + open non-GM EBRs), in batches,
+    // writing as we go. Single-flight; resumable. On a bad/NaN batch, reset the model and retry a few times.
+    async function embedPass() {
+        if (embedding) { return { embedded: 0, busy: true }; }
+        embedding = true;
+        try {
+            await loadModel();
+            var recs = await allRecords();
+            var todo = [];
+            for (var i = 0; i < recs.length; i++) {
+                var r = recs[i];
+                if (r.project === 'EBR' && (isClosedStatus(r.status) || isGmTeam(r.team))) { continue; }   // not ranked -> don't embed
+                if (r.embedding && r.embeddingModelVersion === cfg.MODEL_VERSION) { continue; }
+                todo.push(r);
+            }
+            if (!todo.length) { return { embedded: 0 }; }
+            var idx = 0, retries = 0;
+            while (idx < todo.length) {
+                var slice = todo.slice(idx, idx + BATCH);
+                var texts = slice.map(function (x) { return cleanForCompare(x.summary, x.description); });
+                try {
+                    var vecs = await Promise.race([
+                        embedBatch(texts),
+                        new Promise(function (_r, rej) { setTimeout(function () { rej(new Error('embed batch timeout')); }, 45000); })   // watchdog: a hung GPU batch
+                    ]);
+                    var bad = false;
+                    for (var g = 0; g < vecs.length; g++) { if (!vecs[g] || !vecs[g].length || !isFinite(vecs[g][0])) { bad = true; break; } }
+                    if (bad) { throw new Error('NaN/empty embedding (likely GPU device loss)'); }
+                    for (var j = 0; j < slice.length; j++) { slice[j].embedding = vecs[j]; slice[j].embeddingModelVersion = cfg.MODEL_VERSION; }
+                    await bulkPut(slice);
+                    idx += slice.length; retries = 0;
+                } catch (e) {
+                    pipe = null;                                  // drop the (possibly dead) pipeline and rebuild
+                    if (++retries > 3) { throw e; }
+                    await new Promise(function (r) { setTimeout(r, 1500); });
+                }
+            }
+            vecCache = null; kwCache = null; logsigCache = null;   // new vectors/text -> rebuild all indexes on the next query
+            return { embedded: todo.length };
+        } finally { embedding = false; }
+    }
+    function openDb() {
+        if (db) { return Promise.resolve(db); }
+        return new Promise(function (resolve, reject) {
+            var req = indexedDB.open(cfg.DB_NAME, cfg.DB_VERSION);   // pristine in a worker (no consent-gate wrapper)
+            req.onsuccess = function () { db = req.result; resolve(db); };
+            req.onerror = function () { reject(req.error); };
+        });
+    }
+    function allRecords() {
+        return openDb().then(function (d) {
+            if (!d.objectStoreNames.contains('defects')) { return []; }   // tab hasn't created the store yet
+            return new Promise(function (resolve, reject) {
+                var r = d.transaction('defects', 'readonly').objectStore('defects').getAll();
+                r.onsuccess = function () { resolve(r.result || []); };
+                r.onerror = function () { reject(r.error); };
+            });
+        });
+    }
+    // Build BOTH in-worker indexes in a single DB read (held ONCE for all tabs): the vector index (records
+    // embedded at the current model version) and the BM25 keyword index, each split defects vs open non-GM EBRs.
+    async function ensureIndexes() {
+        if (vecCache && kwCache && logsigCache) { return; }
+        var recs = await allRecords();
+        var vD = [], vE = [], kD = [], kE = [], dfD = {}, dfE = {}, lenD = 0, lenE = 0;
+        var sigMap = {}, keyToSigs = {}, crashMap = {}, keyToCrash = {};   // logsig
+        for (var i = 0; i < recs.length; i++) {
+            var r = recs[i], isEbr = r.project === 'EBR';
+            if (isEbr && (isClosedStatus(r.status) || isGmTeam(r.team))) { continue; }   // not ranked in the reports view
+            var hay = ((r.key || '') + ' ' + (r.summary || '') + ' ' + (r.description || '')).toLowerCase();
+            var meta = { key: r.key, project: r.project, summary: r.summary, status: r.status, resolution: r.resolution, resolutiondate: r.resolutiondate, created: r.created, team: r.team };
+            if (r.embedding && r.embeddingModelVersion === cfg.MODEL_VERSION) {
+                var ve = { key: meta.key, project: meta.project, summary: meta.summary, status: meta.status, resolution: meta.resolution, resolutiondate: meta.resolutiondate, created: meta.created, team: meta.team, vec: r.embedding, hay: hay };
+                (isEbr ? vE : vD).push(ve);
+            }
+            var toks = tokenize(cleanForCompare(r.summary, r.description)), tf = {}, seen = {}, df = isEbr ? dfE : dfD;
+            for (var j = 0; j < toks.length; j++) { var tk = toks[j]; tf[tk] = (tf[tk] || 0) + 1; if (!seen[tk]) { df[tk] = (df[tk] || 0) + 1; seen[tk] = true; } }
+            var kd = { key: meta.key, project: meta.project, summary: meta.summary, status: meta.status, resolution: meta.resolution, resolutiondate: meta.resolutiondate, created: meta.created, team: meta.team, tf: tf, len: toks.length, hay: hay };
+            if (isEbr) { kE.push(kd); lenE += toks.length; } else { kD.push(kd); lenD += toks.length; }
+            // logsig: mine exception signatures from DEFECT descriptions only
+            if (!isEbr && r.description && r.description.indexOf('EXCEPTION #') !== -1) {
+                var lmember = { key: r.key, status: r.status || '', resolution: r.resolution || null, resolutiondate: r.resolutiondate || null, created: r.created || null };
+                var blocks = lgSplit(r.description);
+                for (var b = 0; b < blocks.length; b++) {
+                    var fp = lgFp(blocks[b]);
+                    if (!fp.sig) { continue; }
+                    var csm = sigMap[fp.sig]; if (!csm) { csm = sigMap[fp.sig] = { sig: fp.sig, label: fp.msg || '', members: [] }; }
+                    if (!csm.label && fp.msg) { csm.label = fp.msg; }
+                    if (!keyToSigs[r.key]) { keyToSigs[r.key] = []; }
+                    if (keyToSigs[r.key].indexOf(fp.sig) === -1) { keyToSigs[r.key].push(fp.sig); csm.members.push(lmember); }
+                    if (fp.crashSig) {
+                        var ccm = crashMap[fp.crashSig]; if (!ccm) { ccm = crashMap[fp.crashSig] = { crashSig: fp.crashSig, label: fp.msg || '', members: [] }; }
+                        if (!ccm.label && fp.msg) { ccm.label = fp.msg; }
+                        if (!keyToCrash[r.key]) { keyToCrash[r.key] = []; }
+                        if (keyToCrash[r.key].indexOf(fp.crashSig) === -1) { keyToCrash[r.key].push(fp.crashSig); ccm.members.push(lmember); }
+                    }
+                }
+            }
+        }
+        vecCache = { defects: vD, ebr: vE };
+        kwCache = {
+            defects: { N: kD.length, avgdl: kD.length ? lenD / kD.length : 0, df: dfD, docs: kD },
+            ebr: { N: kE.length, avgdl: kE.length ? lenE / kE.length : 0, df: dfE, docs: kE }
+        };
+        function lgSort(a, b) { var ac = a.created || '', bc = b.created || ''; if (ac !== bc) { return ac < bc ? 1 : -1; } return a.key < b.key ? -1 : 1; }
+        Object.keys(sigMap).forEach(function (s) { sigMap[s].members.sort(lgSort); });
+        Object.keys(crashMap).forEach(function (s) { crashMap[s].members.sort(lgSort); });
+        logsigCache = { sigMap: sigMap, keyToSigs: keyToSigs, crashMap: crashMap, keyToCrash: keyToCrash };
+    }
+    // Cosine == dot product (both vectors are normalized). Return the top-N by score.
+    function cosineTopN(q, entries, topN, excludeKey, filterTerms) {
+        var hasTerms = filterTerms && filterTerms.length;
+        var scored = [];
+        for (var i = 0; i < entries.length; i++) {
+            var e = entries[i];
+            if (excludeKey && e.key === excludeKey) { continue; }
+            if (hasTerms && !matchTerms(e.hay, filterTerms)) { continue; }   // filter-box narrowing (session/UI gates stay in the tab)
+            var v = e.vec, s = 0, n = q.length;
+            for (var j = 0; j < n; j++) { s += q[j] * v[j]; }
+            scored.push({ key: e.key, project: e.project, summary: e.summary, status: e.status, resolution: e.resolution, resolutiondate: e.resolutiondate, created: e.created, team: e.team, score: s });
+        }
+        scored.sort(function (a, b) { return b.score - a.score; });
+        return scored.slice(0, topN || 10);
+    }
+    async function rankSemantic(payload) {
+        payload = payload || {};
+        await ensureIndexes();
+        var entries = payload.scope === 'ebr' ? vecCache.ebr : vecCache.defects;
+        var q = await qEmbed(payload.text || '');
+        return { backend: backend, indexed: entries.length, results: cosineTopN(q, entries, payload.topN || 10, payload.excludeKey, payload.filterTerms) };
+    }
+    async function rankKeyword(payload) {
+        payload = payload || {};
+        await ensureIndexes();
+        var idx = payload.scope === 'ebr' ? kwCache.ebr : kwCache.defects;
+        return { indexed: idx.N, results: bm25Score(idx, payload.text || '', payload.excludeKey, payload.topN || 200, payload.filterTerms) };
+    }
+
+    // ---- ISD credits: the monthly leaderboard crawl runs HERE now, so its fetches + politeness sleeps live off
+    // the tab's main thread and can't be background-timer-throttled when the tab is unfocused. This mirrors
+    // JiTA.credits._computeMonthLocal (the tab keeps that copy as the fallback). Same-origin fetch carries the
+    // session cookie; progress is streamed back as throttled 'creditsProgress' events tagged to the requesting tab.
+    var crc = cfg.credits || {};
+    var crActiveTags = [], crLastTick = 0;   // progress tags of the crawl currently executing (serialized: one crawl at a time)
+    var crLast = null;                       // { key, tags, promise } : the most recent crawl (running or queued), for coalescing
+    function crProgress(msg) { if (crActiveTags.length) { try { self.postMessage({ event: 'creditsProgress', tags: crActiveTags, msg: msg }); } catch (e) { /* ignore */ } } }
+    function crTick(i, total, msg) { var now = Date.now(); if (i === 0 || i + 1 === total || now - crLastTick > 400) { crLastTick = now; crProgress(msg); } }   // throttle per-item ticks so we don't flood the channel
+    function crSleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+    // Session-authenticated GET (retries mirror the tab's _get: 429 + 5xx, honoring Retry-After).
+    function crGet(path) {
+        return new Promise(function (resolve, reject) {
+            (function attempt(retries) {
+                fetch(cfg.HOST + path, { credentials: 'same-origin', headers: { 'Accept': 'application/json' } }).then(function (resp) {
+                    if ((resp.status === 429 || resp.status >= 500) && retries > 0) {
+                        var ra = parseInt(resp.headers.get('Retry-After'), 10);
+                        setTimeout(function () { attempt(retries - 1); }, (isNaN(ra) ? 3 : ra) * 1000); return;
+                    }
+                    if (!resp.ok) { reject(new Error('GET ' + path + ' -> HTTP ' + resp.status)); return; }
+                    resp.json().then(resolve, function () { reject(new Error('GET ' + path + ' -> non-JSON (HTTP ' + resp.status + ', ' + (resp.headers.get('content-type') || '?') + '); likely an unauthenticated response')); });
+                }, reject);
+            })(cfg.MAX_RETRIES);
+        });
+    }
+    // One page of /search/jql (retries mirror the tab's _apiPost: 429 only). Resolves the parsed response body.
+    function crSearch(jql, fields, token) {
+        var body = { jql: jql, fields: fields, maxResults: crc.PAGE_SIZE };
+        if (token) { body.nextPageToken = token; }
+        return new Promise(function (resolve, reject) {
+            (function attempt(retries) {
+                fetch(cfg.HOST + '/rest/api/3/search/jql', {
+                    method: 'POST', credentials: 'same-origin',
+                    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'X-Atlassian-Token': 'no-check' },
+                    body: JSON.stringify(body)
+                }).then(function (resp) {
+                    if (resp.status === 429 && retries > 0) {
+                        var ra = parseInt(resp.headers.get('Retry-After'), 10);
+                        setTimeout(function () { attempt(retries - 1); }, (isNaN(ra) ? 5 : ra) * 1000); return;
+                    }
+                    if (!resp.ok) { reject(new Error('search/jql -> HTTP ' + resp.status)); return; }
+                    resp.json().then(resolve, function () { reject(new Error('search/jql -> non-JSON (HTTP ' + resp.status + ', ' + (resp.headers.get('content-type') || '?') + '); likely an unauthenticated response')); });
+                }, reject);
+            })(cfg.MAX_RETRIES);
+        });
+    }
+    function crAccList(accounts) { return accounts.map(function (a) { return '"' + a + '"'; }).join(', '); }
+    function crSerial(items, fn) {
+        var out = [];
+        return items.reduce(function (p, item, i) { return p.then(function () { return fn(item, i); }).then(function (r) { out.push(r); }); }, Promise.resolve()).then(function () { return out; });
+    }
+    function crFetchIssues(jql, fields) {
+        var out = [];
+        function page(token) {
+            return crSearch(jql, fields, token).then(function (d) {
+                out = out.concat(d.issues || []);
+                var next = d.nextPageToken || null;
+                if (!next || d.isLast) { return out; }
+                return crSleep(cfg.PAGE_DELAY_MS).then(function () { return page(next); });
+            });
+        }
+        return page(null);
+    }
+    function crAllKeys(jql) {
+        return crFetchIssues(jql, ['key']).then(function (issues) { var keys = {}; for (var i = 0; i < issues.length; i++) { keys[issues[i].key] = true; } return keys; });
+    }
+    function crAllHistories(key) {
+        var out = [];
+        function page(start) {
+            return crGet('/rest/api/3/issue/' + key + '/changelog?startAt=' + start + '&maxResults=100').then(function (res) {
+                var vals = res.values || [];
+                out = out.concat(vals);
+                if (start + vals.length >= (res.total || 0) || !vals.length) { out.sort(function (a, b) { return (a.created || '') < (b.created || '') ? -1 : 1; }); return out; }
+                return page(start + vals.length);
+            });
+        }
+        return page(0);
+    }
+    function crGroupMembers(group) {
+        group = group || crc.GROUP;
+        var out = [];
+        function page(param, start) {
+            return crGet('/rest/api/3/group/member?' + param + '&includeInactiveUsers=true&startAt=' + start + '&maxResults=50').then(function (res) {
+                var vals = res.values || [];
+                out = out.concat(vals);
+                if (res.isLast || !vals.length) { return out; }
+                return page(param, start + vals.length);
+            });
+        }
+        return page('groupname=' + encodeURIComponent(group), 0).catch(function () {
+            return crGet('/rest/api/3/groups/picker?query=' + encodeURIComponent(group)).then(function (res) {
+                var gid = null, gs = (res && res.groups) || [];
+                for (var i = 0; i < gs.length; i++) { if ((gs[i].name || '').toLowerCase() === group.toLowerCase()) { gid = gs[i].groupId; } }
+                if (!gid) { throw new Error('group not found: ' + group); }
+                out = [];
+                return page('groupId=' + encodeURIComponent(gid), 0);
+            });
+        });
+    }
+    function crHandles(member) {
+        var out = [], seen = {};
+        var email = member.emailAddress || '';
+        if (email.indexOf('@') > 0) { out.push(email.split('@')[0]); }
+        var dn = (member.displayName || '').replace(/^\s+|\s+$/g, '');
+        var norm = /^isd /i.test(dn) ? dn.slice(4) : dn;
+        out.push(norm.replace(/ /g, '').toLowerCase());
+        out.push(norm.split(' ')[0].toLowerCase());
+        var uniq = [];
+        for (var i = 0; i < out.length; i++) { var h = out[i]; if (h && !seen[h]) { seen[h] = true; uniq.push(h); } }
+        return uniq;
+    }
+    function crReporterAccount(value) {
+        return crSearch('reporter = "' + value + '"', ['reporter'], null).then(function (d) {
+            var issues = d.issues || [];
+            if (!issues.length) { return ''; }
+            return ((issues[0].fields || {}).reporter || {}).accountId || '';
+        }, function () { return null; });
+    }
+    function crResolveOldReporters(members) {
+        var claimed = {}, oldIds = {}, oldNames = {};
+        return crSerial(members, function (m, i) {
+            crTick(i, members.length, 'resolving members: ' + (i + 1) + '/' + members.length);
+            var dn = m.displayName || m.accountId;
+            var cands = crHandles(m).map(function (h) { return h + '@' + crc.OLD_DOMAIN; });
+            return crSerial(cands, function (cand) {
+                if (claimed[cand]) { return null; }
+                return crReporterAccount(cand).then(function (aid) { return aid === null ? null : { cand: cand, aid: aid }; });
+            }).then(function (results) {
+                for (var k = 0; k < results.length; k++) {
+                    var hit = results[k];
+                    if (hit) { claimed[hit.cand] = true; if (hit.aid) { oldIds[hit.aid] = true; oldNames[hit.aid] = dn; } break; }
+                }
+            });
+        }).then(function () { return { oldIds: oldIds, oldNames: oldNames }; });
+    }
+    function crMonthBounds(y, m) {
+        var ny = m === 12 ? y + 1 : y, nm = m === 12 ? 1 : m + 1;
+        var p2 = function (n) { return (n < 10 ? '0' : '') + n; };
+        return { start: y + '-' + p2(m) + '-01', end: ny + '-' + p2(nm) + '-01' };
+    }
+    function crCreditFormula(r) {
+        var filtered = r.attached + r.trashed;
+        var c = 0.3 * Math.min(100, filtered) + 0.1 * Math.max(0, filtered - 100);
+        c += 0.1 * r.reassigned + r.created + r.resolved;
+        return Math.round(c * 10) / 10;
+    }
+    function crDefectsCreated(accounts, b, acctToName, rows) {
+        var jql = 'project in (' + crc.PROJECTS + ') AND issuetype = Defect ' +
+            'AND reporter in (' + crAccList(accounts) + ') ' +
+            'AND created >= "' + b.start + '" AND created < "' + b.end + '" ' +
+            'AND (resolution is EMPTY OR resolution != Duplicate)';
+        return crFetchIssues(jql, ['reporter', 'project']).then(function (issues) {
+            for (var i = 0; i < issues.length; i++) { var name = acctToName[((issues[i].fields || {}).reporter || {}).accountId]; if (name) { rows[name].created++; } }
+        });
+    }
+    function crDefectsResolved(accounts, b, acctToName, rows) {
+        var jql = 'project in (' + crc.PROJECTS + ') AND issuetype = Defect ' +
+            'AND reporter in (' + crAccList(accounts) + ') ' +
+            'AND resolution in (' + crc.RESOLUTIONS + ') ' +
+            'AND resolved >= "' + b.start + '" AND resolved < "' + b.end + '"';
+        return crFetchIssues(jql, ['reporter', 'project', 'issuelinks']).then(function (issues) {
+            var present = {}, meta = {};
+            for (var i = 0; i < issues.length; i++) { present[issues[i].key] = true; meta[issues[i].key] = issues[i]; }
+            var parent = {};
+            function find(x) { if (parent[x] === undefined) { parent[x] = x; } while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; }
+            function union(a, c) { var ra = find(a), rb = find(c); if (ra !== rb) { parent[ra] = rb; } }
+            for (var k in present) { if (present.hasOwnProperty(k)) { find(k); } }
+            for (var j = 0; j < issues.length; j++) {
+                var links = (issues[j].fields || {}).issuelinks || [];
+                for (var l = 0; l < links.length; l++) {
+                    if (!crc.DEDUP_LINK_TYPES[(links[l].type || {}).name]) { continue; }
+                    var other = links[l].inwardIssue || links[l].outwardIssue;
+                    if (other && present[other.key]) { union(issues[j].key, other.key); }
+                }
+            }
+            function rank(key) { var pk = (meta[key].fields.project || {}).key; var pr = crc.PROJECT_RANK[pk]; return (pr === undefined ? 99 : pr); }
+            var comps = {};
+            for (var kk in present) { if (present.hasOwnProperty(kk)) { var root = find(kk); (comps[root] = comps[root] || []).push(kk); } }
+            for (var root2 in comps) {
+                if (!comps.hasOwnProperty(root2)) { continue; }
+                var keep = comps[root2][0];
+                for (var q = 1; q < comps[root2].length; q++) {
+                    var cand = comps[root2][q];
+                    if (rank(cand) < rank(keep) || (rank(cand) === rank(keep) && cand < keep)) { keep = cand; }
+                }
+                var name = acctToName[((meta[keep].fields || {}).reporter || {}).accountId];
+                if (name) { rows[name].resolved++; }
+            }
+        });
+    }
+    function crIsAutomation(author) {
+        if (!author) { return false; }
+        if (crc.AUTOMATION_ID && author.accountId === crc.AUTOMATION_ID) { return true; }
+        if ((author.emailAddress || '').toLowerCase() === crc.AUTOMATION_EMAIL.toLowerCase()) { return true; }
+        return (author.displayName || '').toLowerCase().indexOf('automation for jira') !== -1;
+    }
+    function crAssigneeAt(histories, ts) {
+        var who = null;
+        for (var i = 0; i < histories.length; i++) {
+            if ((histories[i].created || '') > ts) { break; }
+            var items = histories[i].items || [];
+            for (var j = 0; j < items.length; j++) { if (items[j].field === 'assignee') { who = items[j].to; } }
+        }
+        return who;
+    }
+    function crEffectiveActioner(histories, targetStatus, b) {
+        var last = null;
+        for (var i = 0; i < histories.length; i++) {
+            var items = histories[i].items || [];
+            for (var j = 0; j < items.length; j++) {
+                if (items[j].field !== 'status') { continue; }
+                last = items[j].toString === targetStatus ? histories[i] : null;
+            }
+        }
+        if (!last) { return null; }
+        var created = last.created || '';
+        if (!(b.start <= created.slice(0, 10) && created.slice(0, 10) < b.end)) { return null; }
+        var author = last.author || {};
+        return crIsAutomation(author) ? crAssigneeAt(histories, created) : author.accountId;
+    }
+    function crReportsActioned(memberAccounts, b, rows, acctToName) {
+        var names = Object.keys(memberAccounts).sort();
+        var win = 'DURING ("' + b.start + '", "' + b.end + '")';
+        var movedOut = {};
+        return crAllKeys('project = ' + crc.EBR + ' AND status CHANGED FROM "' + crc.ATTACHED_STATUS + '" ' + win).then(function (a) {
+            return crAllKeys('project = ' + crc.EBR + ' AND status CHANGED FROM "' + crc.CLOSED_STATUS + '" ' + win).then(function (c) {
+                var k; for (k in a) { if (a.hasOwnProperty(k)) { movedOut[k] = true; } }
+                for (k in c) { if (c.hasOwnProperty(k)) { movedOut[k] = true; } }
+            });
+        }).then(function () {
+            return crSerial(names, function (name, i) {
+                crTick(i, names.length, 'reports: member ' + (i + 1) + '/' + names.length + '  (' + name + ')');
+                var accs = memberAccounts[name];
+                var att = {}, clo = {}, queries = [];
+                for (var qi = 0; qi < accs.length; qi++) {
+                    queries.push({ tgt: att, jql: 'project = ' + crc.EBR + ' AND status CHANGED TO "' + crc.ATTACHED_STATUS + '" BY "' + accs[qi] + '" ' + win });
+                    queries.push({ tgt: clo, jql: 'project = ' + crc.EBR + ' AND status CHANGED TO "' + crc.CLOSED_STATUS + '" BY "' + accs[qi] + '" ' + win });
+                }
+                if (crc.AUTOMATION_ID) {
+                    var who = 'assignee in (' + crAccList(accs) + ')';
+                    queries.push({ tgt: att, jql: 'project = ' + crc.EBR + ' AND status CHANGED TO "' + crc.ATTACHED_STATUS + '" BY "' + crc.AUTOMATION_ID + '" ' + win + ' AND ' + who });
+                    queries.push({ tgt: clo, jql: 'project = ' + crc.EBR + ' AND status CHANGED TO "' + crc.CLOSED_STATUS + '" BY "' + crc.AUTOMATION_ID + '" ' + win + ' AND ' + who });
+                }
+                return crSerial(queries, function (qq) {
+                    return crAllKeys(qq.jql).then(function (keys) { for (var kk in keys) { if (keys.hasOwnProperty(kk)) { qq.tgt[kk] = true; } } });
+                }).then(function () {
+                    var a = 0, cc = 0;
+                    for (var kA in att) { if (att.hasOwnProperty(kA) && !movedOut[kA]) { a++; } }
+                    for (var kC in clo) { if (clo.hasOwnProperty(kC) && !movedOut[kC]) { cc++; } }
+                    rows[name].attached += a;
+                    rows[name].trashed += cc;
+                });
+            });
+        }).then(function () {
+            var movedKeys = Object.keys(movedOut);
+            if (movedKeys.length) { crProgress('resolving ' + movedKeys.length + ' moved-out report(s) via changelog…'); }
+            return crSerial(movedKeys, function (k, i) {
+                crTick(i, movedKeys.length, 'moved-out reports: ' + (i + 1) + '/' + movedKeys.length);
+                return crSleep(crc.CRAWL_DELAY_MS).then(function () { return crAllHistories(k); }).then(function (hist) {
+                    var an = acctToName[crEffectiveActioner(hist, crc.ATTACHED_STATUS, b)];
+                    var cn = acctToName[crEffectiveActioner(hist, crc.CLOSED_STATUS, b)];
+                    if (an) { rows[an].attached += 1; }
+                    if (cn) { rows[cn].trashed += 1; }
+                });
+            });
+        });
+    }
+    function crAutoReassigned(b, acctToName, rows) {
+        var jql = 'project = ' + crc.EBR + ' AND ' + crc.TEAM_JQL + ' = ' + crc.GM_TEAM_ID + ' AND updated >= "' + b.start + '"';
+        return crAllKeys(jql).then(function (keySet) {
+            var keys = Object.keys(keySet);
+            crProgress('reassign: crawling ' + keys.length + ' candidate report(s)…');
+            return crSerial(keys, function (k, i) {
+                crTick(i, keys.length, 'reassign: ' + (i + 1) + '/' + keys.length);
+                return crSleep(crc.CRAWL_DELAY_MS).then(function () {
+                    return crGet('/rest/api/3/issue/' + k + '?expand=changelog&fields=summary');
+                }).then(function (issue) {
+                    var credited = {};
+                    var hist = ((issue.changelog || {}).histories) || [];
+                    for (var h = 0; h < hist.length; h++) {
+                        var created = (hist[h].created || '').slice(0, 10);
+                        if (!(b.start <= created && created < b.end)) { continue; }
+                        var items = hist[h].items || [];
+                        for (var j = 0; j < items.length; j++) {
+                            var it = items[j];
+                            var isTeam = it.fieldId === crc.TEAM_CF || it.field === 'Team';
+                            var isGm = it.to === crc.GM_TEAM_ID || it.to === crc.GM_TEAM_FULL_ID || it.toString === crc.GM_TEAM_NAME;
+                            if (isTeam && isGm) {
+                                var author = (hist[h].author || {}).accountId;
+                                if (author && !credited[author]) {
+                                    credited[author] = true;
+                                    var name = acctToName[author];
+                                    if (name) { rows[name].reassigned += 1; }
+                                }
+                            }
+                        }
+                    }
+                });
+            });
+        }).catch(function (e) {
+            crProgress('reassign crawl skipped (' + ((e && e.message) || e) + ')');
+        });
+    }
+    function crComputeExtra(names, mentor) {
+        var out = {};
+        for (var i = 0; i < names.length; i++) {
+            var n = names[i];
+            var toks = {}; n.toLowerCase().replace(/-/g, ' ').split(/\s+/).forEach(function (t) { if (t) { toks[t] = true; } });
+            var e = 0;
+            for (var lead in crc.LEADS) { if (crc.LEADS.hasOwnProperty(lead) && toks[lead]) { e += crc.LEAD_BONUS; } }
+            if (mentor) { for (var hh in mentor) { if (mentor.hasOwnProperty(hh) && toks[hh]) { e += mentor[hh]; } } }
+            if (e) { out[n] = e; }
+        }
+        return out;
+    }
+    // Full per-member credit table for (y, m). Mirrors JiTA.credits._computeMonthLocal; resolves the same shape.
+    function crComputeMonth(payload) {
+        payload = payload || {};
+        var y = payload.y, m = payload.m, mentor = payload.mentor || null;
+        var b = crMonthBounds(y, m), ym = b.start.slice(0, 7);
+        crProgress(ym + ': resolving group members…');
+        return crGroupMembers().then(function (members) {
+            var active = members.filter(function (x) { return x.active !== false; });
+            return crResolveOldReporters(active).then(function (old) {
+                var acctToName = {}, memberAccounts = {}, nameToAcc = {};
+                active.forEach(function (x) {
+                    acctToName[x.accountId] = x.displayName;
+                    (memberAccounts[x.displayName] = memberAccounts[x.displayName] || []).push(x.accountId);
+                    if (!nameToAcc[x.displayName]) { nameToAcc[x.displayName] = x.accountId; }
+                });
+                for (var oid in old.oldNames) {
+                    if (!old.oldNames.hasOwnProperty(oid)) { continue; }
+                    var nm = old.oldNames[oid];
+                    acctToName[oid] = nm;
+                    (memberAccounts[nm] = memberAccounts[nm] || []).push(oid);
+                }
+                var names = Object.keys(memberAccounts).sort();
+                var rows = {};
+                names.forEach(function (n) { rows[n] = { created: 0, resolved: 0, attached: 0, trashed: 0, reassigned: 0 }; });
+                var allAccounts = Object.keys(acctToName);
+                crProgress(ym + ': ' + names.length + ' members - fetching defects…');
+                return crDefectsCreated(allAccounts, b, acctToName, rows)
+                    .then(function () { return crDefectsResolved(allAccounts, b, acctToName, rows); })
+                    .then(function () { crProgress(ym + ': reports (attached / trashed)…'); return crReportsActioned(memberAccounts, b, rows, acctToName); })
+                    .then(function () { crProgress(ym + ': reassignments to GM…'); return crAutoReassigned(b, acctToName, rows); })
+                    .then(function () {
+                        var extras = crComputeExtra(names, mentor);
+                        var header = ['Name', 'Defects Created', 'Defects Resolved', 'Reports Attached',
+                            'Reports Trashed', 'Reports Reassigned', 'Total Actioned', 'Extra Credits', 'Credits Earned'];
+                        var table = [];
+                        var tot = { created: 0, resolved: 0, attached: 0, trashed: 0, reassigned: 0, actioned: 0, extra: 0, credits: 0 };
+                        names.forEach(function (n) {
+                            var r = rows[n], extra = extras[n] || 0;
+                            var actioned = r.attached + r.trashed + r.reassigned + r.created;
+                            var earned = crCreditFormula(r);
+                            table.push([n, r.created, r.resolved, r.attached, r.trashed, r.reassigned, actioned, extra, earned]);
+                            tot.created += r.created; tot.resolved += r.resolved; tot.attached += r.attached;
+                            tot.trashed += r.trashed; tot.reassigned += r.reassigned; tot.actioned += actioned;
+                            tot.extra += extra; tot.credits += earned;
+                        });
+                        table.push(['Total', tot.created, tot.resolved, tot.attached, tot.trashed, tot.reassigned,
+                            tot.actioned, Math.round(tot.extra * 10) / 10, Math.round(tot.credits * 10) / 10]);
+                        return { ym: ym, computedAt: new Date().toISOString(), header: header, table: table, rows: rows, nameToAcc: nameToAcc, memberAccounts: memberAccounts };
+                    });
+            });
+        });
+    }
+    // Single-flight so two tabs (e.g. a scheduled run + a manual Refresh) never crawl the same month at once:
+    // a same-month caller COALESCES onto the in-flight crawl (one crawl, one result, one clean progress stream for
+    // all of them); a different-month request is queued behind it. Without this, concurrent crawls doubled the REST
+    // load and their per-item progress ticks interleaved (counts jumping up then back down). crActiveTags is set at
+    // crawl START (not enqueue) so a queued run's progress can't be mis-tagged to a different pending run.
+    function runCreditsMonth(payload) {
+        payload = payload || {};
+        var key = payload.y + '-' + payload.m, tag = payload.tag || null;
+        if (crLast && crLast.key === key) {                                  // coalesce onto the most-recent same-month crawl
+            if (tag && crLast.tags.indexOf(tag) === -1) { crLast.tags.push(tag); }
+            return crLast.promise;
+        }
+        var prev = crLast ? crLast.promise : Promise.resolve();
+        var run = { key: key, tags: tag ? [tag] : [], promise: null };
+        var begin = function () { crActiveTags = run.tags; return crComputeMonth(payload); };
+        run.promise = prev.then(begin, begin);                               // queue behind any running/queued crawl (never concurrent)
+        crLast = run;
+        var settle = function () { if (crLast === run) { crLast = null; } if (crActiveTags === run.tags) { crActiveTags = []; } };
+        run.promise.then(settle, settle);
+        return run.promise;
+    }
+
+    self.onmessage = async function (e) {
+        var d = e.data || {}, id = d.id, type = d.type, payload = d.payload;
+        try {
+            var result;
+            if (type === 'ping') { result = { pong: true, backend: backend }; }
+            else if (type === 'embed') { var v = await embed((payload && payload.text) || ''); result = { backend: backend, dim: v.length, vec: Array.from(v) }; }
+            else if (type === 'rankSemantic') { result = await rankSemantic(payload); }
+            else if (type === 'rankKeyword') { result = await rankKeyword(payload); }
+            else if (type === 'logsig') {
+                await ensureIndexes();
+                var op = payload && payload.op;
+                if (op === 'siblings') { result = lgSiblings(payload.key); }
+                else if (op === 'related') { result = lgRelated(payload.key); }
+                else if (op === 'clusters') { result = lgClusters(); }
+                else if (op === 'match') { result = lgMatch(payload.text); }
+                else { throw new Error('unknown logsig op: ' + op); }
+            }
+            else if (type === 'embedPass') {
+                // Long-running (minutes on a full rebuild): ACK immediately so the caller's RPC never times out,
+                // and post an 'embedPassDone' event when the background pass actually finishes.
+                if (embedding) { result = { started: false, busy: true }; }
+                else {
+                    embedPass().then(function (rr) { self.postMessage({ event: 'embedPassDone', embedded: (rr && rr.embedded) || 0 }); },
+                        function (er) { self.postMessage({ event: 'embedPassError', error: String((er && er.message) || er) }); });
+                    result = { started: true };
+                }
+            }
+            else if (type === 'creditsMonth') {
+                // Long-running (minutes): the caller passes a big timeout. runCreditsMonth single-flights + coalesces
+                // so two tabs never crawl the same month at once; progress streams as tagged 'creditsProgress' events.
+                result = await runCreditsMonth(payload);
+            }
+            else if (type === 'invalidate') { vecCache = null; kwCache = null; logsigCache = null; result = { ok: true }; }   // drop all indexes after a sync writes the DB
+            else { throw new Error('unknown worker request: ' + type); }
+            self.postMessage({ id: id, ok: true, result: result });
+        } catch (err) { self.postMessage({ id: id, ok: false, error: String((err && err.message) || err), stack: String((err && err.stack) || '') }); }
+    };
+}
+
+
+/* ---- shared ranking worker: one model+index for ALL tabs instead of one per tab -----------------------
+ * A userscript can't host a same-origin SharedWorker script (blob/data-URL SharedWorkers don't share across
+ * tabs), so we get the same "one instance for everyone" outcome from primitives that DO work: one tab is
+ * elected LEADER via the Web Locks API and owns a single dedicated module worker; every tab talks to the
+ * leader over a BroadcastChannel. The worker (built from a blob) imports transformers.js, opens the same-origin
+ * IndexedDB (pristine in a worker - Atlassian's consent gate only wraps the main document), holds the model +
+ * ranking indexes, and answers rank queries. Tabs become thin clients. Feature-flagged and additive: nothing
+ * calls into it yet (this milestone just proves leader election + RPC + a shared worker across tabs).
+ */
+JiTA.worker = {
+    CHANNEL: 'jita-rank-v1',
+    LOCK: 'jita-rank-leader-v1',
+    RPC_TIMEOUT_MS: 30000,
+
+    _bc: null,           // BroadcastChannel (every tab)
+    _worker: null,       // the dedicated Worker (leader only)
+    _isLeader: false,
+    _started: false,
+    _tabPending: {},     // id -> {resolve,reject,timer}  : channel requests THIS tab is awaiting
+    _tabSeq: 0,
+    _wPending: {},       // id -> {resolve,reject,timer}  : worker requests the LEADER is awaiting
+    _wSeq: 0,
+
+    start: function () {
+        if (JiTA.worker._started || JITA_IS_FORGE_FRAME) { return; }
+        JiTA.worker._started = true;
+        try { JiTA.worker._bc = new BroadcastChannel(JiTA.worker.CHANNEL); JiTA.worker._bc.onmessage = JiTA.worker._onBc; } catch (e) { /* no channel -> leader-only */ }
+        // Elect a single leader: hold an exclusive Web Lock for this tab's lifetime. When the leader tab closes
+        // the lock releases and another tab's pending request wins -> it becomes leader and spawns its worker.
+        try {
+            if (navigator.locks && navigator.locks.request) {
+                navigator.locks.request(JiTA.worker.LOCK, function () {
+                    JiTA.worker._becomeLeader();
+                    return new Promise(function () { /* never resolve: hold the lock until the tab is gone */ });
+                });
+            } else {
+                JiTA.worker._becomeLeader();   // no Web Locks -> degrade to a per-tab worker
+            }
+        } catch (e) { if (window.console) { console.log('[JiTA worker] leader election failed:', e); } }
+    },
+
+    _becomeLeader: function () {
+        if (JiTA.worker._isLeader) { return; }
+        JiTA.worker._isLeader = true;
+        try {
+            var url = URL.createObjectURL(new Blob([JiTA.worker._src()], { type: 'text/javascript' }));
+            JiTA.worker._worker = new Worker(url, { type: 'module' });
+            JiTA.worker._worker.onmessage = JiTA.worker._onWorker;
+            JiTA.worker._worker.onerror = function (e) { if (window.console) { console.log('[JiTA worker] worker error:', (e && e.message) || e); } };
+            setTimeout(function () { try { URL.revokeObjectURL(url); } catch (x) { /* ignore */ } }, 15000);   // keep the URL alive long enough for the worker to load its module
+            if (window.console) { console.log('[JiTA worker] this tab is now the ranking LEADER (worker spawned)'); }
+            // Embed anything outstanding in the worker (also warms the model there for ranking). Delayed so it
+            // doesn't compete with first paint. Single-flight in the worker, so a concurrent prepare() is harmless.
+            setTimeout(function () {
+                JiTA.worker._workerCall('embedPass').then(function (r) {
+                    if (r && r.embedded > 0) { if (window.console) { console.log('[JiTA worker] embed pass: ' + r.embedded + ' embedded'); } try { JiTA.ui.scheduleRender(); } catch (e) { /* ignore */ } }
+                }, function () { /* ignore */ });
+            }, 8000);
+        } catch (e) { JiTA.worker._isLeader = false; if (window.console) { console.log('[JiTA worker] worker spawn failed:', e); } }
+    },
+
+    // Public: call the ranking worker from ANY tab. Resolves with the worker's result (or rejects on timeout /
+    // no leader). Leader shortcuts straight to its worker; followers route over the channel.
+    call: function (type, payload, opts) {
+        opts = opts || {};
+        var timeoutMs = opts.timeoutMs || JiTA.worker.RPC_TIMEOUT_MS;   // long crawls (credits) pass a bigger cap
+        if (JiTA.worker._isLeader && JiTA.worker._worker) { return JiTA.worker._workerCall(type, payload, timeoutMs); }
+        return new Promise(function (resolve, reject) {
+            if (!JiTA.worker._bc) { reject(new Error('no leader / no channel')); return; }
+            var id = (JiTA.sched.tabId) + ':' + (++JiTA.worker._tabSeq);
+            var timer = setTimeout(function () { delete JiTA.worker._tabPending[id]; reject(new Error('rpc timeout (no leader ready?)')); }, timeoutMs);
+            JiTA.worker._tabPending[id] = { resolve: resolve, reject: reject, timer: timer };
+            JiTA.worker._bc.postMessage({ kind: 'req', id: id, type: type, payload: payload, timeoutMs: timeoutMs });
+        });
+    },
+
+    // Leader <-> its worker
+    _workerCall: function (type, payload, timeoutMs) {
+        return new Promise(function (resolve, reject) {
+            if (!JiTA.worker._worker) { reject(new Error('no worker')); return; }
+            var id = ++JiTA.worker._wSeq;
+            var timer = setTimeout(function () { delete JiTA.worker._wPending[id]; reject(new Error('worker timeout')); }, timeoutMs || JiTA.worker.RPC_TIMEOUT_MS);
+            JiTA.worker._wPending[id] = { resolve: resolve, reject: reject, timer: timer };
+            JiTA.worker._worker.postMessage({ id: id, type: type, payload: payload });
+        });
+    },
+    _onWorker: function (e) {
+        var d = e.data || {};
+        if (d.event) { JiTA.worker._relayEvent(d); return; }   // unsolicited worker event (e.g. embed pass finished)
+        var p = JiTA.worker._wPending[d.id];
+        if (!p) { return; }
+        clearTimeout(p.timer); delete JiTA.worker._wPending[d.id];
+        if (d.ok) { p.resolve(d.result); } else { p.reject(new Error(d.error || 'worker error')); }
+    },
+    // The leader relays a worker event to every tab (over the channel) and applies it locally.
+    _relayEvent: function (d) {
+        try { if (JiTA.worker._bc) { JiTA.worker._bc.postMessage({ kind: 'event', data: d }); } } catch (e) { /* ignore */ }
+        JiTA.worker._applyEvent(d);
+    },
+    _applyEvent: function (d) {
+        if (!d) { return; }
+        if (d.event === 'embedPassDone' && d.embedded > 0) {
+            if (window.console) { console.log('[JiTA worker] embed pass finished: ' + d.embedded + ' embedded'); }
+            try { JiTA.ui.scheduleRender(); } catch (e) { /* ignore */ }   // re-rank the open view now the new vectors exist
+            return;
+        }
+        // Credits crawl progress from the worker. Broadcast to every tab, but only the tab that started THIS
+        // crawl (matching tag) shows its pill; the rest ignore it. _pill itself no-ops during quiet background runs.
+        if (d.event === 'creditsProgress') {
+            // Accept both the new tags[] shape and the legacy single tag, so a not-yet-reloaded leader worker (version
+            // skew during a script update) still drives this tab's pill instead of silently blanking it.
+            var wt = JiTA.credits && JiTA.credits._workerTag;
+            if (wt && ((d.tags && d.tags.indexOf(wt) !== -1) || (d.tag && d.tag === wt))) { try { JiTA.credits._pill(d.msg); } catch (e) { /* ignore */ } }
+            return;
+        }
+    },
+
+    // Channel handler: leaders service 'req' (forward to worker, broadcast 'res'); every tab matches 'res'.
+    _onBc: function (e) {
+        var m = e.data || {};
+        if (m.kind === 'req') {
+            if (!JiTA.worker._isLeader || !JiTA.worker._worker) { return; }   // only the leader answers
+            JiTA.worker._workerCall(m.type, m.payload, m.timeoutMs).then(function (result) {
+                JiTA.worker._bc.postMessage({ kind: 'res', id: m.id, ok: true, result: result });
+            }, function (err) {
+                JiTA.worker._bc.postMessage({ kind: 'res', id: m.id, ok: false, error: String((err && err.message) || err) });
+            });
+        } else if (m.kind === 'res') {
+            var p = JiTA.worker._tabPending[m.id];
+            if (!p) { return; }
+            clearTimeout(p.timer); delete JiTA.worker._tabPending[m.id];
+            if (m.ok) { p.resolve(m.result); } else { p.reject(new Error(m.error || 'remote error')); }
+        } else if (m.kind === 'event') {
+            JiTA.worker._applyEvent(m.data);   // a worker event the leader relayed (e.g. embed pass finished)
+        }
+    },
+
+    // The dedicated worker's source (a module). Minimal for this milestone: lazy-load the model, answer 'ping'
+    // and 'embed'. Later milestones add the vector/keyword indexes + ranking here and return just ranked keys.
+    // The worker source: the real jitaWorkerBody function, serialized + immediately invoked with runtime config.
+    _src: function () {
+        var C = JiTA.credits;
+        var cfg = {
+            LIB: JiTA.embed.LIB_URL, MODEL: JiTA.embed.MODEL, MODEL_VERSION: JiTA.MODEL_VERSION,
+            DB_NAME: JiTA.DB_NAME, DB_VERSION: JiTA.DB_VERSION, MAX_CHARS: JiTA.embed.MAX_CHARS, GM_TEAM_ID: JiTA.GM_TEAM_ID,
+            tryGpu: gmGet('sdTryWebgpu', true) && !gmGet('sdForceCpu', false),
+            HOST: JiTA.HOST, MAX_RETRIES: JiTA.MAX_RETRIES, PAGE_DELAY_MS: JiTA.PAGE_DELAY_MS,
+            // ISD credits config (mirror of JiTA.credits' static fields) so the worker can run the monthly crawl.
+            credits: {
+                PROJECTS: C.PROJECTS, RESOLUTIONS: C.RESOLUTIONS, GROUP: C.GROUP, OLD_DOMAIN: C.OLD_DOMAIN,
+                EBR: C.EBR, ATTACHED_STATUS: C.ATTACHED_STATUS, CLOSED_STATUS: C.CLOSED_STATUS,
+                TEAM_JQL: C.TEAM_JQL, TEAM_CF: C.TEAM_CF, GM_TEAM_ID: C.GM_TEAM_ID, GM_TEAM_FULL_ID: C.GM_TEAM_FULL_ID,
+                GM_TEAM_NAME: C.GM_TEAM_NAME, AUTOMATION_ID: C.AUTOMATION_ID, AUTOMATION_EMAIL: C.AUTOMATION_EMAIL,
+                DEDUP_LINK_TYPES: C.DEDUP_LINK_TYPES, PROJECT_RANK: C.PROJECT_RANK, LEADS: C.LEADS, LEAD_BONUS: C.LEAD_BONUS,
+                PAGE_SIZE: C.PAGE_SIZE, CRAWL_DELAY_MS: C.CRAWL_DELAY_MS
+            }
+        };
+        return '(' + jitaWorkerBody.toString() + ')(' + JSON.stringify(cfg) + ');';
+    }
+};
+
+
 /* ---- init: watch the DOM and (re)inject the panel across Atlassian's React re-renders / SPA nav ---- */
 (function () {
     if (JITA_IS_FORGE_FRAME) { return; }  // inside the Zendesk Forge iframe we only run the responses dropdown
@@ -8716,6 +9623,8 @@ JiTA.credits = {
     }
     // start the periodic background catch-up sync
     JiTA.sched.start();
+    // Shared ranking worker: elect a leader + spawn the one worker all tabs share (additive; nothing routes to it yet).
+    try { JiTA.worker.start(); } catch (e) { /* swallow */ }
     // ISD credit tracker: show the corner badge (from cache) and start the throttled background recompute.
     if (savedVariables[3][1]) {
         try { JiTA.credits.badge.mount(); } catch (e) { /* swallow */ }
