@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Jira Triage Assistant
-// @version     3.1.0
+// @version     3.1.1
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Jira-Triage-Assistant/raw/main/JiTA.user.js
@@ -7550,7 +7550,7 @@ JiTA.menu = {
 #jita-menu { width: 360px; max-height: 82vh; overflow-y: auto; background: #1D2125; color: #e6e6e6;\
   border: 1px solid #3a434d; border-radius: 8px; box-shadow: 0 8px 30px rgba(0,0,0,.55); font-size: 13px; }\
 #jita-menu .jita-menu-head { display: flex; align-items: center; gap: 8px; padding: 12px 14px; background: #282d33; border-radius: 8px 8px 0 0; position: sticky; top: 0; }\
-#jita-menu .jita-menu-head h2 { margin: 0; font-size: 14px; font-weight: 700; flex: 1; }\
+#jita-menu .jita-menu-head h2 { margin: 0; font-size: 14px; font-weight: 700; flex: 1; color: #f2f2f4; }\
 #jita-menu .jita-menu-x { cursor: pointer; font-weight: 700; font-size: 18px; line-height: 1; padding: 0 4px; color: #9aa6b2; }\
 #jita-menu .jita-menu-x:hover { color: #fff; }\
 #jita-menu .jita-menu-sect { padding: 4px 14px 12px; }\
