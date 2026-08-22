@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Jira Triage Assistant
-// @version     3.1.1
+// @version     3.1.2
 // @author      ISD BH Schogol, ISD Tulwar
 // @description Adds a Translate, Assign to GM, Convert to Defect and Close button to Jira, parses Log Files submitted from the EVE client, suggests similar existing defects on bug reports, and (on a defect) lists the open bug reports that best match it
 // @updateURL   https://github.com/Schogol/Jira-Triage-Assistant/raw/main/JiTA.user.js
@@ -4622,9 +4622,13 @@ JiTA.sync = {
                 }).done(function (data, status, xhr) {
                     resolve({ data: data, xhr: xhr });
                 }).fail(function (xhr) {
-                    if (xhr.status === 429 && retries > 0) {
+                    // Retry transient failures: 429 (rate limit), 5xx, and status 0 (network drop /
+                    // outage / aborted request). Every _apiPost caller is an idempotent read
+                    // (/search/jql, /search/approximate-count), so a retry can't double-apply anything.
+                    if ((xhr.status === 429 || xhr.status >= 500 || xhr.status === 0) && retries > 0) {
                         var ra = parseInt(xhr.getResponseHeader('Retry-After'), 10);
-                        var wait = (isNaN(ra) ? 5 : ra) * 1000;
+                        var wait = xhr.status === 429 ? (isNaN(ra) ? 5 : ra) * 1000
+                                                      : (JiTA.MAX_RETRIES - retries + 1) * 1000;   // 1s,2s,3s...
                         setTimeout(function () { attempt(retries - 1); }, wait);
                     } else {
                         reject(new Error('Jira API ' + path + ' failed: HTTP ' + xhr.status));
@@ -7418,11 +7422,22 @@ JiTA.ui = {
     _jqlQuote: function (s) { return '"' + String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"'; },
 
     // This report's Original Reporter ID, read live from Jira (one field). '' when the field is empty/absent.
+    // Retries transient failures (429 / 5xx / status 0) so a network blip doesn't masquerade as "no reporter ID".
     _getReporterId: function (key) {
         return new Promise(function (resolve) {
-            $.ajax({ url: JiTA.HOST + '/rest/api/2/issue/' + key + '?fields=customfield_11660', dataType: 'json' })
-                .done(function (d) { var v = d && d.fields && d.fields.customfield_11660; resolve(typeof v === 'string' ? v.trim() : ''); })
-                .fail(function () { resolve(''); });
+            (function attempt(retries) {
+                $.ajax({ url: JiTA.HOST + '/rest/api/2/issue/' + key + '?fields=customfield_11660', dataType: 'json' })
+                    .done(function (d) { var v = d && d.fields && d.fields.customfield_11660; resolve(typeof v === 'string' ? v.trim() : ''); })
+                    .fail(function (xhr) {
+                        if ((xhr.status === 429 || xhr.status >= 500 || xhr.status === 0) && retries > 0) {
+                            var ra = parseInt(xhr.getResponseHeader('Retry-After'), 10);
+                            var wait = xhr.status === 429 ? (isNaN(ra) ? 5 : ra) * 1000 : (JiTA.MAX_RETRIES - retries + 1) * 1000;
+                            setTimeout(function () { attempt(retries - 1); }, wait);
+                        } else {
+                            resolve('');   // genuine failure / field absent -> treat as no reporter ID
+                        }
+                    });
+            })(JiTA.MAX_RETRIES);
         });
     },
 
